@@ -1,0 +1,6 @@
+# dsh bundle patch: mount the project-nav plugin.
+# Host entry = package main (./host/index.js, standard cordis apply pattern).
+# Format contract: top-level YAML array of loader patch entries (fail-loud at boot).
+- insert:
+    - id: project-nav
+      name: '@dsh-external/project-nav'

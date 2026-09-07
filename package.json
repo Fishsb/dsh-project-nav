@@ -1,0 +1,40 @@
+{
+  "name": "@dsh-external/project-nav",
+  "version": "0.2.7",
+  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, governance-first action ledger (plan/begin/done), and a reference-docs registry consulted at plan time. v0.2.7: closure fixes B1-B4 (disk-drift probe in nav_status, duplicate-attachment warning, dead-link rejection in nav_add_doc, scope-vs-index pre-validation in nav_plan).",
+  "type": "module",
+  "main": "./host/index.js",
+  "exports": {
+    ".": "./host/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "host",
+    "shared",
+    "package.json"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./host/cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "0.1.2-rc.1"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "project-nav",
+    "governance",
+    "anti-drift"
+  ],
+  "license": "BSD-3-Clause",
+  "author": "lk"
+}
