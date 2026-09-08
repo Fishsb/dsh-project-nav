@@ -13,8 +13,8 @@ import {
   loadActions, saveActions, nextActionId,
   loadDocs, saveDocs, nextDocId, suggestDocs,
   queryIndex, partialSearch, normalizePath,
-  buildTree, renderTreeText, renderMapHtml,
-  findStaleFiles
+  renderTreeText, renderMapHtml, renderProjectDocSection,
+  findStaleFiles, scopeTargetsOfOpenActions
 } from '../shared/index.js'
 
 // ---- Plugin metadata (Cordis contract) ----

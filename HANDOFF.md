@@ -659,3 +659,229 @@ _本文件应随项目推进持续更新。最后更新：2026-09-07_
 ### nav 轻维护红线（固化）
 - 不引入任何"每项目必配"的治理配置；数据单真身 D:/FF/.internal/，其余全部自动派生
 - 新工具准入标准：零配置 + 自动对齐，否则不上
+
+---
+
+## 二十一、2026-09-08 20:13 · v0.2.8 ESM 导出/导入修复 + 禁用残留清理（重装生效）
+
+### 事故复盘：修复为什么迟迟不生效
+
+1. **Bug 本身（同类两处）**：`scopeTargetsOfOpenActions` shared 定义未 export + host 调用未 import（前一会话已修）；**`renderProjectDocSection` host:516（nav_sync_docs）调用未 import——前一修复漏掉**，本次补上（修漏时顺带删除 host 死导入 buildTree）。
+2. **前一修复"重启即从 D:\FF\project-nav 加载"的机制解释是错的**：profile 中 project-nav 是 file: tgz 的**解包副本**（realpath 指向自身，非链接）。重启只加载副本，不改源码就永远不会生效。当时碰巧生效是因为修复文件被直接复制进了 profile 副本。
+3. **真正的拦路虎**：profile `cordis.patch.yml` 尾部残留 `- id: project-nav / disabled: true`（09-07 卸载事故遗留），且 `dsh.profile.bundles` 当时无条目 → dev_inject_plugin 以为插件 active 跳过注入，loader 层实际禁用 → dev_reload_package 又因插件入口是 host/index.js（非 lib/index.js）重载失败。三因素叠加，怎么折腾都不生效。
+
+### 本次执行记录
+
+| 步骤 | 结果 |
+|------|------|
+| host/index.js import 块补 `renderProjectDocSection` | ✅ |
+| node --check host/shared ×2 | ✅ |
+| 冒烟：node 直跑 shared 核心链（loadIndex→loadActions→scopeTargetsOfOpenActions→renderMapHtml/renderProjectDocSection），对真实工作区 D:\FF 渲染 | ✅ html 7801B |
+| version 0.2.7→0.2.8，pnpm pack | ✅ 含 host/shared/patch/README |
+| `dsh plugin --profile web add "@dsh-external/project-nav@file:…0.2.8.tgz"`（别名语法覆盖，6.4s） | ✅ supply-chain 过 |
+| 装入核对：副本 0.2.8、shared import 块完整、`dsh.profile.bundles` 含条目、顶层 dsh-tools junction→核心未改写、插件无本地 node_modules | ✅ |
+| 移除 cordis.patch.yml 的 project-nav disabled 条目 | ✅ 备份 `~/.dsh/backups/project-nav-reenable-20260908/` |
+| `--dump-config`：无重复 id、stderr 干净、`- id: project-nav` 条目在 | ✅ |
+| `sc stop/start dsh-web`：RUNNING、3080 LISTENING、token 303 | ✅ err 日志无插件报错 |
+
+### 经验固化（下次改 project-nav 源码的标准发布路径）
+
+源码目录不是运行时加载源——**改完必须 bump 版本 → pnpm pack → dsh plugin add 覆盖装 → 重启 dsh-web**；装完必查 cordis.patch.yml 无 disabled 残留 + bundles 有条目。dev_reload_package 对本项目无效（入口非 lib/index.js）。
+
+### 待 DSH 会话 UI 实测
+
+① 工具清单出现 nav_*（12 个）；② `nav_map format=html` 生成 `D:\FF\.internal\map-workspace.html`（渲染路径冒烟已过）；③ `nav_sync_docs` 跑通（本次修复点）；④ 治理循环 nav_plan → nav_mark begin → 改动 → nav_mark done。
+
+## 二十二、2026-09-08 20:33 · nav-index 键对齐手术 + v0.2.9 stale 误报修复与地图可读性
+
+### 缘起（DSH 侧只读检查汇报）
+
+DSH 会话跑 nav_map 后报告：HTML 生成成功、vector 正常，但 **4/5 项目特征全部不可见**（显示 0 features）。根因定位 = `projectToModules` 与 `moduleToFeatures` 键名层级错位（lk 指令：当前项目问题直接修复，其他项目问题只汇报）。
+
+### 数据手术一：键名层级对齐（修 4/5 项目 0 features）
+
+- **归属判定**：`moduleToFeatures["shoucang"]=SC-S01..S07`（项目名作模块键）本身完整合法——"整个项目一个模块"是合法粒度，与 pmg/prompt-enhancer/dsh-dev-docs 一致。错位来自 `projectToModules` 存量的子模块键（panel/scheduler/host/client/voice/components/engine/lib/scripts/docs/subsystems）**从未在 moduleToFeatures 登记过**（§16 数据合并带入），不是记忆插件项目的数据问题。
+- **方向选择**：改 projectToModules 对齐 m2f 真实键（零信息损失）；反向改 m2f 需要特征→子模块分配知识，数据里没有，不能瞎编。对齐后惯例与 PN-P01 一致（p2m 键 ⊆ m2f 键）。
+- 四项目 p2m 归位为 `[<项目名>]`；空壳子模块键随之消失。备份 `~/.dsh/backups/nav-index-keyalign-20260908/`。手术用 shared 的 loadIndex/saveIndex 走（原子写 + metadata 自动重算）。
+
+### 数据手术二：PN-P01 自治理数据清理（当前项目，连带修复）
+
+- PN-F01..F05 从 M01/M02/M03 **三重挂载**归位到 PN-M02（shared 核心层，实现主体所在）；删空壳/死模块 PN-M01（host）/PN-M03（shared/tools 目录 v0.2.0 已删）/PN-M04/M05；fileToFeature 清掉 shared/tools/* 死链与两条层级错置条目（`host/cordis.patch.yml→PN-M01`、`package.json→PN-P01`——模块码/项目码错当特征码）；删死特征 PN-F06/PN-F07（client 面板与 build 脚本 v0.2.0 起实现已不存在）及其描述、functionToModule 指向已删模块的条目。备份 nav-pn-cleanup / nav-pn-deadfeatures-20260908。
+- 结果：metadata 45→36 files、9→5 modules；PN-P01 = [PN-M02] 单模块，特征零重复、零死链。
+
+### 代码修复（v0.2.9）
+
+| # | 严重度 | 问题 | 修复 |
+|---|--------|------|------|
+| 1 | 🔴 | **findStaleFiles 误报 38 个 stale**（v0.2.7 B1 引入）：假设文件键是项目相对，但存量键是工作区相对（带项目前缀，如 `shoucang/client.js`）→ 双重前缀永远 miss。PN 的 `host/index.js` 恰好项目相对所以没报，`client/index.js` 等真删除文件又恰好报对，掩盖了 bug | **双形态兼容**：项目相对（经 projectPaths 解析）/工作区相对任一存在于磁盘即健康，两者皆缺才报 stale。修复后仅剩 pmg 侧 2 条真死链 |
+| 2 | 🟡 | lk 反馈：地图"只有文件目录结构，没有逻辑说明，没有任何标注" | nav_map HTML 增强：顶部「📖 怎么读这张图」指引块（层级结构/特征定义/🔴语义/改动工作流）；模块显示 moduleMeta 的 name；特征展开显示 userView/systemView 说明块；项目 summary 显示 projectPaths 磁盘路径；无文件无描述的特征显示「待登记（nav_update --field files）」提示。renderTreeText 模块行同步带名字 |
+
+### 汇报项（其他项目侧待办，按 lk 指令不代改）
+
+- **pmg**：`engine/lib/lib-parse.mjs`、`lib-links.mjs` 死链（pmg 仓库已删 lib 目录）→ pmg 侧 `nav_update --field files` 清理 PMG-P01/P02/P03 的文件清单。
+- **shoucang**：SC-S01/S04 登记了特征但无文件清单。
+- **dsh-dev-docs**：DD-D01..D04 无文件清单、无描述。
+
+### 部署（v0.2.9）
+
+pnpm pack（tgz 校验含 5 文件）→ add 覆盖装（6.8s）→ 核对（副本 0.2.9、双形态修复与 howto 增强在位、dsh-tools junction→核心未变、bundles 有条目）→ sc 重启 → RUNNING / 3080 LISTENING / token 303 ✅。地图重新生成 11840B：**5 项目 21 特征全部可见**，stale 仅剩 pmg 侧 2 条真实死链。
+
+## 二十三、2026-09-08 20:55 · 展示形态定稿：多层逻辑架构图（arch-view skill 路线）
+
+### lk 定调（两轮反馈收敛）
+
+1. v0.2.9 增强后的树形地图仍不满足"直观了解项目状态"——目录树是 agent 导航视角，用户要的是**逻辑架构图**。
+2. 目标形态 = **多层嵌套下钻**：L1 项目总览（模块组成与依赖关系）→ 点开模块看 L2（模块内部：文件引用、数据流、循环、条件分支、状态机）。
+3. 生成时机 = **按需生成 + 状态摘要**（lk 已确认）：平时零维护，要看时调用再生成；nav_plan/done 输出带一行状态摘要。
+4. 仪表盘卡片形态被否（"不需要 html 了"指卡片列表形态，非载体本身）；最终产物为 mermaid 图（可配自包含 HTML 渲染）。
+
+### 关键技术判定
+
+| 层 | 内容 | 数据来源 | 幻觉风险 |
+|----|------|---------|---------|
+| L1 | 模块依赖边（谁 import 谁） | 确定性静态扫描 import/require/preload + nav 索引健康标注 | 零 |
+| L2 | 数据流/循环/条件/状态机 | **LLM 读码提炼**（AST 给不了语义） | 有 → 靠锚定 |
+
+**防幻觉闭环**：图中文件节点必须 ⊆ nav_query 锚定清单；索引外节点标 ⚠ 并引导补登记。存档头部记录 per-file mtime/size 指纹，比对不一致即过期重生成。
+
+### 载体决策
+
+skill（`~/.dsh/skills/arch-view/`）先行——L2 的 LLM 读码提炼是 agent 本职，skill 零打包重启成本、立刻可用；实战验证提炼质量后再评估是否把 L1 渲染 + 存档过期管理工具化为 `nav_arch`（v0.3.0 候选，第 13 工具）。MCP 因 WorkBuddy/DSH 环境分离不采用。
+
+### 已落地
+
+- ✅ `~/.dsh/skills/arch-view/SKILL.md`：铁律（锚定/不编造/按需/每图 ≤15 节点）+ L1/L2/交付三段流程 + 存档指纹格式 + 边界（只读源码，写权限仅 `D:\FF\.internal\arch\`）。
+- 设计留档：本节。
+
+### 待办
+
+- DSH 会话实测：对 shoucang 跑一次 L1 + 对 scheduler/distill 链路跑一次 L2，检验提炼质量与锚定告警。
+- nav_mark done 的 delta 输出追加"架构存档过期提示"（v0.3.0 与 nav_arch 一并评估）。
+
+## 24. arch-view 首次实战 + 定位升级：架构文档 = 核心维护文档（2026-09-08 晚）
+
+### 实战结果（shoucang L1+L2）
+
+- 首次全流程跑通：索引锚点 → import 静态扫描（9 条边全实测）→ 逐文件读深睡链源码 → 落档+指纹 → 渲染。
+- 产物：`.internal/arch/shoucang-overview.md`（L1 文件级 import 图，单模块降级规则首次应用）+ `shoucang-SC-S07-deepsleep.md`（L2 贯通主链 15 节点，全部有行号依据：noteEvent:535 / check:944 / setInterval:1096 / probe:839 / parent:697 / spawn:781 / applyPrinciples:645 / gate exit 0/1/2/4 / 落盘:802）。
+- **锚定告警真实命中**：索引外 = src/index.ts、**src/panel.ts（SC-S07 三路由宿主却未登记，此前未发现）**、src/scheduler-share.ts、skill/scripts/locate-transcript-probe.mjs；另有已知 SC-S01/S04 缺文件。登记属 shoucang 侧自治理素材，不在本项目动数据。
+
+### 定位升级（lk 22:10 拍板）
+
+- **架构逻辑文档（arch/*.md）升格为核心维护文档**，= agent 的开发主地图：开发前必读拿"数据怎么流、循环在等什么、分支判什么"，开发后按指纹过期重生成。
+- **渲染图降为文档的用户向投影**：不独立维护、不承载文档外新事实；用户要看时从文档现渲染，文档一改图即视为过期。
+- 三层模型写入 SKILL.md：索引层（nav 四维索引，事实底座）/ **文档层（arch/*.md，核心）** / 渲染层（SVG，投影）。
+- 渲染版式铁律新增（lk 反馈"样式与文字说明重叠覆盖"）：标签与线/框/其他文字间距 ≥10px 禁止重叠；节点内单行文字宽度 ≤ 框宽 −16px。L2 已按此重渲染（修正 4 处贴线标签 + 3 处文字溢出框）。
+
+### 待办
+
+- shoucang 侧补登记 5 处索引外（panel.ts 优先进 SC-S07）。
+- **架构文档接入治理循环（v0.3.0 核心项；lk 22:30 追问"agent 开发时并不看逻辑架构吗"确认的缺口）**：现状循环六环节（查影响面→计划入账→开工→改代码→收口→派生）没有任何一环引导 agent 读 arch 文档，逻辑理解全靠临时读码。接线点：
+  - `nav_query` / `nav_plan` 输出末尾附一行"架构文档指针"：`arch/<project>-*.md（新鲜|过期）`——新鲜度 = scope 内文件最新 mtime 与指纹头部 generated 比对，轻量实现
+  - `nav_mark done` 的 delta 输出提示"涉及特征的架构文档已过期，下次查看将重生成"
+  - `nav_arch` 工具化（L1 渲染 + 过期管理）一并评估
+  - 零代码过渡：各项目 AGENTS.md 加一行"开发前读 `D:\FF\.internal\arch\<project>-*.md`"——shoucang 等属他项目文件，作汇报项由 lk 定
+
+## 25. 架构先行协议（Architecture-First）—— v0.3.0 整体架构方案（lk 23:35 拍板）
+
+### 原则
+
+**每一个任务、每一个开发决策都从架构出发**。架构文档不是参考资料，是决策入口：
+
+- 方案确认阶段（nav_plan → lk 拍板）必须以架构为核心参考——lk 拍板的依据从"文字描述"升级为"**架构位置**"（落在哪条链、哪个节点、波及谁）
+- 任务在架构上**找不到锚点 / 链路不覆盖任务意图** = 架构不足 → **先修架构（整体方案），再开工程任务**
+- 禁止"架构空白处反复打补丁"——这是大模型迭代最常见病灶，由工具侧守卫识别
+
+### 任务分流（nav_plan 阶段判定）
+
+| 判定 | 条件 | 结果 |
+|---|---|---|
+| 架构可承载 | 有明确锚点（arch 文档 + 节点），链路可解释任务意图 | 工程任务正常入账（archBasis 写入 plan 记录） |
+| 架构不足 | 无锚点 / 链路与意图冲突 / 文档过期且差异大 | **架构修订任务**：先出整体架构方案（改 arch 文档+设计），lk 确认后派生工程任务 |
+| 补丁循环嫌疑 | 同一特征同一节点 ≥3 次 done 修补 | 强制回架构层：输出整体审视建议，暂停继续小修 |
+
+### 工具改动清单（v0.3.0）
+
+1. `nav_plan`：plan 记录新增 `archBasis` 字段（arch 文档+节点）；输出附"架构对照"段（落点/波及/状态）；无锚点 → 提示转架构修订
+2. `nav_mark done`：delta 累计 per-feature/per-node 修补计数；≥3 触发补丁循环告警；提示架构文档过期
+3. `nav_arch`（新，第 13 工具）：check（任务↔架构覆盖校验）+ render（用户向投影）+ 过期管理（指纹比对）
+4. `nav_query`：输出末尾附 arch 文档指针行（新鲜|过期）
+5. 零代码：各项目 AGENTS.md 加"开发前读 arch 文档；决策从架构出发"指针
+
+### 分级判定（lk 23:45 补充拍板：不批量补档，按需生成）
+
+| 项目架构文档状态 | nav_plan 行为 |
+|---|---|
+| 项目**无** arch 档 | **软提示**："该项目暂无架构文档，建议本次方案确认时顺带出 L1（可跳过）"——不强制、不阻塞 |
+| 有档但无锚点 / 链路不覆盖 / 过期差异大 | **强制架构修订**：先出整体方案，lk 确认后派生工程任务 |
+| 同节点 ≥3 次 done 修补 | **强制回架构层**整体审视 |
+
+### 首批应用与验收（lk 23:45 定）
+
+- ❌ 不批量预生成其余 4 项目的 L1——项目由 lk 自行开发时按需补充（软提示引导即可）
+- v0.3.0 验收标准：接线四件套（nav_query 指针行 / nav_plan 架构对照段+archBasis / nav_mark done 计数+过期提示 / nav_arch 三能力）落地 + shoucang 实测一轮协议判定正确
+- 协议的第一次执行对象是 **v0.3.0 自身**：开工第一步 = 先给 project-nav 自身出 L1 arch 档作为架构锚点，工程任务再挂锚点入账（自举）
+
+## 26. 逻辑循环闭环审查（lk 23:50 要求；逐边源码验证，非凭记忆）
+
+### 结论
+
+**治理主循环 8 条边全部闭环（有行号证据）；架构层设计闭环但 3 处接线未实现（v0.3.0 立项范围）；文件落点 2 处缺口 + 1 处策略缺口。**
+
+### 闭环矩阵（文件 × 产生 × 消费 × 过期）
+
+| 文件 | 产生 | 消费（行号） | 过期/再生 | 判定 |
+|---|---|---|---|---|
+| `.internal/nav-index.json` | nav_add/update（loadIndex/saveIndex 原子写） | nav_query / nav_status / nav_map（buildTree: shared:275→330/405/452） | 活真相，无过期概念 | ✅ |
+| `.internal/nav-actions.json` | nav_plan / nav_mark（nextActionId） | scopeGate（host:114 查影响面拦截）/ nav_map 标红（host:480） / nav_status open 清单 | done 归档 | ✅ |
+| `.internal/nav-docs.json` | nav_sync_docs | suggestDocs（host:199/456）/ nav_status（host:550） | — | ✅ |
+| `.internal/vector.json` | nav_set_vector | **mainlineGate 告警（host:74/114）+ notDoing 硬拦截 ERROR（host:164）** + nav_status（548-568）/ nav_map 头部（487）/ nav_sync_docs（516） | 每次调用现读盘，改了立即生效 | ✅ 最强一环 |
+| `.internal/map-workspace.html` | nav_map（renderMapHtml） | 用户（状态视图） | 按需重生成 | ✅ |
+| `.internal/arch/*.md` | arch-view skill（LLM 提炼 + 指纹头） | agent 开发前必读（协议）/ 渲染投影 | 指纹过期 → 重生成 | ⚠ 设计闭环，接线未做 |
+| `.internal/arch/render/*.svg` | skill 渲染 | 用户（逻辑视图） | 跟随文档指纹 | ✅ 单向，不回写 |
+| `~/.dsh/skills/arch-view/*` | 人工/会话修订 | DSH 会话 agent | 无版本管理 | ⚠ G7 |
+
+### 缺口清单（含处置方案）
+
+- **G1（已立项）**：架构层三处接线未实现——nav_query/nav_plan 指针行、nav_mark done 计数+过期提示、nav_arch check。当前 agent 开发时无人提醒 arch 文档过期，属明示开环，v0.3.0 关闭。
+- **G4（✅ 已执行，lk 23:58 确认）**：project-nav 自身 4 文件已登记——新建模块 **PN-M03「插件工程与治理」(infra)** + 特征 **PN-F06「打包·补丁·治理文档」**，挂 package.json / host/cordis.patch.yml / README.md / HANDOFF.md。数据手术流程：备份 `~/.dsh/backups/nav-index-g4-20260908/` → loadIndex/saveIndex 原子写 → 双验证通过（metadata 36→40 文件/21→22 特征/5→6 模块；buildTree 5 项目 0 孤儿；stale 仅已知 2 条 pmg 死链，无新增）。
+- **G5（✅ 策略已立，lk 23:58 确认）**：备份保留规则写入 MEMORY 运维铁律——`.internal/*.bak-*` 每类保留最近 5 份、`.internal-bak-*/` 快照目录保留最近 1 份，超出在下次数据手术时顺带清理（不静默删）。当前存量（actions×4 / index×3 / vector×3 / 快照×1）全部合规，无需清理。
+- **G6（✅ 已修）**：两套用户渲染边界未成文 → 已写入 SKILL.md：nav_map=状态视图（索引驱动、实时）；arch 渲染=逻辑视图（文档驱动、指纹过期），互不替代互不回写。
+- **G7（待办）**：arch-view 技能文件（`~/.dsh/skills/arch-view/`）无备份落点——建议每次修订后随手备份到 `~/.dsh/backups/skill-arch-view-<日期>/`，或纳入项目 docs/ 存副本。
+- **G8（✅ 已执行，lk 23:58 确认）**：旧发布包 dsh-external-project-nav-0.2.7/0.2.8.tgz 已删除，仅保留 0.2.9（当前发布通道参照）；`.gitignore` 经核实**本就含 `*.tgz`**（此前审查误判为缺失，已更正）。
+
+### 补丁计数现状说明
+
+nav_actions.json 目前只记 done 与 scope，无 per-node 修补计数——"≥3 次强制回架构层"的守卫在 v0.3.0 实现（nav_mark done 时按 plan 的 archBasis 累计）。在此之前该守卫靠 agent 自觉（协议已入 MEMORY 铁律）。
+
+## 27. 重复与臃肿审查（lk 00:00 要求；工具全量名册核对 + 多副本规则盘点）
+
+### 工具层：12 个全量核对，无真功能重复
+
+nav_query / nav_plan / nav_mark / nav_update / nav_add_feature / nav_add_module / nav_add_doc / nav_docs / nav_map / nav_sync_docs / nav_status / nav_set_vector（host:96–587）。
+
+- 最接近的一对：`nav_add_doc`（手工登记）vs `nav_sync_docs`（扫描同步+排序建议）——动作不同不重复，保持；若 sync 将来全覆盖 add 场景再评估合并
+- nav_map(text) / nav_query / nav_status 三者都带 open 动作信息——回答的问题不同（导航树 / 点查 / 健康快照），不合并（API 稳定优先）
+
+### 规则多副本：有意分层，加权威源声明防漂移
+
+- 架构先行协议正文 = **HANDOFF §25（权威源）**；arch-view SKILL.md（DSH 会话运行时读）与项目 MEMORY.md（WorkBuddy 会话运行时读）为**投影副本**，各带指针。修订规则只改权威源，副本跟着同步。
+- 同理：G5 备份规则权威源 = MEMORY 运维铁律 5；G6 渲染边界权威源 = SKILL.md 边界节。
+- SKILL.md 内部去重：铁律 3（图不添料）为唯一规则源，§3 渲染步骤改为引用（本次已执行）。
+
+### 未来双轨风险（预承诺收敛路径）
+
+- **nav_arch 工具落地时**，arch-view SKILL 的 check / render / 过期管理章节收缩为"调 nav_arch"，skill 只保留 L2 内容提炼（LLM 读码）——**不允许 skill+tool 双轨长期并存**。
+
+### 卫生观察（lk 00:19 确认，已全部清理 ✅）
+
+- ~~`metadata.generated` 遗留字段~~ → **已删**（全库 grep 证实零消费；recomputeMetadata 不会回填；删后双验证：40/22/6/5、0 孤儿、PN-F06 完好、stale 不变）。备份：`~/.dsh/backups/nav-index-meta-gen-20260909/`
+- ~~`project-nav/.internal-bak-20260907/` 孤儿快照~~ → **已删**（对应本目录 `.internal` 已不存在，真身统一在 `D:\FF\.internal`；快照内 3 个 json 的 9-07 状态已在删除前留档于本节历史）
+- HANDOFF.md 57KB 叙事史：交接文档定位使然，按需沉淀，暂不瘦身（维持原判）
+- 附带闭环 **G7**：arch-view 技能已备份至 `~/.dsh/backups/skill-arch-view-20260909/SKILL.md`，今后每次修订后随手更新该备份
+
+### 闭环复核（PN-M03 手术后）
+
+buildTree 5 项目 0 孤儿；stale 仅 2 条已知 pmg 死链；vector 五消费点 / scopeGate / findStaleFiles 全部在位（§26 证据仍有效）；arch 两档指纹自 20:50 无文件变更，新鲜。
+
+_本文件应随项目推进持续更新。最后更新：2026-09-09 00:05_

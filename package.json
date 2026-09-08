@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/project-nav",
-  "version": "0.2.7",
-  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, governance-first action ledger (plan/begin/done), and a reference-docs registry consulted at plan time. v0.2.7: closure fixes B1-B4 (disk-drift probe in nav_status, duplicate-attachment warning, dead-link rejection in nav_add_doc, scope-vs-index pre-validation in nav_plan).",
+  "version": "0.2.9",
+  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, governance-first action ledger (plan/begin/done), and a reference-docs registry consulted at plan time. v0.2.9: findStaleFiles accepts workspace-relative file keys (fixes mass false stale); nav_map HTML readability — module display names, per-feature user/system views, project disk paths, how-to-read guide.",
   "type": "module",
   "main": "./host/index.js",
   "exports": {
@@ -33,8 +33,22 @@
     "dsh-plugin",
     "project-nav",
     "governance",
-    "anti-drift"
+    "anti-drift",
+    "drift-detection",
+    "project-governance",
+    "architecture-docs",
+    "feature-map",
+    "documentation",
+    "agent-tools"
   ],
   "license": "BSD-3-Clause",
-  "author": "lk"
+  "author": "Fishsb (lk)",
+  "homepage": "https://github.com/Fishsb/dsh-project-nav#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Fishsb/dsh-project-nav.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Fishsb/dsh-project-nav/issues"
+  }
 }

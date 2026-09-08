@@ -277,6 +277,14 @@ export function buildTree(index) {
   const m2f = index.indexes?.moduleToFeatures || {};
   const f2files = index.indexes?.featureToFiles || {};
   const descs = index.descriptions || {};
+  const modMeta = index.moduleMeta || {};
+  const featNode = code => ({
+    code,
+    fname: descs[code]?.name || '',
+    uv: descs[code]?.userView || '',
+    sv: descs[code]?.systemView || '',
+    files: f2files[code] || []
+  });
   const attached = new Set();
   const projects = Object.entries(p2m).map(([name, mods]) => {
     attached.add(name);
@@ -286,18 +294,15 @@ export function buildTree(index) {
         attached.add(mod);
         return {
           name: mod,
-          features: (m2f[mod] || []).map(code => ({
-            code,
-            fname: descs[code]?.name || '',
-            files: f2files[code] || []
-          }))
+          mname: modMeta[mod]?.name || '',
+          features: (m2f[mod] || []).map(featNode)
         };
       })
     };
   });
   const orphans = Object.keys(m2f)
     .filter(mod => !attached.has(mod))
-    .map(mod => ({ name: mod, features: (m2f[mod] || []).map(code => ({ code, fname: descs[code]?.name || '', files: f2files[code] || [] })) }));
+    .map(mod => ({ name: mod, mname: modMeta[mod]?.name || '', features: (m2f[mod] || []).map(featNode) }));
   if (orphans.length) projects.push({ name: '(unattached modules)', modules: orphans, orphan: true });
   // orphan features: registered in featureToFiles but not listed under any module
   const inModules = new Set();
@@ -308,7 +313,7 @@ export function buildTree(index) {
   return { projects, orphanFeatures };
 }
 
-function scopeTargetsOfOpenActions(ledger) {
+export function scopeTargetsOfOpenActions(ledger) {
   const open = (ledger.actions || []).filter(a => a.status === 'planned' || a.status === 'in_progress');
   const feats = new Set(); const mods = new Set(); const files = new Set(); const ids = [];
   for (const a of open) {
@@ -336,7 +341,7 @@ export function renderTreeText(index, { target = '', openActions = null } = {}) 
     lines.push(`▼ ${p.name}  (${p.modules.length} modules, ${nf} features)`);
     for (const m of p.modules) {
       const flag = S.mods.has(m.name) ? '  ← open action' : '';
-      lines.push(`  ▼ ${m.name}  (${m.features.length} features)${flag}`);
+      lines.push(`  ▼ ${m.name}${m.mname ? ` (${m.mname})` : ''}  (${m.features.length} features)${flag}`);
       for (const f of m.features) {
         const flag2 = S.feats.has(f.code) ? '  ← open action' : '';
         lines.push(`      ${f.code} ${f.fname ? `- ${f.fname}` : ''}${flag2}`);
@@ -360,8 +365,10 @@ export function renderTreeText(index, { target = '', openActions = null } = {}) 
 
 /**
  * Disk-drift check: indexed files that no longer exist on disk.
- * File keys are project-relative; resolve via index.projectPaths (project → dir
- * relative to workspace root), falling back to the workspace root.
+ * Index keys come in two shapes: project-relative ("host/index.js") and
+ * workspace-relative ("shoucang/client.js", with the project dir prefix).
+ * Resolve via index.projectPaths for the former; accept either shape —
+ * only flag stale when NEITHER resolves on disk.
  */
 export function findStaleFiles(index, rootPath) {
   const p2m = index.indexes?.projectToModules || {};
@@ -382,7 +389,9 @@ export function findStaleFiles(index, rootPath) {
   for (const [file, proj] of Object.entries(fileToProject)) {
     const base = paths[proj] ? resolve(rootPath, paths[proj]) : rootPath;
     try {
-      if (!existsSync(resolve(base, file))) stale.push(`${file} [${proj}]`);
+      if (!existsSync(resolve(base, file)) && !existsSync(resolve(rootPath, file))) {
+        stale.push(`${file} [${proj}]`);
+      }
     } catch { /* unreadable path — skip */ }
   }
   return stale;
@@ -447,21 +456,30 @@ export function renderMapHtml(index, { title = 'Project Nav Map', vector = null,
     const inOpen = S.feats.has(f.code);
     const style = inOpen ? ' style="color:#c0392b;font-weight:600"' : '';
     const flag = inOpen ? ' 🔴' : '';
+    const desc = [f.uv ? `用户：${esc(f.uv)}` : '', f.sv ? `系统：${esc(f.sv)}` : ''].filter(Boolean).join('<br>');
+    const descHtml = desc ? `<div class="feat-desc">${desc}</div>` : '';
     const files = f.files.map(file => {
       const fo = S.files.has(file) ? ' style="color:#c0392b"' : '';
       const ff = S.files.has(file) ? ' 🔴' : '';
       return `<li class="file"${fo}>${esc(file)}${ff}</li>`;
     }).join('');
-    if (!f.files.length) return `<li${style}>${esc(f.code)} ${esc(f.fname)}${flag} <span class="dim">(no files)</span></li>`;
-    return `<li${style}><details><summary>${esc(f.code)} ${esc(f.fname)}${flag} <span class="dim">(${f.files.length} files)</span></summary><ul>${files}</ul></details></li>`;
+    if (!f.files.length) {
+      const gap = desc ? '' : ' <span class="dim">— 无文件清单/无描述，待登记（nav_update --field files）</span>';
+      return `<li${style}><details><summary>${esc(f.code)} ${esc(f.fname)}${flag} <span class="dim">(no files)</span></summary>${descHtml}${gap}</details></li>`;
+    }
+    return `<li${style}><details><summary>${esc(f.code)} ${esc(f.fname)}${flag} <span class="dim">(${f.files.length} files)</span></summary>${descHtml}<ul>${files}</ul></details></li>`;
   };
   const modHtml = (m) => {
     const inOpen = S.mods.has(m.name);
     const style = inOpen ? ' style="color:#c0392b;font-weight:600"' : '';
     const flag = inOpen ? ' 🔴' : '';
-    return `<li><details open><summary${style}>${esc(m.name)}${flag} <span class="dim">(${m.features.length} features)</span></summary><ul>${m.features.map(featHtml).join('')}</ul></details></li>`;
+    const mlabel = m.mname ? ` <span class="dim">— ${esc(m.mname)}</span>` : '';
+    return `<li><details open><summary${style}>${esc(m.name)}${mlabel}${flag} <span class="dim">(${m.features.length} features)</span></summary><ul>${m.features.map(featHtml).join('')}</ul></details></li>`;
   };
-  const projHtml = (p) => `<li><details open><summary class="proj">${esc(p.name)} <span class="dim">(${p.modules.length} modules)</span></summary><ul>${p.modules.map(modHtml).join('')}</ul></details></li>`;
+  const projHtml = (p) => {
+    const pp = index.projectPaths?.[p.name] || '';
+    return `<li><details open><summary class="proj">📁 ${esc(p.name)} <span class="dim">${esc(pp)} · ${p.modules.length} modules</span></summary><ul>${p.modules.map(modHtml).join('')}</ul></details></li>`;
+  };
   const vec = [
     v.doing ? `<b>Doing:</b> ${esc(v.doing)}` : '',
     v.next ? `<b>Next:</b> ${esc(v.next)}` : '',
@@ -486,15 +504,18 @@ export function renderMapHtml(index, { title = 'Project Nav Map', vector = null,
  li{margin:1px 0;font-size:13.5px}
  li.file{color:#555;font-family:Consolas,monospace;font-size:12.5px}
  .dim{color:#888;font-weight:400;font-size:12px}
+ .feat-desc{color:#444;font-size:12.5px;margin:4px 0 4px 22px;padding:6px 10px;background:#f4f6fa;border-left:3px solid #c9d4e8;border-radius:0 4px 4px 0;line-height:1.6}
+ .howto{background:#f0f7f0;border:1px solid #cfe3cf;border-radius:8px;padding:10px 14px;margin:12px 0;font-size:12.5px;color:#2e4d2e;line-height:1.8}
  .legend{font-size:12px;color:#888;margin-top:16px}
 </style></head><body>
 <h1>🗺️ ${esc(title)}</h1>
 ${vec ? `<div class="vector">🧭 ${vec}</div>` : ''}
 ${S.ids.length ? `<div class="open-actions">🔴 Open actions（红=在未完结动作范围内）: ${S.ids.map(esc).join('; ')}</div>` : ''}
+<div class="howto">📖 <b>怎么读这张图</b>：层级为 <b>项目 → 模块 → 特征 → 文件</b>（点 ▸ 渐进展开）。<b>特征</b>（如 SC-S07）= 一条用户可感知的功能，展开后的小字是它的「用户视角 / 系统视角」说明；<b>文件</b> = 实现该特征的源码。🔴 红色 = 在未完结动作（open action）范围内，动这些文件前先处理对应动作。本图由 nav-index.json 自动生成，永不手工编辑。改动工作流：nav_query 查影响面 → nav_plan 登记动作 → 改代码 → nav_mark done 收口。</div>
 <ul style="list-style:none;padding-left:0">
 ${projects.map(projHtml).join('\n')}
 ${orphanHtml}
 </ul>
-<div class="legend">自动生成自 nav-index.json · 永不手工编辑 · 点击 ▸ 渐进展开 · 🔴 = open action 范围内</div>
+<div class="legend">生成自 .internal/nav-index.json（agent 自治理索引）· 🔴 = open action 范围内 · 灰字为辅助说明</div>
 </body></html>`;
 }
