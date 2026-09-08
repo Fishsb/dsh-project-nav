@@ -884,4 +884,15 @@ nav_query / nav_plan / nav_mark / nav_update / nav_add_feature / nav_add_module 
 
 buildTree 5 项目 0 孤儿；stale 仅 2 条已知 pmg 死链；vector 五消费点 / scopeGate / findStaleFiles 全部在位（§26 证据仍有效）；arch 两档指纹自 20:50 无文件变更，新鲜。
 
-_本文件应随项目推进持续更新。最后更新：2026-09-09 00:05_
+## 28. GitHub 发布与展示页（lk 00:27；锚点 PN-F06，架构档无代码变更直接开工）
+
+- **推送**：`cb819d4..8f28a4a main→main`（v0.2.9 全量：架构文档层 / 架构先行协议 / 双语 README / LICENSE / 包元数据；7 文件 +477/−35）
+- **展示页重排**（参考常规开源项目版式）：`README.md`（中文主）+ `README.en.md`（英文镜像）顶部互切；居中标题 + 4 徽章（version/license/dsh-tools/node）；治理循环 mermaid（GitHub 原生渲染）；12 工具表；三层模型表
+- **LICENSE 落盘**（BSD-3-Clause）——此前 package.json 声明了 license 却无 LICENSE 文件，即"标签不完整"的根因之一
+- **package.json**：+repository / homepage / bugs，keywords 6→12，author 更正 Fishsb (lk)
+- **仓库元数据**：description（中英双语一句）+ homepage（API PATCH 200）
+- **topics 12 个**（API PUT 200，GET 验证在列）：agent-tools · anti-drift · architecture · cli · deepseek · deepseek-harness · documentation · drift-detection · dsh · dsh-plugin · knowledge-graph · project-governance
+- **索引落点**：LICENSE + README.en.md 登记进 PN-F06（metadata 40→42 文件；0 孤儿；stale 不变；备份 `nav-index.pre-docs2.json`）
+- **实施备注**：gh 未登录，API 走 `git credential fill` 存储凭据（token 未回显、用后即弃于进程）；profile 副本与仓库无关，插件发布仍走 pnpm pack 循环
+
+_本文件应随项目推进持续更新。最后更新：2026-09-09 00:30_
