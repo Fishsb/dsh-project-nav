@@ -23,9 +23,12 @@ export const name = '@dsh-external/project-nav'
 export const inject = ['tools']
 
 export const Config = z.object({
-  // Personal default: the governed workspace root (D:\FF). Override via config
-  // if the plugin is pointed at another workspace.
-  root: z.string().default('D:/FF')
+  // Workspace root governed by this plugin — the folder whose .internal/
+  // holds the nav index/vector/actions/docs data (usually the PROJECT.md root).
+  // No machine-specific default: leave empty to fall back to the process
+  // working directory at load time (a boot log reports the resolved root).
+  // Set config.root to govern a specific workspace explicitly.
+  root: z.string().default('')
 })
 
 // ---- helpers ----
@@ -89,7 +92,15 @@ const OUTPUT = {
 // ---- plugin entry ----
 
 export function apply(ctx, config) {
-  const root = config.root
+  // Resolve the governed root at load time: explicit config.root wins;
+  // otherwise fall back to the process cwd and say so loudly at boot, so the
+  // plugin never silently targets a hardcoded machine-specific path.
+  const root = config?.root ? resolve(config.root) : process.cwd()
+  if (ctx.logger?.warn && !config?.root) {
+    ctx.logger.warn(`[project-nav] root config unset — governing process.cwd() (${root}). Set config.root to the workspace you want governed (see README "配置").`)
+  } else if (ctx.logger?.info) {
+    ctx.logger.info(`[project-nav] governing root: ${root} (config.root)`)
+  }
 
   // ---- 1. nav_query — bidirectional mapping + gates ----
   ctx.effect(() => ctx.tools.register(defineTool({
@@ -450,7 +461,7 @@ export function apply(ctx, config) {
         if (args.project) docs = docs.filter(d => d.project === args.project)
         if (args.tag) docs = docs.filter(d => (d.tags || []).includes(args.tag))
         if (docs.length === 0) {
-          return 'No reference docs registered. Use nav_add_doc to register them (推荐存放位置：D:\\FF\\refs\\<项目>\\).'
+          return 'No reference docs registered. Use nav_add_doc to register them (docs may live anywhere: any absolute path, directory or URL works — e.g. a refs/<project>/ folder under your workspace).'
         }
         if (args.task) {
           const ranked = suggestDocs(registry, { taskText: args.task, projects: args.project ? [args.project] : [], modules: [] })

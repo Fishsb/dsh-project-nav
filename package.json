@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/project-nav",
-  "version": "0.2.9",
-  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, governance-first action ledger (plan/begin/done), and a reference-docs registry consulted at plan time. v0.2.9: findStaleFiles accepts workspace-relative file keys (fixes mass false stale); nav_map HTML readability — module display names, per-feature user/system views, project disk paths, how-to-read guide.",
+  "version": "0.2.10",
+  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, governance-first action ledger (plan/begin/done), and a reference-docs registry consulted at plan time. v0.2.10: portable root — no machine-specific default (config.root with cwd fallback + boot log); neutral doc-location hints; real regression tests (test/core.test.mjs); README corrected (root config docs, arch layer marked as companion skill, not packaged).",
   "type": "module",
   "main": "./host/index.js",
   "exports": {
@@ -14,7 +14,7 @@
     "package.json"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test"
   },
   "dsh": {
     "bundle": {

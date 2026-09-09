@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.2.9-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.2.10-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -26,7 +26,7 @@ AI coding 的长期项目会漂移：文件越堆越多却没有功能映射、�
 ## ✨ 核心能力
 
 - 🗺️ **双向治理地图**：项目→模块→功能→文件 四维交叉索引，单一数据真身，一张图看清全部结构
-- 🏛️ **架构文档层（核心）**：L1 项目总览 + L2 特征主链（贯通式流程、行号级证据），agent 开发前必读，指纹过期自动重生成
+- 🏛️ **架构文档层（生态配合，不在本包内）**：L1 项目总览 + L2 特征主链（贯通式流程、行号级证据）、指纹过期自动重生成，由配套的 arch-view 技能提供——本仓库只交付索引与治理闭环
 - 🏛️ **架构先行协议**：任务必须锚定架构节点才入账；无锚点 = 架构不足 → 先修架构再开发；同节点 ≥3 次修补强制回架构层整体审视
 - 🎯 **治理事务环**：`nav_plan` → `begin` → 改动 → `done`（abort 兜底），单 in_progress 强制，未完成动作 = 漂移信号，地图标红
 - 🧭 **主线向量带牙齿**：doing / next / notDoing / exitCondition——方案撞上"不做什么"**直接拒绝立项**
@@ -66,9 +66,9 @@ flowchart LR
 
 | 层 | 载体 | 读者 |
 |----|------|------|
-| 索引层 | `.internal/nav-index.json`（四维映射 + 原子写） | 机器（工具查询） |
-| **架构文档层（核心）** | `.internal/arch/*.md`：L1 总览 + L2 特征主链 | **agent 开发前必读** + 人 |
-| 渲染层 | nav_map HTML / 架构投影图 | 人（只看不写回） |
+| 索引层 | `<root>/.internal/nav-index.json`（四维映射 + 原子写） | 机器（工具查询） |
+| 架构文档层（生态配合） | `<root>/.internal/arch/*.md`（由配套 arch-view 技能维护，不在本包） | agent + 人 |
+| 渲染层 | nav_map HTML（本包生成） | 人（只看不写回） |
 
 ## 📦 安装
 
@@ -77,21 +77,36 @@ pnpm pack
 dsh plugin --profile web add "@dsh-external/project-nav@file:<tgz 路径>"
 ```
 
-依赖：`@deepseek-ai/dsh-tools`（peer，精确锁 `0.1.2-rc.1`）。
+依赖：`@deepseek-ai/dsh-tools`（peer，精确锁 `0.1.2-rc.1`）；Node ≥ 18。
+
+## ⚙️ 配置 root（重要）
+
+插件治理哪个工作区由 `root` 决定——被治理目录下的 `.internal/` 存放全部数据。
+`root` **没有机器相关默认值**：未配置时回退到 DSH 进程的工作目录（cwd），启动日志会以 warn 打印实际生效的 root。
+
+在 profile 的 patch 层（如 `~/.dsh/profiles/<profile>/cordis.patch.yml`）给插件条目补 `config`：
+
+```yaml
+- id: project-nav
+  config:
+    root: 'C:/path/to/your/workspace'   # 指向含 PROJECT.md 的被治理工作区
+```
+
+配置后重启 profile 生效。启动日志中显示的 root 就是要被治理的目录——请确认它符合预期再开始用 `nav_*` 工具。
 
 ## 🗃️ 数据
 
-单一数据真身 `<工作区根>/.internal/`（nav-index / vector / nav-actions / nav-docs / arch），其余全部自动派生——**零每项目配置**。索引与数据文件不进 git（`.gitignore`），数据手术一律先备份。
+单一数据真身 `<root>/.internal/`（nav-index / vector / nav-actions / nav-docs），其余全部自动派生——**除 `root` 外零每项目配置**。索引与数据文件不进 git（`.gitignore`），数据手术一律先备份。`.internal/arch/*.md` 由配套 arch-view 技能维护，不在本包数据流内。
 
 ## 🛠️ 开发
 
 ```bash
 pnpm install
-pnpm test      # node --test
+pnpm test      # node --test（真实回归：test/core.test.mjs，全部在临时目录跑，不碰真实工作区）
 pnpm pack      # 构建发布包
 ```
 
-发布循环：bump version → `pnpm pack` → `dsh plugin --profile web add "@dsh-external/project-nav@file:<tgz>"` → 重启 dsh-web。
+发布循环：bump version → `pnpm pack` → `dsh plugin --profile web add "@dsh-external/project-nav@file:<tgz>"` → 重启 dsh-web（记得补 `config.root`，见上）。
 
 工程日志见 [HANDOFF.md](./HANDOFF.md)（§1–§27：决策 / 数据手术 / 闭环审查全记录）。
 

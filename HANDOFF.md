@@ -4,6 +4,8 @@
 > **工作目录**：`D:\FF\project-nav`  
 > **关联工作区**：`D:\FF`（四项目治理文档：`PROJECT.md` + `modules/` + `.internal/nav-index.json`）
 
+> ⚠️ **读者注意（开源可移植性）**：本文件是作者本机开发日志，含作者环境路径（`D:\FF`、`D:\FF\refs`、`C:\Users\lk` 等）与个人工作流细节。它们**不是插件的运行时依赖**——插件所有路径均可配置（见 README「配置 root」）。维护/贡献者参考时请勿把这些路径当作对外约定；对外文档以 README.md / README.en.md 为准。
+
 ---
 
 ## 一、项目定位
@@ -895,4 +897,16 @@ buildTree 5 项目 0 孤儿；stale 仅 2 条已知 pmg 死链；vector 五消�
 - **索引落点**：LICENSE + README.en.md 登记进 PN-F06（metadata 40→42 文件；0 孤儿；stale 不变；备份 `nav-index.pre-docs2.json`）
 - **实施备注**：gh 未登录，API 走 `git credential fill` 存储凭据（token 未回显、用后即弃于进程）；profile 副本与仓库无关，插件发布仍走 pnpm pack 循环
 
-_本文件应随项目推进持续更新。最后更新：2026-09-09 00:30_
+## 29. v0.2.10 开源可移植性修复（review → 修复；锚点 PN-F06 发布面 + 代码面）
+
+- **背景**：审查结论——新用户按 README 安装会踩作者机器耦合：① `Config.root` 默认硬编码 `D:/FF`（全仓无配置文档）；② README 主打"架构文档层"实为作者本机 arch-view 技能提供、不在包内；③ `nav_docs` 空态提示夹带 `D:\FF\refs\<项目>\`；④ `pnpm test` 指向不存在的 `test/*.test.mjs`，空跑假绿。
+- **改动**（用户确认：不做版本适配，peer 锁 `0.1.2-rc.1` 与 Node 要求保持）：
+  - `host/index.js`：`root` 默认 `''`（无机器路径），apply 时 `config.root` 显式则 `resolve`，否则回退 `process.cwd()` 并 boot warn 打印生效 root（提示看 README「配置 root」）；`nav_docs` 空态提示改为中性文案。
+  - `test/core.test.mjs`：新增 12 项真实回归（原子 JSON 往返 / metadata / queryIndex / id 自增 / suggestDocs / scopeTargets / findStaleFiles / 三种渲染），全部跑临时目录，不碰真实工作区。
+  - `package.json`：version 0.2.10；`test` script 由 glob 改为 `node --test`（默认发现 test/*.test.mjs，无 shell glob 依赖）。
+  - `README.md` / `README.en.md`：新增「配置 root」小节（patch 层 `config.root` 示例 + cwd 回退语义 + 启动日志核对）；架构文档层改标"生态配合，不在本包内"；三层模型/数据节同步；"零每项目配置"修正为"除 root 外零每项目配置"；开发节注明真实测试与发布循环补 root。
+  - `HANDOFF.md`：头部加机器路径警示（本日志路径非对外约定）。
+- **验证**：pnpm test 12/12 绿；pnpm pack 产物 0.2.10 tgz（旧 0.2.9 tgz 删除）；fresh clone → install → import 冒烟通过。
+- **作者本机后续动作**：重装 0.2.10 时必须在 profile patch 层补 `config.root: 'D:/FF'`（旧默认值已移除），否则回退 cwd 治理到错误目录——README「配置 root」有示例。
+
+_本文件应随项目推进持续更新。最后更新：2026-09-10 05:10_
