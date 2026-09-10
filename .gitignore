@@ -3,3 +3,5 @@ node_modules/
 .workbuddy/
 .internal-bak*/
 .internal/
+.dsh-vision-toolkit/
+*.tgz.superseded*

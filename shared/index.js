@@ -23,22 +23,25 @@ const DOCS_FILENAME = '.internal/nav-docs.json';
 const LOCK_STALE_MS = 15000;
 const LOCK_TIMEOUT_MS = 10000;
 const LOCK_WAIT_MS = 50;
+const LOCKS_DIR = '.internal/locks';
 const SESSION_LABEL_LEN = 8;
 
 /** Per-process serialization: all cordis tools run in one process, so queue them first. */
-let ledgerQueue = Promise.resolve();
+let workspaceQueue = Promise.resolve();
 function enqueue(task) {
-  const run = ledgerQueue.then(task, task);
-  ledgerQueue = run.then(() => undefined, () => undefined);
+  const run = workspaceQueue.then(task, task);
+  workspaceQueue = run.then(() => undefined, () => undefined);
   return run;
 }
 
-// Synchronous sleep: the ledger critical sections are deliberately sync
-// (a read-modify-write must not interleave with another await in-process).
-const sleepSync = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+// Async sleep: the acquire loop must never block the event loop. The old
+// synchronous sleep froze the whole daemon for up to LOCK_TIMEOUT_MS whenever the
+// lock was contended — with several sessions that is a self-inflicted outage.
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-export function lockPathFor(rootPath) {
-  return resolve(rootPath, ACTIONS_FILENAME + '.lock');
+/** Lock file for one target, kept under .internal/locks/ so the workspace root stays clean. */
+export function lockPathFor(rootPath, name = 'nav-actions.json') {
+  return resolve(rootPath, LOCKS_DIR, `${String(name).replace(/[\\/]/g, '_')}.lock`);
 }
 
 function readLockFile(p) {
@@ -51,16 +54,20 @@ function readLockFile(p) {
 }
 
 /**
- * Run one ledger critical section under an exclusive lock. A held lock re-enters
- * (token check) instead of deadlocking; a lock whose owner died is broken by the
- * lock file's own age, so a crashed session never blocks the workspace forever.
+ * Run one critical section under an exclusive per-target lock. A stale lock (its
+ * owner died mid-section) is broken by the lock file's own age, so a crashed
+ * session never wedges the workspace.
+ *
+ * CONTRACT: a locked section must not acquire another lock — the in-process queue
+ * is a single chain, so a nested acquire would deadlock. All mutation entry points
+ * below obey this by touching exactly one file per section.
  */
-export async function withLedgerLock(rootPath, fn) {
-  return enqueue(() => {
-    const lockPath = lockPathFor(rootPath);
+export async function withFileLock(rootPath, name, fn) {
+  return enqueue(async () => {
+    const lockPath = lockPathFor(rootPath, name);
     mkdirSync(dirname(lockPath), { recursive: true });
     const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const payload = JSON.stringify({ token, pid: process.pid, at: new Date().toISOString() });
+    const payload = JSON.stringify({ token, pid: process.pid, at: new Date().toISOString(), target: name });
     const started = Date.now();
     let held = false;
     while (!held) {
@@ -72,21 +79,57 @@ export async function withLedgerLock(rootPath, fn) {
       } catch (e) {
         if (e && e.code === 'EEXIST') {
           const holder = readLockFile(lockPath);
-          if (holder && holder.token === token) return fn();   // re-entrant same holder
+          if (holder && holder.token === token) return await fn();   // re-entrant same holder
           let aged = false;
           try { aged = Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS; } catch { aged = true; }
           if (aged) { try { unlinkSync(lockPath); } catch { /* another waiter won the break */ } continue; }
           if (Date.now() - started > LOCK_TIMEOUT_MS) {
-            throw new Error(`[project-nav] ledger lock busy for ${LOCK_TIMEOUT_MS}ms (${lockPath}, held by pid ${holder?.pid ?? '?'} since ${holder?.at ?? '?'}). Another session is writing the action ledger; retry in a moment.`);
+            throw new Error(`[project-nav] lock busy for ${LOCK_TIMEOUT_MS}ms on ${name} (${lockPath}, held by pid ${holder?.pid ?? '?'} since ${holder?.at ?? '?'}). Another session is writing the same file; retry in a moment.`);
           }
-          sleepSync(LOCK_WAIT_MS);
+          await sleep(LOCK_WAIT_MS);
           continue;
         }
         throw e;
       }
     }
-    try { return fn(); } finally { try { rmSync(lockPath, { force: true }); } catch { /* lock file already gone */ } }
+    try { return await fn(); } finally { try { rmSync(lockPath, { force: true }); } catch { /* lock file already gone */ } }
   });
+}
+
+/** Ledger lock — a named convenience over the generic per-target file lock. */
+export async function withLedgerLock(rootPath, fn) {
+  return withFileLock(rootPath, 'nav-actions.json', fn);
+}
+
+// ---- mutation entry points (every read-modify-write of shared state goes here) ----
+// A read-modify-write without a lock silently drops the other writer's update.
+// That is exactly how PN-P01's index kept reverting: two sessions edited the same
+// index, each wrote back its own snapshot, the later rename won. Every write path
+// in host/ now goes through one of these; none of them nests another lock.
+
+async function mutateJsonFile(rootPath, lockName, load, save, mutator) {
+  return withFileLock(rootPath, lockName, async () => {
+    const data = load(rootPath);
+    const result = await mutator(data);
+    save(rootPath, data);
+    return result;
+  });
+}
+
+export function mutateIndex(rootPath, mutator) {
+  return mutateJsonFile(rootPath, 'nav-index.json', loadIndex, saveIndex, mutator);
+}
+
+export function mutateVector(rootPath, mutator) {
+  return mutateJsonFile(rootPath, 'vector.json', loadVector, saveVector, mutator);
+}
+
+export function mutateDocs(rootPath, mutator) {
+  return mutateJsonFile(rootPath, 'nav-docs.json', loadDocs, saveDocs, mutator);
+}
+
+export function mutateArch(rootPath, mutator) {
+  return mutateJsonFile(rootPath, 'nav-arch.json', loadArch, saveArch, mutator);
 }
 
 // ---- path helpers ----
@@ -853,10 +896,10 @@ export function renderTreeText(index, { target = '', openActions = null } = {}) 
   const lines = [];
   for (const p of shown) {
     const nf = p.modules.reduce((n, m) => n + m.features.length, 0);
-    lines.push(`▼ ${p.name}  (${p.modules.length} modules, ${nf} features)`);
+    lines.push(`▼ ${p.name}  (${p.modules.length} module${p.modules.length === 1 ? '' : 's'}, ${nf} feature${nf === 1 ? '' : 's'})`);
     for (const m of p.modules) {
       const flag = S.mods.has(m.name) ? '  ← open action' : '';
-      lines.push(`  ▼ ${m.name}${m.mname ? ` (${m.mname})` : ''}  (${m.features.length} features)${flag}`);
+      lines.push(`  ▼ ${m.name}${m.mname ? ` (${m.mname})` : ''}  (${m.features.length} feature${m.features.length === 1 ? '' : 's'})${flag}`);
       for (const f of m.features) {
         const flag2 = S.feats.has(f.code) ? '  ← open action' : '';
         lines.push(`      ${f.code} ${f.fname ? `- ${f.fname}` : ''}${flag2}`);
@@ -998,11 +1041,11 @@ export function renderMapHtml(index, { title = 'Project Nav Map', vector = null,
     const style = inOpen ? ' style="color:#c0392b;font-weight:600"' : '';
     const flag = inOpen ? ' 🔴' : '';
     const mlabel = m.mname ? ` <span class="dim">— ${esc(m.mname)}</span>` : '';
-    return `<li><details open><summary${style}>${esc(m.name)}${mlabel}${flag} <span class="dim">(${m.features.length} features)</span></summary><ul>${m.features.map(featHtml).join('')}</ul></details></li>`;
+    return `<li><details open><summary${style}>${esc(m.name)}${mlabel}${flag} <span class="dim">(${m.features.length} feature${m.features.length === 1 ? '' : 's'})</span></summary><ul>${m.features.map(featHtml).join('')}</ul></details></li>`;
   };
   const projHtml = (p) => {
     const pp = index.projectPaths?.[p.name] || '';
-    return `<li><details open><summary class="proj">📁 ${esc(p.name)} <span class="dim">${esc(pp)} · ${p.modules.length} modules</span></summary><ul>${p.modules.map(modHtml).join('')}</ul></details></li>`;
+    return `<li><details open><summary class="proj">📁 ${esc(p.name)} <span class="dim">${esc(pp)} · ${p.modules.length} module${p.modules.length === 1 ? '' : 's'}</span></summary><ul>${p.modules.map(modHtml).join('')}</ul></details></li>`;
   };
   const vec = [
     v.doing ? `<b>Doing:</b> ${esc(v.doing)}` : '',
@@ -1035,7 +1078,7 @@ export function renderMapHtml(index, { title = 'Project Nav Map', vector = null,
 <h1>🗺️ ${esc(title)}</h1>
 ${vec ? `<div class="vector">🧭 ${vec}</div>` : ''}
 ${S.ids.length ? `<div class="open-actions">🔴 Open actions（红=在未完结动作范围内）: ${S.ids.map(esc).join('; ')}</div>` : ''}
-<div class="howto">📖 <b>怎么读这张图</b>：层级为 <b>项目 → 模块 → 特征 → 文件</b>（点 ▸ 渐进展开）。<b>特征</b>（如 SC-S07）= 一条用户可感知的功能，展开后的小字是它的「用户视角 / 系统视角」说明；<b>文件</b> = 实现该特征的源码。🔴 红色 = 在未完结动作（open action）范围内，动这些文件前先处理对应动作。本图由 nav-index.json 自动生成，永不手工编辑。改动工作流：nav_query 查影响面 → nav_plan 登记动作 → 改代码 → nav_mark done 收口。</div>
+<div class="howto">📖 <b>怎么读这张图</b>：层级为 <b>项目 → 模块 → 特征 → 文件</b>（点 ▸ 渐进展开）。<b>特征</b>（如 SC-S07）= 一条用户可感知的功能，展开后的小字是它的「用户视角 / 系统视角」说明；<b>文件</b> = 实现该特征的源码。🔴 红色 = 在未完结动作（open action）范围内，动这些文件前先处理对应动作。本图由 nav-index.json 自动生成，永不手工编辑。改动工作流：nav_query 查影响面 → nav_plan 登记动作（必带 anchor 锚定架构节点；单目标自动取锚）→ 改代码 → nav_mark done 收口；同一锚点反复补丁会触发计数闸，此时先 nav_adr 出架构决策再动手。</div>
 <ul style="list-style:none;padding-left:0">
 ${projects.map(projHtml).join('\n')}
 ${orphanHtml}

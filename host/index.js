@@ -1,23 +1,25 @@
 // @dsh-external/project-nav — anti-drift governance for agent-maintained projects
 // Design core: governance-first transaction loop (HANDOFF §14):
 //   nav_query (scope) → nav_plan (register action) → nav_mark begin → change → nav_mark done
-// 13 tools. Core logic lives in ../shared/index.js (single source, no duplication).
+// 10 tools. Core logic lives in ../shared/index.js (single source, no duplication).
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 import { writeFileSync, mkdirSync, readFileSync, existsSync, renameSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import {
-  loadIndex, saveIndex, getIndexAge,
-  loadVector, saveVector,
-  loadActions, loadActionsReconciled, mutateActions, nextActionId, selfOwner, DEFAULT_LEASE_TTL_MS,
+  loadIndex, getIndexAge,
+  loadVector,
+  loadActions, loadActionsReconciled, mutateActions,
+  mutateIndex, mutateVector, mutateDocs, mutateArch, withFileLock,
+  nextActionId, selfOwner, DEFAULT_LEASE_TTL_MS,
   isLeaseExpired, canonPath, scopeOwnModules, sessionLabel, sessionBusyWith, checkScopeConflicts, queuePosition, actorLabel, describeConflicts,
-  loadDocs, saveDocs, nextDocId, suggestDocs,
+  loadDocs, nextDocId, suggestDocs,
   queryIndex, partialSearch, normalizePath,
   renderTreeText, renderMapHtml, renderProjectDocSection,
-  findStaleFiles, scopeTargetsOfOpenActions, withLedgerLock,
+  findStaleFiles, scopeTargetsOfOpenActions,
   snapshotScopeFiles, verifyScopeFingerprint,
-  loadArch, saveArch, nextDecisionId, checkAnchor, repeatPressure, REPEAT_PATCH_THRESHOLD, lastDecisionFor
+  loadArch, nextDecisionId, checkAnchor, repeatPressure, REPEAT_PATCH_THRESHOLD, lastDecisionFor
 } from '../shared/index.js'
 
 // ---- Plugin metadata (Cordis contract) ----
@@ -210,6 +212,17 @@ export function apply(ctx, config) {
     ctx.logger.warn(`[project-nav] root config unset — governing process.cwd() (${root}). Set config.root to the workspace you want governed (see README "配置").`)
   } else if (ctx.logger?.info) {
     ctx.logger.info(`[project-nav] governing root: ${root} (config.root)`)
+  }
+
+  // G3 (HANDOFF §33): every read/write in this plugin goes through node:fs.
+  // Some deployments expose a sandboxed fs capability (ctx.fs) that fences
+  // mutations by workspace policy. When it is present, say so loudly instead of
+  // silently bypassing the fence. The async fs-port swap is deliberately deferred
+  // until a confined deployment actually exists (complexity budget, v0.6.0).
+  let fsCapability = null
+  try { fsCapability = ctx.get?.('fs') ?? ctx.fs ?? null } catch { fsCapability = null }
+  if (fsCapability && ctx.logger?.warn) {
+    ctx.logger.warn('[project-nav] a sandboxed fs capability (ctx.fs) is present, but this plugin reads/writes .internal/ through node:fs directly. If this deployment confines plugin fs access, governance data may bypass the fence — see HANDOFF §33 (G3).')
   }
 
   // ---- 1. nav_query — bidirectional mapping + gates ----
@@ -587,7 +600,7 @@ export function apply(ctx, config) {
     output: OUTPUT,
     async execute(args) {
       try {
-        const index = loadIndex(root)
+        return await mutateIndex(root, (index) => {
         if (index.indexes?.featureToFiles?.[args.target]) {
           if (args.field === 'files') {
             const newList = splitList(args.value).map(normalizePath)
@@ -600,7 +613,6 @@ export function apply(ctx, config) {
               if (!index.indexes.fileToFeature[f]) index.indexes.fileToFeature[f] = []
               if (!index.indexes.fileToFeature[f].includes(args.target)) index.indexes.fileToFeature[f].push(args.target)
             }
-            saveIndex(root, index)
             return `✓ Feature ${args.target} files replaced: ${newList.length} file(s), mappings rebuilt.`
           }
           if (!args.field || args.value === undefined) return 'ERROR: updating an existing entry requires field + value.'
@@ -608,13 +620,11 @@ export function apply(ctx, config) {
           index.descriptions[args.target] = index.descriptions[args.target] || {}
           index.descriptions[args.target][args.field] = args.value
           index.descriptions[args.target].lastModified = now_()
-          saveIndex(root, index)
           return `✓ Updated feature ${args.target}: ${args.field} = "${args.value}"`
         }
         if (index.indexes?.moduleToFeatures?.[args.target]) {
           if (args.features !== undefined) {
             index.indexes.moduleToFeatures[args.target] = splitList(args.features)
-            saveIndex(root, index)
             return `✓ Module ${args.target} feature list replaced (${index.indexes.moduleToFeatures[args.target].length} feature(s)).`
           }
           if (!args.field || args.value === undefined) return 'ERROR: updating an existing entry requires field + value (or features= for modules).'
@@ -622,7 +632,6 @@ export function apply(ctx, config) {
           index.moduleMeta[args.target] = index.moduleMeta[args.target] || {}
           index.moduleMeta[args.target][args.field] = args.value
           index.moduleMeta[args.target].lastModified = now_()
-          saveIndex(root, index)
           return `✓ Updated module ${args.target}: ${args.field} = "${args.value}"`
         }
         const wantsModule = args.features !== undefined || args.project !== undefined
@@ -639,7 +648,6 @@ export function apply(ctx, config) {
           index.indexes.moduleToFeatures[args.target] = feats
           if (!index.moduleMeta) index.moduleMeta = {}
           index.moduleMeta[args.target] = { ...(index.moduleMeta[args.target] || {}), name: args.name || '' }
-          saveIndex(root, index)
           return `✓ Module ${args.target} created: ${feats.length} feature(s)` + (args.project ? `, attached to project ${args.project}` : '') + attachNote
         }
         const fileList = splitList(args.files).map(normalizePath)
@@ -655,15 +663,14 @@ export function apply(ctx, config) {
           systemView: args.systemView || '',
           createdAt: now_()
         }
-        saveIndex(root, index)
         return `✓ Feature ${args.target} created with ${fileList.length} file(s)\n  ⚠ Not attached to any module yet — nav_update again with target=<module>, features=<codes>, project=<name> to place it on the map.`
+        })
       } catch (e) { return err(e) }
     }
   })), 'project-nav: update')
 
-  // ---- 5. (registration tools merged into nav_update — the single upsert entry point) ----
+  // ---- 5.–7. (registration tools merged into nav_update — the single upsert entry point) ----
 
-  // ---- 8. nav_docs — reference docs: query AND register in one tool (辅助收敛） ----
   // ---- 8. nav_docs — reference docs: query AND register in one tool ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_docs',
@@ -682,18 +689,17 @@ export function apply(ctx, config) {
       try {
         if (args.path || args.title || args.when) {
           if (!args.path || !args.title || !args.when) return 'ERROR: registering requires title + path + when (when is the task routing rule).'
-          const registry = loadDocs(root)
-          if (registry.docs.some(d => d.path === args.path)) {
-            return `Doc already registered: ${registry.docs.find(d => d.path === args.path).id} (${args.path}).`
-          }
           const isUrl = /^https?:\/\//i.test(args.path)
           if (!isUrl && !existsSync(args.path)) {
             return `✗ Path does not exist on disk: ${args.path}\n  Doc NOT registered (dead links are rejected).`
           }
-          const doc = { id: nextDocId(registry), title: args.title, path: args.path, when: args.when, project: args.project || '', tags: splitList(args.tags), addedAt: new Date().toISOString() }
-          registry.docs.push(doc)
-          saveDocs(root, registry)
-          return `✓ Registered ${doc.id} "${doc.title}"\n  → ${doc.path}\n  when: ${doc.when}`
+          return await mutateDocs(root, (registry) => {
+            const dup = (registry.docs || []).find(d => d.path === args.path)
+            if (dup) return `Doc already registered: ${dup.id} (${args.path}).`
+            const doc = { id: nextDocId(registry), title: args.title, path: args.path, when: args.when, project: args.project || '', tags: splitList(args.tags), addedAt: new Date().toISOString() }
+            registry.docs.push(doc)
+            return `✓ Registered ${doc.id} "${doc.title}"\n  → ${doc.path}\n  when: ${doc.when}`
+          })
         }
         const registry = loadDocs(root)
         let docs = registry.docs || []
@@ -764,23 +770,27 @@ export function apply(ctx, config) {
         const index = loadIndex(root)
         const vector = loadVector(root)
         const section = renderProjectDocSection(index, { vector, arch: loadArch(root) })
-        let content = ''
-        if (existsSync(docPath)) content = readFileSync(docPath, 'utf-8')
-        const START = '<!-- nav:auto:start -->'
-        const END = '<!-- nav:auto:end -->'
-        const s = content.indexOf(START)
-        const e = content.indexOf(END)
-        if (s !== -1 && e !== -1 && e > s) {
-          content = content.slice(0, s) + section + content.slice(e + END.length)
-        } else {
-          content = (content ? content.replace(/\s*$/, '\n\n') : '') + section + '\n'
-        }
-        const tmp = docPath + '.tmp'
-        writeFileSync(tmp, content, 'utf-8')
-        renameSync(tmp, docPath)
-        const nProjects = Object.keys(index.indexes?.projectToModules || {}).length
-        const nFeatures = Object.keys(index.indexes?.featureToFiles || {}).length
-        return `✓ ${docPath} auto-section aligned (source of truth: .internal/nav-index.json)\n  Coverage: ${nProjects} projects, ${nFeatures} features. Narrative content outside markers untouched.`
+        // The marker replacement is a read-modify-write of a workspace file: two
+        // sessions syncing at once would interleave and corrupt the auto section.
+        return await withFileLock(root, 'PROJECT.md', () => {
+          let content = ''
+          if (existsSync(docPath)) content = readFileSync(docPath, 'utf-8')
+          const START = '<!-- nav:auto:start -->'
+          const END = '<!-- nav:auto:end -->'
+          const s = content.indexOf(START)
+          const e = content.indexOf(END)
+          if (s !== -1 && e !== -1 && e > s) {
+            content = content.slice(0, s) + section + content.slice(e + END.length)
+          } else {
+            content = (content ? content.replace(/\s*$/, '\n\n') : '') + section + '\n'
+          }
+          const tmp = docPath + '.tmp'
+          writeFileSync(tmp, content, 'utf-8')
+          renameSync(tmp, docPath)
+          const nProjects = Object.keys(index.indexes?.projectToModules || {}).length
+          const nFeatures = Object.keys(index.indexes?.featureToFiles || {}).length
+          return `✓ ${docPath} auto-section aligned (source of truth: .internal/nav-index.json)\n  Coverage: ${nProjects} projects, ${nFeatures} features. Narrative content outside markers untouched.`
+        })
       } catch (e) { return err(e) }
     }
   })), 'project-nav: sync-docs')
@@ -881,14 +891,12 @@ export function apply(ctx, config) {
     output: OUTPUT,
     async execute(args) {
       try {
-        const v = loadVector(root)
-        const next = {
+        const next = await mutateVector(root, (v) => ({
           doing: args.doing ?? v.doing ?? '',
           next: args.next ?? v.next ?? '',
           notDoing: args.notDoing ?? v.notDoing ?? '',
           exitCondition: args.exit ?? v.exitCondition ?? ''
-        }
-        saveVector(root, next)
+        }))
         return [
           '✓ Mainline vector updated:',
           `  Doing: ${next.doing}`,
@@ -922,21 +930,24 @@ export function apply(ctx, config) {
             '  Register the node first with nav_update (upsert), or anchor to an arch doc under .internal/arch/ — an unanchored ADR is not traceable.'
           ].join('\n')
         }
-        const arch = loadArch(root)
-        const pressure = repeatPressure(arch, (loadActions(root).actions || []), args.anchor)
-        const d = {
-          id: nextDecisionId(arch),
-          anchor: normalizePath(String(args.anchor)),
-          anchorKind: chk.kind,
-          reason: args.reason,
-          decision: args.decision,
-          impact: args.impact || '',
-          action: args.action || '',
-          session: sid || '',
-          createdAt: new Date().toISOString()
-        }
-        arch.decisions.push(d)
-        saveArch(root, arch)
+        const pressure = repeatPressure(loadArch(root), (loadActions(root).actions || []), args.anchor)
+        // Allocate the ADR id INSIDE the lock: two concurrent decisions must not
+        // both read ADR-007 and both write ADR-007 (same class of bug as ACT ids).
+        const d = await mutateArch(root, (arch) => {
+          const decision = {
+            id: nextDecisionId(arch),
+            anchor: normalizePath(String(args.anchor)),
+            anchorKind: chk.kind,
+            reason: args.reason,
+            decision: args.decision,
+            impact: args.impact || '',
+            action: args.action || '',
+            session: sid || '',
+            createdAt: new Date().toISOString()
+          }
+          arch.decisions.push(decision)
+          return decision
+        })
         return [
           `✓ ${d.id} recorded for anchor ${d.anchor} (${d.anchorKind})`,
           `  reason:   ${d.reason}`,

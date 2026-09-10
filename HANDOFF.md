@@ -1113,4 +1113,94 @@ _本文件应随项目推进持续更新。最后更新：2026-09-10 10:05_
 1. **按注释区间做块删除时误删了同区块的四个导出**（`loadArch` / `saveArch` / `nextDecisionId` / `checkAnchor`）——只核对了区间首尾，没核对区间**内容**；表现为 host 加载即 `does not provide an export named 'checkAnchor'`。修复：补回四函数。**教训：块删除必须先列出区间内容再删，不能只对首尾锚点。**
 2. **生成脚本的转义连番踩坑**：PowerShell here-string 生成 JS 脚本时，路径反斜杠与 `'@` 序列被吞，出现「脚本没跑却以为跑了」的假象，白耗数轮。修复：内置 fs 工具恢复后全部改用精确 `edit`。**教训：能用文件工具就不要用生成脚本改代码。**
 
-_本文件应随项目推进持续更新。最后更新：2026-09-10 11:05_
+## 33. 发布声明对齐修复：声明↔实体二次漂移（lk 2026-09-10 指令；锚点 PN-F06）
+
+### 33.1 问题（DSH 侧升级前审查发现）
+
+| 层 | 实测值 | 判据 |
+|---|---|---|
+| profile 声明 | `file:D:/FF/project-nav/dsh-external-project-nav-0.4.0.tgz` | profile package.json |
+| 该 tgz **内部** version | **0.4.0**（真旧版） | `tar -xOf … package/package.json` |
+| profile 实体 | **0.6.0** | 实体 package.json |
+| 实体 vs 源内容 | **逐字节 IDENTICAL**（host/shared/patch/package.json） | SHA256 |
+
+即：上次更新**未走 pack + 声明同步**，而是把源文件**手工复制进 profile 副本**（手法同 §21）。后果：任何重装/刷新按声明解析 → **静默退化到 0.4.0**，丢 v0.5 架构先行协议 + v0.6 收敛改造。**这是同型问题第二次复发**（第一次见复核卡「部署声明与实体一度不一致」：声明 0.2.10 vs 实体 0.4.0）。
+
+### 33.2 根因（流程，不是笔误）
+
+产物名含版本号 + 声明文本手工维护 → 两者必须同步，而既有发布步骤里**没有「改声明」这一强制环节**；手工复制副本可让插件"看起来更新了"，从而掩盖声明未同步。
+
+### 33.3 本次修复（ACT-003，未重装、未重启）
+
+| 步骤 | 结果 |
+|---|---|
+| `pnpm pack`（D:/FF/project-nav） | ✅ `dsh-external-project-nav-0.6.0.tgz` 41220B，内部 version=0.6.0，含 host/shared/package.json/LICENSE/README×2/cordis.patch.yml，**无 node_modules 混入** |
+| 归档旧产物 | ✅ `0.4.0.tgz` → `.tgz.superseded-20260910`（防再次误指向） |
+| 更新 profile 声明 | ✅ → `file:D:/FF/project-nav/dsh-external-project-nav-0.6.0.tgz`；备份 `package.json.bak-projectnav-declfix-20260910-130130`（含 pnpm-lock 同步备份） |
+| 三层一致性 | ✅ 声明路径可解析 / tgz 内部 0.6.0 = 实体 0.6.0 / host+shared+patch SHA256 全 MATCH |
+| 单实例拓扑 | ✅ `dsh-tools`/`cordis`/`dsh-llm`/`dsh-client-locale` 四链接仍 → 核心副本，未受影响 |
+| patch 层 | ✅ 无 `project-nav disabled` 残留 |
+| `dsh --profile web --dump-config` | ✅ exit=0、583 行、无 error/duplicate 信号；project-nav 条目正常 |
+
+**为何不重装**：实体内容已与源一致（IDENTICAL），重装无收益，却会触发 pnpm peer 重解析 → 直撞 §11 双实例事故面。**为何不重启**：无代码/装配形态变更（仅声明文本），且重启属用户红线操作。
+
+### 33.4 流程纪律（固化，防第三次复发）
+
+**发布清单（缺一不可）**：① bump version → ② `pnpm pack` → ③ **更新 profile 声明的 tgz 文件名** → ④（如需）官方通道 `dsh plugin --profile web add "@dsh-external/project-nav@file:<新tgz>"`（别名覆盖，勿先 remove 再 add，见 §15 踩坑） → ⑤ 核对单实例拓扑 + `--dump-config` → ⑥ 重启 dsh-web **由用户执行**。
+
+> 备选根因消除方案（**待定，本次未执行**）：**A)** 产物固定名（`pnpm pack --out <不含版本号的文件名>`）→ 声明永不需要改；**B)** 改 `link:D:/FF/project-nav` 源码直连 → 须**先清除源目录 `node_modules`**，否则复发 §11 事故形态（见 §33.5 遗留 1）。
+
+### 33.5 遗留（本次未处理）
+
+1. 源目录 `node_modules/` 仍有 **19 个 `@deepseek-ai` 拷贝**（含 dsh-tools 0.1.2-rc.1、cordis 4.0.2、zod、@standard-schema）——§12 明确要求的净化项，是 link 形态安装的事故隐患；因与 `npm test` 运行相关，待 lk 决策（清掉后测试需改用 profile 顶层依赖）。
+2. 复核卡 `docs/devref/shoucang/*已知代码问题` 的「部署声明与实体一致（**已消除**）」条目已**过时**（本次二次复发）——下次复核按本节更正（该卡由守藏/用户维护，本次未擅改）。
+3. profile 顶层 `dsh-client-runtime` junction 仍指向 `D:\lk\deepseek\dsh-motion\node_modules\@deepseek-ai\dsh-client-runtime`（**0.1.0-rc.6**，非核心副本）——同为 §11 事故形态的同类残留（三插件 client 侧共用此副本），建议 DSH 升级后统一来源。
+
+---
+
+## 34. v0.7.0 共享状态写入串行化 + 视觉通道修复（lk 2026-09-10）
+
+### 34.1 G2 实施：所有共享状态读改写进入 per-target 锁
+
+架构审查（§31.6）把「索引写路径无互斥」列为 G2，并指出它正是 PN-P01 索引被反复回退的根因：每次读改写都是「load 快照 → 改 → 整文件回写」，两个写者各自回写自己的快照，**后 rename 者覆盖先者**。
+
+| 改动 | 内容 |
+|---|---|
+| 锁原语泛化 | `withLedgerLock` → 通用 `withFileLock(rootPath, name, fn)`；锁文件统一落在 **`.internal/locks/<name>.lock`**（不再污染工作区根目录）；`withLedgerLock` 保留为账本专用别名 |
+| 陈旧锁判定 | 以**锁文件 mtime** 为权威信号（崩溃进程无法伪造），载荷里的 `at` 仅作诊断 |
+| 等待方式 | 旧实现用 `Atomics.wait` 同步睡眠——争用时**阻塞整个 daemon 事件循环**最多 10s；改为 `await sleep(50)` |
+| 变更入口 | 新增 `mutateIndex` / `mutateVector` / `mutateDocs` / `mutateArch`（load→mutator→save 全在锁内，返回 mutator 结果）；`nav_sync_docs` 的 PROJECT.md 标记区替换也纳入锁 |
+| 锁嵌套禁令 | 单进程队列是一条链，嵌套获取会死锁 → 契约写明「一个临界区只碰一个文件」，四个入口与 PROJECT.md 同步均满足 |
+| host 改造 | `nav_update`（6 处 saveIndex 收敛为 1 个 mutator）、`nav_docs` 登记分支、`nav_set_vector`、`nav_adr`（**ADR id 在锁内分配**——与 ACT id 同类竞态）、`nav_sync_docs`；`saveIndex/saveDocs/saveVector/saveArch` 在 host 中已彻底消失（计数为 0） |
+
+### 34.2 验证（43/43）与一次自伤复盘
+
+- 新增 5 项：并发 8 个 `nav_update` 创建均存活、并发 6 次 `nav_docs` 登记均存活、并发 4 个 ADR 拿到互异 id、混合写入后**无锁文件残留**、**锁原语证明**（3 段含 `await` 的临界区严格串行 enter/exit；伪造死人锁按 mtime 立即破除；段尾必释放）。
+- **自伤复盘**：该测试初版把「死人锁」写成「载荷 `at` 是 60s 前、文件 mtime 是现在」→ 正确行为是**继续阻塞到超时**（测试因此挂 10s 报错）。这反过来确认设计正确：陈旧判定只信 mtime。修法：用 `utimesSync` 回写文件时间戳来模拟真正的崩溃遗留。
+- 全套：`core 12 + concurrency 31 = 43` 全绿。
+
+### 34.3 G3 / G5 处置（记录理由，不为清单而堆机制）
+
+- **G3【探测 + 显式告警，不做双后端】**：`apply` 时探测 `ctx.fs`；存在则 warn「本插件仍走 node:fs 直读直写 .internal/，若本部署对插件 fs 强制围栏，治理数据可能绕过围栏」。不做异步 fs 端口双后端：当前宿主进程未受限（node:fs 全程可用），双后端会让 IO 层翻倍——违反 §32 立的复杂度预算；待真实受限部署出现时一次性迁移。
+- **G5【不引入不变量层】**：那会给模型增加一个必须学习的新概念，而锚点闸 + ADR 已覆盖「先做架构思考、决策留痕」的意图。触发条件：出现「必须硬拦且 ADR 拦不住」的真实案例时再评估。
+
+### 34.4 视觉通道：两层根因（环境侧，非本插件缺陷）
+
+多模态在本会话一度完全不生效（`read_image` 拒绝 + 视觉工具全线失败），实测定位到两层根因：
+
+1. **模型能力未声明**（真根因）：`~/.dsh/settings.yaml` 中 provider `commandcode-goat` 的 `deepseek/deepseek-v4.1-flash` 缺 `input:` 声明 → 官方文档明载「手动输入的模型在自己声明之前一律按纯文本对待」，故 `read_image` 在**发送前**拒绝。实测该模型确实多模态（探针图 4 位数正确回显 7391）。
+2. **图片输入变体拦截**（设计行为）：dsh-vision-toolkit 对「DSH 判定为 text-only」的路由注册 `<model> (Vision Toolkit)` 兄弟模型并默认透明路由（`hidden: true`），把图片改写成文字描述；当时该描述调用失败 → 既无像素也无描述。修好根因后变体不再对已声明多模态的路由生效，故**不要**为绕开问题关闭 `imageInputVariants`（会让真正 text-only 的路由失去回退能力）——本次已恢复默认并复验。详细排查记录（含「运行时其实 ready、别拿基础解释器测依赖」等踩坑）见工作区 `refs/project-nav/2026-09-10-reference-多模态图片链路两层根因与修法.md`。
+
+**视觉 QA 的收益（首次真正看图）**：据实渲染并审查 `nav_map` HTML，发现并修掉两处渲染缺陷——① 计数未做单复数（`1 modules` / `1 features`）；② 图内「怎么读这张图」的改动工作流仍是旧循环，未含 v0.5.0 起的锚点闸/计数闸/`nav_adr`。修后重渲染复验：`1 module` 正确、howto 已更新、无重叠与截断。
+
+### 34.5 发布（按 §33.4 清单执行，v0.7.0）
+
+① bump → ② `pnpm pack` 得 `dsh-external-project-nav-0.7.0.tgz`（42598B，内部 0.7.0，语义字段与源全 MATCH）→ ③ 归档 `0.6.0.tgz → .superseded-20260910-v070`、更新 profile 声明为 0.7.0（备份 `.bak-declfix-v070-*`）→ ④ **未走重装**（实体已与源一致，重装会触发 pnpm peer 重解析 → §11 双实例事故面）→ ⑤ 三层 SHA256 全 MATCH（src = installed = plugins）、四链接拓扑完好、patch 层无 disabled 残留 → ⑥ `dsh --profile web --dump-config` exit=0 / 594 行 / project-nav 条目正常。
+
+### 34.6 遗留
+
+1. **重启 dsh-web 由用户执行**（当前 daemon 内存里仍是 v0.5.0 代码；本插件无热重载路径）。
+2. §33.5 的三项遗留（源目录 `node_modules/` 19 个 `@deepseek-ai` 拷贝、复核卡声明条目随版本 bump 再度过时、`dsh-client-runtime` junction 指向非核心副本）**仍未处理**，均待 lk 决策；本次发布走的正是 §33.4 清单，故声明与实体此刻一致。
+3. 架构档 L1/L2 指纹与行号已按本次代码变动刷新（`arch-cache` 块 + L2 行号重核）。
+
+_本文件应随项目推进持续更新。最后更新：2026-09-10 18:20_

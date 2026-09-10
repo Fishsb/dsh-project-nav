@@ -13,7 +13,7 @@
 // and ctx.logger. Everything else (shared core included) is the real code.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync, readdirSync, existsSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -407,6 +407,95 @@ test('consolidated: nav_sync_docs derives an ADR section from the architecture l
   const md = readFileSync(join(root, 'PROJECT.md'), 'utf-8')
   assert.match(md, /架构决策（ADR，自动对齐）/, md)
   assert.match(md, /ADR-001/)
+})
+
+// ---- v0.7.0 (G2): every read-modify-write of shared state is serialized ----
+// Without a lock these are classic lost-update races: two writers each load the
+// same snapshot, each write it back, and the later rename silently drops the
+// other's work. That is exactly how PN-P01's index kept reverting.
+
+test('G2: concurrent index writers lose no update', async () => {
+  const { root, tools } = await booted()
+  const codes = Array.from({ length: 8 }, (_, i) => 'CW-F0' + (i + 1))
+  await Promise.all(codes.map((code, i) =>
+    call(tools, 'nav_update', { target: code, name: 'w' + i, files: 'src/w' + i + '.js' }, 'session-' + i)))
+  const idx = shared.loadIndex(root)
+  const missing = codes.filter(c => !idx.indexes.featureToFiles[c])
+  assert.deepEqual(missing, [], 'every concurrent create must survive; missing: ' + missing.join(','))
+  const files = codes.map((_, i) => 'src/w' + i + '.js')
+  const unmapped = files.filter(f => !(idx.indexes.fileToFeature[f] || []).length)
+  assert.deepEqual(unmapped, [], 'every file mapping must survive; missing: ' + unmapped.join(','))
+})
+
+test('G2: concurrent reference-doc registrations lose no doc', async () => {
+  const { root, tools } = await booted()
+  const files = ['package.json', 'README.md', 'README.en.md', 'LICENSE', 'HANDOFF.md', 'host/cordis.patch.yml']
+    .map(f => join(process.cwd(), f))
+  await Promise.all(files.map((p, i) =>
+    call(tools, 'nav_docs', { title: 'doc' + i, path: p, when: 'kw' + i }, 'session-' + i)))
+  const registry = shared.loadDocs(root)
+  assert.equal(registry.docs.length, files.length, 'every concurrent registration must survive')
+  const ids = registry.docs.map(d => d.id)
+  assert.equal(new Set(ids).size, ids.length, 'DOC ids must be unique: ' + ids.join(','))
+})
+
+test('G2: concurrent architecture decisions get distinct ADR ids', async () => {
+  const { root, tools } = await booted()
+  const anchors = ['PN-F01', 'PN-F02', 'DM-F01', 'PN-M01']
+  await Promise.all(anchors.map((a, i) =>
+    call(tools, 'nav_adr', { anchor: a, reason: 'r' + i, decision: 'd' + i }, 'session-' + i)))
+  const arch = shared.loadArch(root)
+  assert.equal(arch.decisions.length, anchors.length, 'every concurrent decision must survive')
+  const ids = arch.decisions.map(d => d.id)
+  assert.equal(new Set(ids).size, ids.length, 'ADR ids must be unique: ' + ids.join(','))
+})
+
+test('G2: locks are released — no lock file survives a mixed write burst', async () => {
+  const { root, tools } = await booted()
+  await Promise.all([
+    call(tools, 'nav_update', { target: 'LK-F01', name: 'x', files: 'src/lk.js' }, 'session-A'),
+    call(tools, 'nav_set_vector', { doing: 'lk' }, 'session-B'),
+    call(tools, 'nav_adr', { anchor: 'PN-F01', reason: 'r', decision: 'd' }, 'session-C'),
+    call(tools, 'nav_sync_docs', {}, 'session-D')
+  ])
+  const lockDir = join(root, '.internal', 'locks')
+  const left = existsSync(lockDir) ? readdirSync(lockDir).filter(f => f.endsWith('.lock')) : []
+  assert.deepEqual(left, [], 'no lock file may be left behind: ' + left.join(','))
+})
+
+// The tests above prove no update is lost. This one proves the primitive itself:
+// mutual exclusion holds even when a section contains an await (the point where a
+// synchronous read-modify-write would otherwise interleave), a lock whose owner
+// died is broken by age instead of wedging the workspace, and the lock is released.
+
+test('G2: the file lock is mutually exclusive, stale-safe and always released', async () => {
+  const { root } = await booted()
+  const order = []
+  await Promise.all([1, 2, 3].map(n => shared.withFileLock(root, 'primitive-probe', async () => {
+    order.push('enter' + n)
+    await new Promise(r => setTimeout(r, 25))
+    order.push('exit' + n)
+  })))
+  assert.equal(order.length, 6)
+  for (let i = 0; i < order.length; i += 2) {
+    assert.match(order[i], /^enter/, 'sections must not interleave: ' + order.join(','))
+    assert.match(order[i + 1], /^exit/, 'sections must not interleave: ' + order.join(','))
+  }
+
+  // A foreign lock abandoned by a dead owner must be broken, not waited on. The
+  // staleness signal is the lock FILE's mtime (a crashed process cannot forge it),
+  // so the simulation backdates the file itself — writing an old `at` payload with
+  // a fresh mtime is NOT a dead owner and must still block.
+  const lockPath = shared.lockPathFor(root, 'primitive-probe')
+  mkdirSync(join(root, '.internal', 'locks'), { recursive: true })
+  writeFileSync(lockPath, JSON.stringify({ token: 'foreign-dead-owner', pid: 999999, at: new Date(Date.now() - 60000).toISOString() }))
+  const backdated = (Date.now() - 60000) / 1000
+  utimesSync(lockPath, backdated, backdated)
+  const t0 = Date.now()
+  const got = await shared.withFileLock(root, 'primitive-probe', () => 'acquired')
+  assert.equal(got, 'acquired', 'an aged foreign lock must be broken')
+  assert.ok(Date.now() - t0 < 5000, 'breaking must be immediate, not the full timeout')
+  assert.equal(existsSync(lockPath), false, 'the lock must be released when the section ends')
 })
 
 process.on('exit', () => { try { rmSync(join(tmpdir(), 'nav-conc-'), { recursive: true, force: true }) } catch {} })

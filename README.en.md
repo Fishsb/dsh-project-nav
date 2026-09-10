@@ -4,7 +4,7 @@
 
 **Anti-drift project governance plugin for DeepSeek Harness (DSH)**
 
-[![version](https://img.shields.io/badge/version-0.6.0-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.7.0-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -40,6 +40,7 @@ Long-running AI coding projects drift: files pile up without feature mapping, pl
 - 🏛️ **Architecture-first protocol (v0.5.0+)** — a task must anchor to an architecture node before it enters the ledger: a single-target scope auto-anchors, an ambiguous multi-target scope must pass `anchor=`; ≥3 patches on one anchor since the last architecture decision trip the **repeat-patch gate**; `nav_adr` records the decision and resets the counter
 - 🎯 **Governance-first action ledger** — `nav_plan` → `begin` → change → `done` (with `abort`); open actions = drift signal, marked red on the map; **one in-progress action per session**
 - 🔍 **Scope fingerprints (v0.4.0)** — `begin` records size/mtime/sha1 for every file in scope; `done` reports `⚠ Scope drift` (modified / vanished / appeared) and `nav_status` shows live drift for running actions. Leases stop two sessions from starting together; fingerprints catch files moved underneath a running action.
+- 🔒 **Serialized shared-state writes (v0.7.0)** — every read-modify-write of the index / reference docs / vector / architecture ledger / `PROJECT.md` runs under a **per-target exclusive lock** (lock files under `.internal/locks/`), so two sessions writing at once no longer overwrite each other (this was the root cause of an index being repeatedly reverted). The acquire loop waits asynchronously instead of blocking the event loop, and a lock whose owner died is broken by the lock file's mtime.
 - 🧵 **Multi-session concurrency (v0.3.0)** — the lock is per **scope**, not per workspace: sessions with disjoint scopes really do run in parallel, and only overlapping scopes queue (same feature / same module / same file / the same file reached through the index). `nav_mark begin wait=true` blocks until the holder finishes, a crashed session's lease expires and self-heals, and the ledger holds a cross-process file lock so concurrent planners never lose an action
 - 🧭 **Mainline vector with teeth** — doing / next / notDoing / exitCondition — plans colliding with `notDoing` are **hard-rejected**
 - 📚 **Reference-docs foundation** — registered by `when` routing rules, recommended automatically at plan time
