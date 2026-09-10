@@ -127,3 +127,30 @@ sc.exe start dsh-web ; sc.exe query dsh-web     # 确认 RUNNING
 一句话交接：插件只做"覆盖判定 + 会话绑定"（命中被治理工作区的会话 → append `sandbox/mode=workspace-write`），边界/强制/升级/策略投影全部由 harness 原生沙箱承担。
 
 **顺序上有一处强依赖**：本文 §四.2 的验证 PASS **必须早于**插件绑定上线——后端不可用时绑定会让新会话丧失全部 shell（fail-closed）。
+
+## 七、密码走不通时的替代路径（2026-09-11 实机结论）
+
+三次尝试切服务账户均失败于同一处：`nssm set ObjectName` 能写入，但服务启动被拒——
+
+```
+系统日志 id=7038  dsh-web 服务无法使用当前配置的密码以 .\lk 身份登录，
+                 错误原因: The user name or password is incorrect.
+系统日志 id=7000  The service did not start due to a logon failure.
+```
+
+即**账户密码不对**（常见原因：日常用 Windows Hello 的 PIN 登录，而 PIN ≠ 账户密码）。而"让服务以 lk 运行"**必然**需要那个密码 —— 没有密码时这条路是死的。
+
+**可行替代：交互式计划任务（不需要密码）。** 原理：真实用户的**登录会话**自带 logon SID，而 `/it`（仅用户已登录时运行）任务不需要存储密码 —— 正好满足沙箱后端对令牌的要求。
+
+```powershell
+# 以管理员身份（lk 需已在交互登录）
+powershell -ExecutionPolicy Bypass -File D:\FF\project-nav\docs\switch-dsh-web-to-user.ps1
+# 回滚
+powershell -ExecutionPolicy Bypass -File D:\FF\project-nav\docs\switch-dsh-web-to-user.ps1 -Rollback
+```
+
+脚本行为：备份服务注册表 → 生成 ASCII 包装 `.cmd`（复刻 nssm 的 `AppEnvironmentExtra` 与命令行）→ 建 `onlogon` + 最高权限 + `/it` 任务 → **停用**（不删除）nssm 服务 → 启动任务 → 等端口就绪 → **校验监听进程所有者确实是 lk** → 打印新 token；任一步失败自动恢复服务。
+
+两条必须知道的约束：
+1. **agent 无法自己启动该进程** —— agent 的子进程继承宿主（SYSTEM）令牌，仍然没有 logon SID。必须由"以 lk 身份"的机制启动。
+2. **服务是停用而非删除**（`sc.exe config dsh-web start= auto` 即可恢复）；确认新方式稳定后，再按 nssm 删除规程 `nssm remove dsh-web confirm` 彻底移除。
