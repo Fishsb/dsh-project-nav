@@ -2,8 +2,33 @@
 
 > 记录日期：2026-09-11（本地）
 > 触发场景：project-nav 要落地工作区边界（ADR-014 定稿：**单一机制** = DSH 原生会话沙箱），依赖把会话限制在 `workspace-write`。
-> 结论：**本机不可用，根因在宿主服务账户，不在插件。**
-> 执行者：**用户**（agent 不碰宿主服务：不自重启、不改服务配置）
+> 结论（2026-09-11 二次更新）：**已修复** —— 根因确在宿主服务账户（不在插件）；最终出路不是"改服务账户"，而是**卸掉 nssm**、改以 `lk` 身份启动 `dsh-web`，后端随即 PASS。**先读 §0 的现行状态与实证**；§二/§三/§五/§七 保留为历史留档，其中一切"改服务账户 / `nssm remove` / `sc config` 恢复"的操作在新宿主形态下均已失效。
+> 执行者：**用户**（agent 不碰宿主进程：不自重启、不改服务配置）
+
+---
+
+## 零、现行状态（2026-09-11 二次更新 · 已修复并实证）
+
+**宿主形态（现行）**：nssm 服务已卸载（`sc query dsh-web` → `1060 不存在`），`dsh-web` 以 **lk 身份前台运行**：
+
+```
+D:\lk\tools\dsh-web.cmd        # 现唯一启动方式；无自启 —— 重启电脑/注销后需手动拉起
+```
+
+实测：3080 监听者 = `DESKTOP-97Q0S5H\lk`；agent 自己的 `whoami` 也已是 `desktop-97q0s5h\lk`（此前是 `nt authority\system`）。
+
+**后端实证（决定门已开）**——直接用官方 runner 做探针（与插件就绪探针同形：`read-only`、零授权、零 ACL 变更）：
+
+| 模式 | 命令（runner = `…\@deepseek-ai\dsh-sandbox-windows-acl\lib\runner.js`，node = 宿主同款 `D:\lk\hermes\…\node.exe`） | 结果 |
+|---|---|---|
+| read-only | `--workspace D:\FF\project-nav --temp %TEMP% --mode read-only -- cmd /c "echo SANDBOX_PROBE_OK & whoami"` | **PASS**：`SANDBOX_PROBE_OK` / `desktop-97q0s5h\lk`，exit 0 |
+| workspace-write | 同上改 `--mode workspace-write`（工作区 = 临时探针目录） | **PASS**：区内写成功；**区外写被拒**（`Access is denied.`），exit 0 |
+
+> ⚠️ **判据只能跑 runner，不能看 `whoami`**：`.NET WindowsIdentity.Groups` 与 `whoami /groups` **都看不到** logon SID（`S-1-5-5-*`），但那**不等于令牌里没有** —— runner 的 `findLogonSid` 是按 token group 的 `SE_GROUP_LOGON_ID` **属性**取的（`types-DuU3lSVe.js:584-610`）；真没有才会打印 `windows-acl-run: CreateRestrictedToken prerequisite failed: no logon SID found among N token groups` 并退 127。**曾据 `whoami` 输出误判"令牌仍无 logon SID"，实为工具口径问题。**
+
+**回归到边界**：前置门已开 → profile `cordis.patch.yml` 已写 `autoBindWorkspace: true` + `boundaryWorkspaces: 'project-nav'`（YAML 解析 + 插件 Config schema 双校验通过）。**重启 dsh-web** 后按本文 §四与 `plan-workspace-boundary-binding.md` §8 验收。
+
+**已知缺口（不在本文件修复范围）**：nssm 卸载后**没有自启** —— 重启电脑后 GUI 不会自动回来。原先 `switch-dsh-web-to-user.ps1` 的 onlogon 计划任务思路仍成立（且同样满足 logon SID 要求），但该脚本以"停用 nssm 服务"为前提、服务已不存在 → 需按新形态重写或另走一条自启路径。
 
 ---
 
@@ -39,7 +64,7 @@ no logon SID found among 4 token groups
 
 `4 token groups` 与实测组数完全对上。**logon SID 是登录会话产生的**（交互登录/服务登录时由 LSA 创建），LocalSystem 的内核令牌天然没有；Windows 没有"给 SYSTEM 补一个 logon SID"的开关。所以唯一出路是**让 dsh-web 以真实用户账户运行**。
 
-## 三、修复步骤（用户执行）
+## 三、修复步骤（用户执行 · 历史留档：改服务账户路线已废弃，见 §0）
 
 > **最快路径**：以**管理员身份**运行随附脚本，它把下面 1–4 步全做了（含备份、权限补授、失败自动回滚、新 token 打印）：
 > ```powershell
@@ -128,7 +153,7 @@ sc.exe start dsh-web ; sc.exe query dsh-web     # 确认 RUNNING
 
 **顺序上有一处强依赖**：本文 §四.2 的验证 PASS **必须早于**插件绑定上线——后端不可用时绑定会让新会话丧失全部 shell（fail-closed）。
 
-## 七、密码走不通时的替代路径（2026-09-11 实机结论）
+## 七、密码走不通时的替代路径（2026-09-11 实机结论 · 历史留档：最终以"卸载 nssm + 前台以 lk 运行"落地，见 §0）
 
 三次尝试切服务账户均失败于同一处：`nssm set ObjectName` 能写入，但服务启动被拒——
 

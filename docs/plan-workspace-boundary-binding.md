@@ -2,7 +2,9 @@
 
 > 整理日期：2026-09-11（本地）
 > 架构依据：**ADR-014**（现行，收敛 ADR-012/ADR-013）
-> 状态（2026-09-11 01:00，v0.8.4）：机制链已完整并全部实证 —— **覆盖判定**（白名单 opt-in，空名单即惰性）、**能力判定**（只读探针，宿主不能强制就不绑）、**绑定**（`agent/session-start`，实测生效过）、**原生强制**（fs 边界实测拦截）。当前部署刻意保持**惰性**：profile 里 `autoBindWorkspace: false` 且白名单为空——因为本机沙箱后端**仍不可用**（`dsh-web` 仍 `LocalSystem`）。修好后端并验证 PASS 后，把白名单填上（如 `boundaryWorkspaces: 'project-nav'`）即可启用，探针会自行确认宿主真的能强制。事故经过与架构调整见 §12/§13 与 ADR-016。
+> 状态（2026-09-11 02:05，v0.8.4）：机制链已完整并全部实证 —— **覆盖判定**（白名单 opt-in，空名单即惰性）、**能力判定**（只读探针，宿主不能强制就不绑）、**绑定**（`agent/session-start`，实测生效过）、**原生强制**（fs 边界实测拦截）。
+> **前置门（§3）已开**：宿主侧沙箱后端 PASS —— nssm 服务已卸载，`dsh-web` 改以 `lk` 身份前台运行（`D:\lk\tools\dsh-web.cmd`）→ 受限令牌 runner 可创建；**read-only**（=插件探针形态）与 **workspace-write** 双探针实测通过，workspace-write 下区内写成功、区外写被拒（`Access is denied.`）。实证与现行宿主形态见 runbook §0。
+> 故本机**已启用**：profile `autoBindWorkspace: true` + `boundaryWorkspaces: 'project-nav'`（只治理 project-nav；shoucang 等主线工作不受影响）——待**重启 dsh-web** 后按 §8 验收。启用后仍受插件自带一次性只读探针兜底（探针不绿即不绑，绝不夺会话 shell）。事故经过与架构调整见 §12/§13 与 ADR-016。
 
 ---
 
