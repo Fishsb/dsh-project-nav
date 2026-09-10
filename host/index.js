@@ -1,7 +1,11 @@
 // @dsh-external/project-nav — anti-drift governance for agent-maintained projects
 // Design core: governance-first transaction loop (HANDOFF §14):
 //   nav_query (scope) → nav_plan (register action) → nav_mark begin → change → nav_mark done
-// 10 tools. Core logic lives in ../shared/index.js (single source, no duplication).
+// 11 tools. Core logic lives in ../shared/index.js (single source, no duplication).
+// v0.8.0 (ADR-011): the architecture layer (.internal/arch/*.md + arch-cache fingerprint header)
+// is wired into the read face — nav_query prints the arch pointer, nav_plan records archBasis,
+// nav_mark done reports docs the change made stale, nav_status summarizes freshness, and the new
+// nav_arch tool owns list/check/stamp. Rendering stays a projection outside the plugin.
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
@@ -19,7 +23,8 @@ import {
   renderTreeText, renderMapHtml, renderProjectDocSection,
   findStaleFiles, scopeTargetsOfOpenActions,
   snapshotScopeFiles, verifyScopeFingerprint, resolveScopeFile, indexedOwnersOf,
-  loadArch, nextDecisionId, checkAnchor, repeatPressure, REPEAT_PATCH_THRESHOLD, lastDecisionFor
+  loadArch, nextDecisionId, checkAnchor, repeatPressure, REPEAT_PATCH_THRESHOLD, lastDecisionFor,
+  listArchDocs, archDocsFor, archDocsForScope, archDocStatus, renderArchPointer, stampArchDoc, parseArchCache
 } from '../shared/index.js'
 
 // ---- Plugin metadata (Cordis contract) ----
@@ -249,7 +254,11 @@ export function apply(ctx, config) {
         }
         const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
         const notices = [scopeGate(ledger, args.target, sid, index), mainlineGate(loadVector(root), result)].filter(Boolean)
-        if (args.format === 'json') return JSON.stringify({ ...result, notices }, null, 2)
+        // 架构档指针：这是「开发前必读架构档」落到读取面的那一行——agent 不必记得去查，
+        // 查询目标的影响面时顺手就知道本目标的架构档在哪、还新不新鲜（ADR-011 接线①）。
+        let archStates = []
+        try { archStates = archDocsFor(index, root, args.target) } catch { archStates = [] }
+        if (args.format === 'json') return JSON.stringify({ ...result, notices, archDocs: archStates }, null, 2)
         const lines = [
           `Query: ${result.query} (${result.type})`,
           `Features: ${result.features.join(', ') || 'none'}`,
@@ -263,6 +272,7 @@ export function apply(ctx, config) {
           if (vector.doing) lines.push(`  Doing: ${vector.doing}`)
           if (vector.next) lines.push(`  Next: ${vector.next}`)
         }
+        lines.push('', renderArchPointer(archStates))
         if (notices.length) lines.push('', ...notices)
         return lines.join('\n')
       } catch (e) { return err(e) }
@@ -320,7 +330,8 @@ export function apply(ctx, config) {
             'ERROR: nav_plan requires anchor=<架构节点> —— 所有开发动作必须从架构出发。',
             '  改哪个功能就锚功能码（PN-F01），动哪个模块就锚模块名（PN-M02），修哪个文件就锚文件路径；架构层改动锚 .internal/arch/*.md。',
             '  先跑 nav_query <目标> 拿到锚点，再登记动作。无锚点的动作 = 还没有架构思考，十有八九会变成局部补丁。',
-            '  arch=<一句话架构判断> 可选但强烈建议：本任务是否需要调整架构？'
+            '  arch=<一句话架构判断> 可选但强烈建议：本任务是否需要调整架构？',
+            '  若某目标在架构上**找不到锚点**（nav_query 展不开、对应架构档不存在，或档已过期且与实际差异大），它就不是普通工程任务而是**架构修订任务**：先出整体架构方案（改 .internal/arch/*.md），lk 确认后再派生工程动作。'
           ].join('\n')
         }
         const anchorChk = checkAnchor(index, root, anchor)
@@ -365,6 +376,15 @@ export function apply(ctx, config) {
         const busyNote = busy
           ? [`⚠ Your session already holds ${actorLabel(busy)} — finish it (nav_mark done) or abort it (nav_mark abort) before beginning a new one. (Other sessions are unaffected: it is one in_progress per session, not one per workspace.)`]
           : []
+        // 架构对照（ADR-011 接线②）：本动作的落点/波及对应哪些架构档、还新不新鲜。随 plan 一起
+        // 留痕（archBasis），方案确认时就能看见「这次改动会不会让某一档架构描述失效」。
+        let archStates = []
+        try { archStates = archDocsForScope(index, root, scope) } catch { archStates = [] }
+        const archBasis = {
+          node: anchor,
+          kind: anchorChk.kind,
+          docs: archStates.map(d => ({ path: d.path, scope: d.scope || '', fresh: !!d.ok, drifted: (d.drifted || []).length }))
+        }
         const action = {
           id: null,   // assigned INSIDE the ledger lock: concurrent planners must not collide
           task: args.task,
@@ -374,6 +394,7 @@ export function apply(ctx, config) {
           anchor,
           anchorKind: anchorChk.kind,
           archNote: String(args.arch || '').trim(),
+          archBasis,
           owner: selfOwner(sid, { cwd: process.cwd() }),
           lease: null,
           createdAt: new Date().toISOString(),
@@ -399,6 +420,8 @@ export function apply(ctx, config) {
           `  Anchor: ${anchor} (${anchorChk.kind})${autoAnchor ? ` · ${autoAnchor}` : ''}${action.archNote ? ` · arch: ${action.archNote}` : ''}`,
           ...(archNote.length ? ['', ...archNote] : []),
           `  Scope: features=[${scope.features.join(', ')}] modules=[${scope.modules.join(', ')}] files=[${scope.files.join(', ')}]`,
+          `  架构对照: 落点 ${anchor} (${anchorChk.kind}) · 波及 ${scope.features.length + scope.modules.length + scope.files.length} 项`,
+          ...renderArchPointer(archStates).split('\n').map(l => '  ' + l),
           ...(unknownNote ? [unknownNote] : []),
           ...(suggestions.length ? [
             '',
@@ -584,6 +607,17 @@ export function apply(ctx, config) {
             lines.push('  ✓ Scope fingerprint verified: none of the scoped files changed during this action.')
           }
           if (res.pressureNote) lines.push(res.pressureNote)
+          // 架构档过期提示（ADR-011 接线③）：本动作改的就是这些档声明覆盖的文件，所以收口这一刻
+          // 正是「架构描述已被代码甩下」的判定点——提示重生成 + 用 nav_arch stamp 刷新指纹。
+          try {
+            const archAfter = archDocsForScope(index, root, res.action.scope || {})
+            if (archAfter.length) {
+              const stale = archAfter.filter(d => !d.ok)
+              lines.push(stale.length
+                ? `  架构档: 本次改动使 ${stale.length}/${archAfter.length} 档过期 → 重生成内容后跑 nav_arch mode="stamp" path="<档>" 刷新指纹：${stale.map(d => d.path).join(', ')}`
+                : `  架构档: ${archAfter.length} 档覆盖本 scope，指纹仍新鲜（本次改动未触及档内声明文件）。`)
+            }
+          } catch { /* 架构档提示永不阻断收口 */ }
           if (res.waiters.length) lines.push(`  Scope released — ${res.waiters.length} queued action(s) can now begin: ${res.waiters.join(', ')}`)
           return lines.join('\n')
         }
@@ -926,6 +960,11 @@ export function apply(ctx, config) {
         const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
         const registry = loadDocs(root)
         const arch = loadArch(root)
+        // 架构档新鲜度汇总（ADR-011 接线④）：架构层是核心，健康快照就必须报它——此前 4 档里
+        // 过期 2 档而无人知，正是因为「档的状态」不在任何读取面上。
+        let archDocStates = []
+        try { archDocStates = listArchDocs(root) } catch { archDocStates = [] }
+        const staleDocs = archDocStates.filter(d => !d.ok)
         const decisions = arch.decisions || []
         const lastDecision = decisions.length ? decisions[decisions.length - 1] : null
         // The architecture layer is this plugin's core, so the health snapshot has to show it:
@@ -994,6 +1033,9 @@ export function apply(ctx, config) {
             : 'Stale files: none (index matches disk)',
           `Architecture: ${decisions.length} decision(s)${lastDecision ? `, last ${lastDecision.id} on ${lastDecision.anchor}` : ' (none recorded yet)'}${hotAnchors.length ? ` — ⚠ near/over the repeat-patch gate: ${hotAnchors.map(p => `${p.anchor} ${p.count}/${p.threshold}`).join(', ')}` : ''}`,
           `Reference docs: ${(registry.docs || []).length} registered (nav_docs to list or register)`,
+          archDocStates.length
+            ? `Arch Docs: ${archDocStates.length} 档（新鲜 ${archDocStates.length - staleDocs.length} / 过期 ${staleDocs.length}）${staleDocs.length ? ' — 重生成后 nav_arch mode="stamp" 刷新: ' + staleDocs.map(d => d.path).join(', ') : ''}`
+            : 'Arch Docs: 无（.internal/arch/ 为空 — 建议先出 L1 总览，再谈按指纹重生成）',
           '',
           recent.length ? `Recent actions:\n${recent.map(a => `  ${a.id} [${a.status}] ${a.task}`).join('\n')}` : ''
         ].filter(Boolean)
@@ -1090,6 +1132,71 @@ export function apply(ctx, config) {
       } catch (e) { return err(e) }
     }
   })), 'project-nav: adr')
+
+  // ---- 11. nav_arch — 架构文档层：过期管理 / 覆盖校验 / 指纹刷新 ----
+  // 架构档（.internal/arch/*.md + 头部 arch-cache 指纹块）是项目的核心维护文档，也是 agent 开发前
+  // 的主地图。这个工具把「档在哪、还新鲜吗、覆盖不覆盖这个目标」从手工 mtime 比对变成一次调用；
+  // 除 stamp 外全程只读，且从不改写正文（正文 = arch-view 的 L2 读码提炼产出）。
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 'nav_arch',
+    description: 'Architecture document layer: list = every .internal/arch doc with fingerprint freshness (expiry management) | check = which docs cover one target (feature/module/file) and whether they are fresh | stamp = refresh one doc\'s arch-cache header from its declared file list AFTER you regenerate its content. Read-only except stamp; rendering stays a projection outside the plugin.',
+    parameters: {
+      mode: { type: 'string', description: 'list (default) | check | stamp' },
+      target: { type: 'string', description: 'check mode: feature code / module / file path / arch doc path' },
+      path: { type: 'string', description: 'stamp mode: arch doc path, e.g. .internal/arch/project-nav-overview.md' }
+    },
+    output: OUTPUT,
+    async execute(args) {
+      try {
+        const mode = String(args.mode || 'list').trim().toLowerCase()
+        if (mode === 'stamp') {
+          if (!args.path) return 'ERROR: stamp 需要 path=<架构档路径>（如 .internal/arch/project-nav-overview.md）。'
+          const rel = normalizePath(String(args.path).trim())
+          const res = await withFileLock(root, 'arch-doc:' + rel, () => stampArchDoc(root, rel))
+          if (!res.ok) return `ERROR: stamp 失败 —— ${res.reason}`
+          return [
+            `✓ 指纹已刷新: ${res.path}`,
+            `  generated: ${res.generated}`,
+            `  files: ${res.files} 项（按档内已声明的列表重取 mtime/size；正文未改动）`,
+            ...res.rows.map(r => `    - ${r.path}  ${r.size}B  ${r.mtime}`)
+          ].join('\n')
+        }
+        if (mode === 'check') {
+          if (!args.target) return 'ERROR: check 需要 target=<功能码/模块/文件/档路径>。'
+          const t = String(args.target).trim()
+          let states = []
+          try { states = archDocsFor(loadIndex(root), root, t) } catch (e) { return `ERROR: 覆盖判定失败 —— ${e.message}` }
+          const stale = states.filter(s => !s.ok)
+          const lines = [`架构覆盖检查: ${t}`, '  ' + renderArchPointer(states).replace(/\n\s*/g, '\n  ')]
+          if (!states.length) lines.push('  → 无覆盖档：这个目标目前无法从架构层解释——要么补 L1（模块级总览），要么它本身就是架构修订任务。')
+          else if (stale.length) lines.push('  → ⛔ 过期/未纳管的档视为设计已漂移，不可当现行事实读：重生成内容 → nav_arch mode="stamp" 刷新指纹，再据此开发。')
+          else lines.push('  → 可用：档与它所描述的文件一致，可据此开工。')
+          return lines.join('\n')
+        }
+        if (mode !== 'list') return `ERROR: mode 只支持 list / check / stamp（收到 "${args.mode}"）。`
+        const docs = listArchDocs(root)
+        if (!docs.length) {
+          return '架构档: 0 档（.internal/arch/ 为空）——先出 L1 总览（arch-view 契约：arch-cache 指纹块 + 依赖图 + 索引外告警），此后每档按指纹过期重生成。'
+        }
+        const fresh = docs.filter(d => d.ok)
+        const stale = docs.filter(d => !d.ok)
+        const tzDocs = stale.filter(d => d.tzOnly)
+        const realStale = stale.filter(d => !d.tzOnly)
+        const flagOf = d => (d.ok ? '✓ 新鲜' : (d.noHeader ? '⚠ 无指纹头' : (d.tzOnly ? '⚠ 指纹写法不符' : '⛔ 过期')))
+        const fmt = d => [
+          `  ${flagOf(d)}  ${d.path}`,
+          `      project=${d.project || '?'} · scope=${d.scope || '?'} · generated=${d.generated || '?'} · files=${(d.files || []).length}`,
+          ...(d.ok ? [] : ((d.drifted || []).length ? d.drifted.slice(0, 5).map(x => `      漂移: ${x}`) : [`      ${d.reason || ''}`]))
+        ].join('\n')
+        return [
+          `架构档: ${docs.length} 档（新鲜 ${fresh.length} / 过期 ${realStale.length}${tzDocs.length ? ` / 写法不符 ${tzDocs.length}` : ''}）`,
+          ...docs.map(fmt),
+          ...(tzDocs.length ? ['', '只需校正指纹（内容与代码一致）: ' + tzDocs.map(d => `nav_arch mode="stamp" path="${d.path}"`).join(' | ')] : []),
+          ...(realStale.length ? ['', '需重生成内容后再刷新指纹: ' + realStale.map(d => `nav_arch mode="stamp" path="${d.path}"`).join(' | ')] : [])
+        ].join('\n')
+      } catch (e) { return err(e) }
+    }
+  })), 'project-nav: arch')
 }
 
 function now_() {

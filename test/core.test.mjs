@@ -4,9 +4,9 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, statSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 import {
   normalizePath,
   createEmptyIndex, saveIndex, loadIndex,
@@ -15,7 +15,9 @@ import {
   createEmptyDocs, saveDocs, loadDocs, nextDocId, suggestDocs,
   queryIndex, partialSearch,
   renderTreeText, renderMapHtml, renderProjectDocSection,
-  findStaleFiles, scopeTargetsOfOpenActions, scopeFiles, sessionLabel
+  findStaleFiles, scopeTargetsOfOpenActions, scopeFiles, sessionLabel,
+  parseArchCache, archDocStatus, listArchDocs, archDocsFor, archDocsForScope,
+  renderArchPointer, stampArchDoc
 } from '../shared/index.js'
 
 function tmpRoot(t) {
@@ -239,3 +241,154 @@ test('renderMapHtml honours target, and reports an empty match honestly', (t) =>
   const miss = renderMapHtml(loadIndex(root), { target: 'no-such-thing' })
   assert.match(miss, /No project or module matching this target/, 'an empty narrowing must say so')
 })
+
+// ---- architecture docs layer (v0.8.0, ADR-011) ----
+// 架构档 = .internal/arch/*.md + 头部 arch-cache 指纹块。这层的契约只有两条：新鲜度可机检、
+// 覆盖可机检——两者都是「让 agent 在动手前被引导读档、动手后被提示档过期」的前提。
+
+/** Write an arch doc whose header stamps the CURRENT disk state of `files`. */
+function writeArchDoc(root, rel, { project = 'alpha', scope = 'overview', files = [] } = {}) {
+  const abs = join(root, rel)
+  mkdirSync(dirname(abs), { recursive: true })
+  const rows = files.map(f => {
+    const st = statSync(join(root, f))
+    return `  - path: ${f}\n    mtime: ${new Date(st.mtimeMs).toISOString()}\n    size: ${st.size}`
+  })
+  const header = [
+    '<!-- arch-cache',
+    `generated: ${new Date().toISOString()}`,
+    `project: ${project}`,
+    `scope: ${scope}`,
+    'files:',
+    ...rows,
+    '-->'
+  ].join('\n')
+  writeFileSync(abs, `${header}\n\n# ${scope}\n\nbody\n`)
+  return abs
+}
+
+test('parseArchCache reads the fingerprint header contract', (t) => {
+  const root = tmpRoot(t)
+  writeFileSync(join(root, 'a.js'), 'x')
+  const rel = '.internal/arch/proj-overview.md'
+  writeArchDoc(root, rel, { project: 'PN-P01（project-nav）', scope: 'overview', files: ['a.js'] })
+  const cache = parseArchCache(readFileSync(join(root, rel), 'utf-8'))
+  assert.equal(cache.project, 'PN-P01（project-nav）')
+  assert.equal(cache.scope, 'overview')
+  assert.deepEqual(cache.files.map(f => f.path), ['a.js'])
+  assert.equal(cache.files[0].size, 1)
+  assert.equal(parseArchCache('# 没有指纹块'), null, 'a doc without the block is "unmanaged", not a crash')
+})
+
+test('archDocStatus: fresh while declared stamps hold, stale once a file moves', (t) => {
+  const root = tmpRoot(t)
+  writeFileSync(join(root, 'a.js'), 'x')
+  writeArchDoc(root, '.internal/arch/d.md', { files: ['a.js'] })
+  assert.equal(archDocStatus(root, '.internal/arch/d.md').ok, true)
+  writeFileSync(join(root, 'a.js'), 'xx')   // size + mtime differ → the doc describes an older reality
+  const stale = archDocStatus(root, '.internal/arch/d.md')
+  assert.equal(stale.ok, false)
+  assert.match(stale.drifted.join(' '), /a\.js/)
+  const gone = archDocStatus(root, '.internal/arch/nope.md')
+  assert.equal(gone.missing, true)
+})
+
+test('listArchDocs walks .internal/arch recursively and skips the render/ projection dir', (t) => {
+  const root = tmpRoot(t)
+  writeFileSync(join(root, 'a.js'), 'x')
+  writeArchDoc(root, '.internal/arch/x.md', { files: ['a.js'] })
+  writeArchDoc(root, '.internal/arch/sub/y.md', { files: ['a.js'] })
+  mkdirSync(join(root, '.internal', 'arch', 'render'), { recursive: true })
+  writeFileSync(join(root, '.internal', 'arch', 'render', 'shot.md'), '# projection artefact, not a doc')
+  const docs = listArchDocs(root).map(d => d.path)
+  assert.deepEqual(docs, ['.internal/arch/sub/y.md', '.internal/arch/x.md'])
+})
+
+test('archDocsFor matches by scope equality and by declared-file intersection', (t) => {
+  const root = tmpRoot(t)
+  const idx = seededIndex(root)                       // PE-F01 → src/main.js, module editor, project alpha
+  writeFileSync(join(root, 'a.js'), 'x')
+  mkdirSync(join(root, 'src'), { recursive: true })
+  writeFileSync(join(root, 'src', 'main.js'), 'x')
+  writeArchDoc(root, '.internal/arch/by-scope.md', { scope: 'PE-F01', files: ['a.js'] })
+  writeArchDoc(root, '.internal/arch/by-file.md', { scope: 'overview', files: ['src/main.js'] })
+  writeArchDoc(root, '.internal/arch/unrelated.md', { scope: 'other', files: ['a.js'] })
+  const forFeature = archDocsFor(idx, root, 'PE-F01').map(d => d.path).sort()
+  assert.deepEqual(forFeature, ['.internal/arch/by-file.md', '.internal/arch/by-scope.md'])
+  // overview 档按 project 字段回退命中（档没声明该文件时仍算覆盖这个项目）
+  assert.ok(archDocsFor(idx, root, 'editor').some(d => d.path === '.internal/arch/by-file.md'))
+  // scope 混写 → 并集，按档去重
+  const scoped = archDocsForScope(idx, root, { features: ['PE-F01'], modules: ['editor'], files: ['a.js'] })
+  assert.deepEqual(scoped.map(d => d.path).sort(), ['.internal/arch/by-file.md', '.internal/arch/by-scope.md', '.internal/arch/unrelated.md'])
+})
+
+test('stampArchDoc refreshes the header from the declared list, refusing a broken declaration', (t) => {
+  const root = tmpRoot(t)
+  writeFileSync(join(root, 'a.js'), 'x')
+  writeArchDoc(root, '.internal/arch/d.md', { files: ['a.js'] })
+  writeFileSync(join(root, 'a.js'), 'xxxx')
+  assert.equal(archDocStatus(root, '.internal/arch/d.md').ok, false)
+  const res = stampArchDoc(root, '.internal/arch/d.md')
+  assert.equal(res.ok, true)
+  assert.equal(res.files, 1)
+  assert.equal(archDocStatus(root, '.internal/arch/d.md').ok, true, 'after stamp the doc is fresh again')
+  assert.match(readFileSync(join(root, '.internal/arch/d.md'), 'utf-8'), /# overview[\s\S]*body/, 'the body must survive the rewrite')
+  rmSync(join(root, 'a.js'))
+  const refused = stampArchDoc(root, '.internal/arch/d.md')
+  assert.equal(refused.ok, false)
+  assert.match(refused.reason, /不存在/, 'a fingerprint pointing at air is worse than a loud failure')
+})
+
+test('stampArchDoc refuses a doc with no arch-cache header', (t) => {
+  const root = tmpRoot(t)
+  mkdirSync(join(root, '.internal', 'arch'), { recursive: true })
+  writeFileSync(join(root, '.internal', 'arch', 'plain.md'), '# 没指纹块\n')
+  const res = stampArchDoc(root, '.internal/arch/plain.md')
+  assert.equal(res.ok, false)
+  assert.match(res.reason, /arch-cache/)
+})
+
+test('renderArchPointer states freshness, staleness and the no-doc soft hint', (t) => {
+  const root = tmpRoot(t)
+  writeFileSync(join(root, 'a.js'), 'x')
+  writeArchDoc(root, '.internal/arch/d.md', { files: ['a.js'] })
+  const fresh = renderArchPointer([archDocStatus(root, '.internal/arch/d.md')])
+  assert.match(fresh, /新鲜/)
+  writeFileSync(join(root, 'a.js'), 'xxxx')
+  const stale = renderArchPointer([archDocStatus(root, '.internal/arch/d.md')])
+  assert.match(stale, /过期/)
+  assert.match(stale, /nav_arch mode="stamp"/, 'a stale doc must come with the one command that fixes the fingerprint')
+  assert.match(renderArchPointer([]), /暂无架构档/, 'no arch doc is a soft hint, never a hard block')
+})
+
+test('arch-cache mtime accepts both UTC and local-wall-clock renderings of one instant', (t) => {
+  const root = tmpRoot(t)
+  writeFileSync(join(root, 'a.js'), 'x')
+  writeArchDoc(root, '.internal/arch/d.md', { files: ['a.js'] })
+  const abs = join(root, '.internal', 'arch', 'd.md')
+  const st = statSync(join(root, 'a.js'))
+  const utc = new Date(st.mtimeMs).toISOString()
+  const local = new Date(st.mtimeMs - new Date(st.mtimeMs).getTimezoneOffset() * 60000).toISOString()
+  // 库里两种写法都在（project-nav 各档 = UTC 带毫秒；shoucang 各档 = 本地墙上时间且截到秒）——
+  // 指纹记的是瞬时，不是字符串：两种渲染都必须算命中，否则一半的档会永久假过期。
+  writeFileSync(abs, readFileSync(abs, 'utf-8').replace(utc, local.slice(0, 19) + 'Z'))
+  const asLocal = archDocStatus(root, '.internal/arch/d.md')
+  assert.equal(asLocal.ok, true, 'the local rendering of the same instant is not drift')
+  if (local !== utc) {
+    assert.equal(asLocal.localForm, true)
+    assert.equal(asLocal.truncated, true, 'second-precision stamps are the same instant, not drift')
+  }
+  // 第三种偏移（既非 UTC 也非本机本地）= 写法不符：只报不静默放行，且指明 stamp 校正
+  const offHours = -new Date().getTimezoneOffset() / 60
+  const odd = offHours === -3 ? -4 : -3
+  writeFileSync(abs, readFileSync(abs, 'utf-8').replace(local.slice(0, 19) + 'Z', new Date(st.mtimeMs + odd * 3600000).toISOString()))
+  const oddStatus = archDocStatus(root, '.internal/arch/d.md')
+  assert.equal(oddStatus.ok, false, 'an alien offset is still not fresh')
+  assert.equal(oddStatus.tzOnly, true)
+  assert.match(renderArchPointer([oddStatus]), /写法不符/)
+  // 真正的代码漂移（size 变了）不得被降级成写法问题
+  writeFileSync(join(root, 'a.js'), 'xxxxx')
+  assert.equal(archDocStatus(root, '.internal/arch/d.md').tzOnly, false)
+})
+
+

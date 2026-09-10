@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.7.4-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.8.0-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-%3E%3D0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -36,7 +36,7 @@ AI coding 的长期项目会漂移：文件越堆越多却没有功能映射、�
 ## ✨ 核心能力
 
 - 🗺️ **双向治理地图**：项目→模块→功能→文件 四维交叉索引，单一数据真身，一张图看清全部结构
-- 🏛️ **架构文档层（生态配合，不在本包内）**：L1 项目总览 + L2 特征主链（贯通式流程、行号级证据）、指纹过期自动重生成，由配套的 arch-view 技能提供——本仓库只交付索引与治理闭环
+- 🏛️ **架构文档层接入治理循环（v0.8.0）**：架构档（`.internal/arch/*.md`，头部带 `arch-cache` 指纹块：声明本档读的是哪些文件的哪一版）不再只靠 agent 自觉——`nav_query` 查询目标时附**架构档指针行**（新鲜 / 过期 / 无档软提示）、`nav_plan` 记 `archBasis` 并输出**架构对照**段（落点 / 波及 / 状态）、`nav_mark done` 报**本次改动使哪几档过期**、`nav_status` 汇总全档新鲜度、`nav_arch` 负责列出 / 覆盖校验 / 指纹刷新。**渲染（SVG/HTML 投影）不进插件**：投影零维护，仍由配套 arch-view 技能侧脚本产出；本仓库只负责「档在哪、还新鲜吗、覆盖不覆盖这个目标」三件可机检的事
 - 🏛️ **架构先行协议（v0.5.0 起）**：任务必须锚定架构节点才入账——单目标 scope 自动取锚，多目标必须显式 `anchor=`；同锚点自最近架构决策以来 ≥3 次**补丁** → **计数闸**强制回架构层；`nav_adr` 记录架构决策并重置计数。**「补丁」只认真的动过东西**（v0.7.3）：done 时指纹证明 scope 内文件一个都没变的验证/记账动作不计入——否则会逼出没有架构内容的 ADR，ADR 通胀后核心决策账本就成噪音
 - 🎯 **治理事务环**：`nav_plan` → `begin` → 改动 → `done`（abort 兜底），未完成动作 = 漂移信号，地图标红；**每会话同时只允许一个 in_progress**
 - 🧵 **多会话并发（v0.3.0）**：锁的粒度是 **scope 而不是工作区**——不相交的会话真并行干活，只有 scope 相交（同功能 / 同模块 / 同文件 / 索引派生出的同一文件）才排队；`nav_mark begin wait=true` 可阻塞等待，崩溃会话的租约自动过期自愈，账本带跨进程文件锁（并发立项不再丢动作）
@@ -49,19 +49,20 @@ AI coding 的长期项目会漂移：文件越堆越多却没有功能映射、�
 - 🌳 **渐进式导图**：自包含离线 HTML 思维导图，无 CDN、双击即开
 - 🩺 **磁盘漂移探测**：索引里有、磁盘上没有（STALE）一览无余，双路径形态兼容
 
-## 🔧 工具一览（10 个，单一职责）
+## 🔧 工具一览（11 个，单一职责）
 
 | 工具 | 作用 |
 |------|------|
-| `nav_query` | 查结构/模块/功能，改动前理解范围（范围门禁 + 主线告警 + **跨会话占用提示**） |
-| `nav_plan` | 治理优先门禁：登记动作（**锚点闸** + 范围预校验 + 反目标硬拦截 + **计数闸**） |
-| `nav_mark` | 事务生命周期 begin / done / abort（begin 含 scope 冲突闸 + 租约 + 排队；done 报 scope 漂移与计数压力）。**租约过期不是死路**（v0.7.4）：其 owner 仍可 `begin` 重取锁并重拍指纹、`done` 迟收口（记 `lateCompletion`）或 `abort` |
+| `nav_query` | 查结构/模块/功能，改动前理解范围（范围门禁 + 主线告警 + **跨会话占用提示** + **架构档指针行**） |
+| `nav_plan` | 治理优先门禁：登记动作（**锚点闸** + 范围预校验 + 反目标硬拦截 + **计数闸** + **架构对照段与 archBasis**） |
+| `nav_mark` | 事务生命周期 begin / done / abort（begin 含 scope 冲突闸 + 租约 + 排队；done 报 scope 漂移、计数压力与**本次改动使哪几档架构档过期**）。**租约过期不是死路**（v0.7.4）：其 owner 仍可 `begin` 重取锁并重拍指纹、`done` 迟收口（记 `lateCompletion`）或 `abort` |
 | `nav_adr` | **架构决策记录**（锚点 + 触发原因 + 决策 + 影响面）；登记即重置该锚点补丁计数 |
+| `nav_arch` | **架构文档层**：`list`（全档新鲜度 / 过期管理）、`check`（某目标由哪些档覆盖、是否新鲜）、`stamp`（按档内已声明的 files 列表重取指纹——内容由 agent 重生成，指纹由工具写）。除 stamp 外全程只读，从不改写正文 |
 | `nav_update` | **唯一登记口（upsert 与退役）**：更新已存在条目，或直接创建功能/模块（新功能给 `files=`，新模块给 `features=`/`project=`）；条目真正从工作区消失时用 `retire=true` 退役并级联（功能清双向文件映射 + 模块成员；模块摘除项目挂载但保留其功能；项目摘除模块但保留之），在飞动作仍引用该目标时拒绝。**模块可迁移**（v0.7.4）：已有模块给 `project=` 即换挂载，`project=""` 摘除（退役项目后「re-home」不再是空话） |
 | `nav_docs` | 参考文档：给 `title`+`path`+`when` 即登记（`when` 是路由规则），否则列库 / 按 `task` 排序推荐。相对路径按**被治理 root** 解析（v0.7.4），不受进程 cwd 影响 |
 | `nav_map` | 治理地图：`text`（agent 导航）/ `html`（人看导图）；`target` 按名称收窄（v0.7.4 起 text 与 html 一致生效，原 `level` 死参数已移除） |
 | `nav_sync_docs` | 自动对齐 PROJECT.md（标记区派生：功能地图 + 主线向量 + **架构决策**） |
-| `nav_status` | 健康快照：覆盖度 + 未完成动作 + STALE 文件 + **跨会话并发视图** + **架构决策与计数闸压力**（v0.7.4 起架构层可见） |
+| `nav_status` | 健康快照：覆盖度 + 未完成动作 + STALE 文件 + **跨会话并发视图** + **架构决策与计数闸压力** + **架构档新鲜度汇总**（v0.8.0） |
 | `nav_set_vector` | 设置主线向量 |
 
 ## 🔄 治理循环

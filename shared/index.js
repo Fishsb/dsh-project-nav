@@ -882,6 +882,250 @@ export function repeatPressure(arch, actions, anchor, { threshold = REPEAT_PATCH
   const skipped = done.filter(x => x.noChange === true).map(x => x.id);
   return { anchor: a, count: list.length, threshold, exceeded: list.length >= threshold, sinceDecision: since ? since.id : null, patches: list.map(p => p.id), skipped };
 }
+// ---- architecture docs layer (.internal/arch/*.md + 头部 arch-cache 指纹块) ----
+// 架构文档 = 项目的核心维护文档（lk 2026-09-08 拍板）：「开发前读它拿数据怎么流、逻辑怎么判、
+// 循环在等什么；代码变更后按指纹过期重生成」。本层只做三件可机检的事——**找档、判新鲜、判覆盖**，
+// 好让 nav_query / nav_plan / nav_mark / nav_status 的读取面自带「本目标的架构档在哪、还新鲜吗」。
+// 边界（ADR-011）：渲染（SVG/HTML 投影）不进插件——投影零维护，归 arch-view skill 侧脚本；
+// 工具不复制架构内容，档本身（含指纹块）仍是唯一事实源，此处只读它、从不代写正文。
+
+const ARCH_DOCS_DIR = '.internal/arch';
+
+/**
+ * 解析一份架构档头部的 arch-cache 指纹块。契约（arch-view 存档指纹格式）：
+ *   <!-- arch-cache
+ *   generated: <ISO>
+ *   project: <名>
+ *   scope: <overview | 模块名 | 特征码>
+ *   files:
+ *     - path: <相对 root 的路径>
+ *       mtime: <ISO>
+ *       size: <字节>
+ *   -->
+ * 没有指纹块 → null（不是错误，是「未纳管」：下次重生成时补上即可）。
+ */
+export function parseArchCache(text) {
+  const m = /<!--\s*arch-cache\s*\n([\s\S]*?)-->/m.exec(String(text || ''));
+  if (!m) return null;
+  const head = { generated: '', project: '', scope: '' };
+  const files = [];
+  for (const rawLine of m[1].split(/\r?\n/)) {
+    const line = rawLine.replace(/\s+$/, '');
+    const item = /^\s*-\s*path:\s*(.+?)\s*$/.exec(line);
+    if (item) { files.push({ path: normalizePath(item[1]), mtime: '', size: null }); continue; }
+    const kv = /^\s*([A-Za-z_]+):\s*(.*?)\s*$/.exec(line);
+    if (!kv) continue;
+    const [, k, v] = kv;
+    if (files.length && (k === 'mtime' || k === 'size')) {
+      const cur = files[files.length - 1];
+      if (k === 'mtime') cur.mtime = v; else cur.size = Number(v);
+      continue;
+    }
+    if (k === 'generated') head.generated = v;
+    else if (k === 'project') head.project = v;
+    else if (k === 'scope') head.scope = v;
+  }
+  return { ...head, files, raw: m[0] };
+}
+
+/**
+ * 一档的新鲜度：指纹块声明的每个文件是否仍与记录一致——mtime 或 size **任一**不同即过期
+ * （arch-view 铁律：宁可重生成一次，也不让 agent 读到与代码不符的架构描述）。
+ * 无指纹块 / 档案缺失返回 ok:false 并带上原因，由调用方决定是告警还是软提示。
+ */
+export function archDocStatus(rootPath, relPath, { text = null } = {}) {
+  const rel = normalizePath(relPath);
+  let content = text;
+  if (content === null || content === undefined) {
+    try { content = readFileSync(resolve(rootPath, rel), 'utf-8'); }
+    catch { return { path: rel, ok: false, missing: true, reason: '档案不存在', project: '', scope: '', generated: '', files: [], drifted: [] }; }
+  }
+  const cache = parseArchCache(content);
+  if (!cache) return { path: rel, ok: false, noHeader: true, reason: '无 arch-cache 指纹头', project: '', scope: '', generated: '', files: [], drifted: [] };
+  const drifted = [];
+  const drift = [];
+  let localForm = false;
+  let truncated = false;
+  for (const f of cache.files) {
+    let st = null;
+    try { st = statSync(resolve(rootPath, f.path)); } catch { st = null; }
+    if (!st || !st.isFile()) { drifted.push(`${f.path}（磁盘上不存在）`); drift.push({ path: f.path, kind: 'missing' }); continue; }
+    const nowIso = new Date(st.mtimeMs).toISOString();
+    if (f.size !== null && Number.isFinite(f.size) && st.size !== f.size) {
+      drifted.push(`${f.path}（size ${f.size}→${st.size}）`);
+      drift.push({ path: f.path, kind: 'size', from: f.size, to: st.size });
+      continue;
+    }
+    if (f.mtime && f.mtime !== nowIso) {
+      // 历史档里同一个瞬时有多套写法：UTC 带毫秒（`toISOString`，project-nav 各档）与「本地墙上
+      // 时间当 UTC 写、且截到秒」（shoucang 各档，2026-09-10 那次校准把它定为约定）。指纹记的是
+      // **瞬时**而不是字符串，所以「同一瞬时 + 任意渲染 + 秒级截断」都算命中——否则一半的档会永久
+      // 假过期，而假警报正是「模型学会忽略漂移信号」的起点。真正的改动仍会被 size、文件缺失，或
+      // 超过 1 秒的瞬时差捕获（同一秒内且同字节数的改写才可能漏，代价可接受）。
+      const recMs = Date.parse(f.mtime);
+      const localMs = st.mtimeMs - new Date(st.mtimeMs).getTimezoneOffset() * 60000;
+      const NEAR_MS = 1000;
+      if (Number.isFinite(recMs) && Math.abs(recMs - st.mtimeMs) < NEAR_MS) {
+        if (recMs !== st.mtimeMs) truncated = true;
+        continue;
+      }
+      if (Number.isFinite(recMs) && Math.abs(recMs - localMs) < NEAR_MS) {
+        localForm = true;
+        if (recMs !== localMs) truncated = true;
+        continue;
+      }
+      // 既不是 UTC 也不是本机本地渲染（例如在别的时区按整点写的档）：报「写法不符」，只需 stamp
+      // 校正；不能与「代码真漂移」混为一谈——后者要求重生成内容，前者只要重写指纹。
+      const shiftMs = recMs - Date.parse(nowIso);
+      const hours = shiftMs / 3600000;
+      const tz = Number.isFinite(shiftMs) && shiftMs !== 0 && shiftMs % 3600000 === 0 && Math.abs(hours) <= 24;
+      drift.push({ path: f.path, kind: tz ? 'tz' : 'mtime', from: f.mtime, to: nowIso, shiftHours: tz ? hours : 0 });
+      drifted.push(tz
+        ? `${f.path}（mtime 记 ${f.mtime} / 实际 ${nowIso}，差 ${hours}h —— 既非 UTC 也非本机本地时间）`
+        : `${f.path}（mtime ${f.mtime}→${nowIso}）`);
+    }
+  }
+  // tzOnly：全部漂移都只是写法不符（无 size 变化、无文件缺失）→ 内容大概率仍与代码一致。
+  const tzOnly = drift.length > 0 && drift.every(d => d.kind === 'tz');
+  return { path: rel, ok: drifted.length === 0, project: cache.project, scope: cache.scope, generated: cache.generated, files: cache.files.map(f => f.path), drifted, drift, tzOnly, localForm, truncated };
+}
+
+/** `.internal/arch` 下全部架构档（递归）。`render/` 是投影产物目录，不算档。 */
+export function listArchDocs(rootPath) {
+  const base = resolve(rootPath, ARCH_DOCS_DIR);
+  let entries = [];
+  try { entries = readdirSync(base, { recursive: true }); } catch { return []; }
+  const out = [];
+  for (const e of entries) {
+    const rel = normalizePath(typeof e === 'string' ? e : e.name);
+    if (!/\.md$/i.test(rel)) continue;
+    if (rel.startsWith('render/') || rel.includes('/render/')) continue;
+    out.push(archDocStatus(rootPath, `${ARCH_DOCS_DIR}/${rel}`));
+  }
+  return out.sort((a, b) => String(a.path).localeCompare(String(b.path)));
+}
+
+/**
+ * 覆盖判定：target（功能码 / 模块 / 文件 / 档路径）→ 覆盖它的架构档。
+ * 三条命中规则，全部可机检、不做模糊猜测：① target 就是档路径；② 档的 scope 字段等于 target；
+ * ③ 档声明的文件与 target 展开出的文件有交集。另加一条受限回退：scope=overview 的档，其
+ * project 字段里出现 target 所属项目名/代码即算覆盖（只对 overview 生效，避免跨项目误配）。
+ */
+export function archDocsFor(index, rootPath, target) {
+  const t = normalizePath(String(target || '').trim());
+  if (!t) return [];
+  const docs = listArchDocs(rootPath);
+  if (!docs.length) return [];
+  const q = queryIndex(index, t) || { features: [], modules: [], files: [], projects: [] };
+  const m2f = index?.indexes?.moduleToFeatures || {};
+  const f2files = index?.indexes?.featureToFiles || {};
+  const p2m = index?.indexes?.projectToModules || {};
+  const targets = new Set();
+  // queryIndex 只分「功能码 vs 其它（一律当文件）」，所以模块名/功能名要在这里自己展开成文件与项目：
+  // 少了这一步，一个模块级 target 会既拿不到成员文件、也拿不到所属项目（覆盖判定静默变空）。
+  const features = new Set([...(q.features || []), ...(q.files || []).filter(f => f2files[f])]);
+  const modules = new Set([...(q.modules || []), ...(m2f[t] ? [t] : [])]);
+  for (const f of (q.files || [])) targets.add(normalizePath(f));
+  const projectHints = new Set((q.projects || []).map(p => String(p).toLowerCase()));
+  for (const mod of modules) {
+    for (const code of (m2f[mod] || [])) features.add(code);
+    for (const [proj, mods] of Object.entries(p2m)) if ((mods || []).includes(mod)) projectHints.add(String(proj).toLowerCase());
+  }
+  for (const code of features) {
+    for (const f of (f2files[code] || [])) targets.add(normalizePath(f));
+    for (const [proj, mods] of Object.entries(p2m)) {
+      const owner = (mods || []).find(m => (m2f[m] || []).includes(code));
+      if (owner) projectHints.add(String(proj).toLowerCase());
+    }
+  }
+  const tCanon = canonPath(t).toLowerCase();
+  return docs.filter(d => {
+    if (d.path === t) return true;
+    if (String(d.scope || '').trim() && canonPath(String(d.scope).trim()).toLowerCase() === tCanon) return true;
+    if ((d.files || []).some(f => targets.has(normalizePath(f)) || canonPath(f).toLowerCase() === tCanon)) return true;
+    if (String(d.scope || '').trim().toLowerCase() === 'overview') {
+      const proj = String(d.project || '').toLowerCase();
+      for (const h of projectHints) if (h.length >= 3 && proj.includes(h)) return true;
+    }
+    return false;
+  });
+}
+
+/** scope（features/modules/files 混写）→ 覆盖它的架构档并集（按档路径去重）。 */
+export function archDocsForScope(index, rootPath, scope = {}) {
+  const out = new Map();
+  for (const t of [...(scope.features || []), ...(scope.modules || []), ...(scope.files || [])]) {
+    for (const d of archDocsFor(index, rootPath, t)) if (!out.has(d.path)) out.set(d.path, d);
+  }
+  return [...out.values()];
+}
+
+/** 一行（或两行）架构档指针：新鲜 / ⛔过期 / ⚠指纹写法不符 / 无档软提示（不阻塞）。 */
+export function renderArchPointer(states, { label = '架构档' } = {}) {
+  const list = states || [];
+  if (!list.length) {
+    return `${label}: 该目标暂无架构档（软提示，不阻塞）——建议本次方案确认时顺带出 L1 总览，或按 arch-view 契约补 L2。`;
+  }
+  const parts = list.map(s => {
+    if (s.missing) return `${s.path}（档案不存在）`;
+    if (s.noHeader) return `${s.path}（无指纹头 → nav_arch mode="stamp" path="${s.path}" 补）`;
+    if (s.ok) return `${s.path}（新鲜）`;
+    const flag = s.tzOnly ? '⚠指纹写法不符' : '⛔过期';
+    return `${s.path}（${flag}：${s.drifted.slice(0, 2).join('、')}${s.drifted.length > 2 ? ` 等 ${s.drifted.length} 项` : ''}）`;
+  });
+  const tzDocs = list.filter(s => !s.ok && !s.missing && !s.noHeader && s.tzOnly);
+  const stale = list.filter(s => !s.ok && !s.missing && !s.noHeader && !s.tzOnly);
+  const tail = [];
+  if (tzDocs.length) {
+    tail.push(`  ⚠ ${tzDocs.map(d => d.path).join('、')} 只是指纹写法不符（文件未变）→ nav_arch mode="stamp" path="${tzDocs[0].path}" 一次校正，无需重生成内容。`);
+  }
+  if (stale.length) {
+    tail.push(`  过期档 = 设计已漂移，不可当现行事实读：重生成内容后跑 nav_arch mode="stamp" path="${stale[0].path}" 刷新指纹。`);
+  }
+  return `${label}: ${parts.join(' / ')}${tail.length ? '\n' + tail.join('\n') : ''}`;
+}
+
+/**
+ * 刷新一档的 arch-cache 指纹头：按档内**已声明**的 files 列表重取 mtime/size。内容由 agent 读码
+ * 重生成，指纹由工具写——手抄 mtime 正是漂移的来源（工具化替代手工比对是本次接入的实质）。
+ * 声明文件在磁盘上缺失 = 拒绝写（宁可显性失败，也不写一份指向空气的指纹）。
+ * 调用方须包在 withFileLock 内（单一写入路径，与 index/docs/arch 账本同规矩）。
+ */
+export function stampArchDoc(rootPath, relPath) {
+  const rel = normalizePath(relPath);
+  const abs = resolve(rootPath, rel);
+  let content;
+  try { content = readFileSync(abs, 'utf-8'); } catch { return { ok: false, reason: `找不到架构档：${abs}` }; }
+  const cache = parseArchCache(content);
+  if (!cache) return { ok: false, reason: '该档没有 arch-cache 指纹头——先按契约在文档头部写入（含 files: 列表），再 stamp。' };
+  if (!cache.files.length) return { ok: false, reason: 'arch-cache 指纹头的 files: 列表为空——先声明本档覆盖哪些文件。' };
+  const rows = [];
+  const missing = [];
+  for (const f of cache.files) {
+    let st = null;
+    try { st = statSync(resolve(rootPath, f.path)); } catch { st = null; }
+    if (!st || !st.isFile()) { missing.push(f.path); continue; }
+    rows.push({ path: f.path, mtime: new Date(st.mtimeMs).toISOString(), size: st.size });
+  }
+  if (missing.length) return { ok: false, reason: `以下声明文件在磁盘上不存在，拒绝刷新指纹（宁可显性失败）：${missing.join(', ')}` };
+  const generated = new Date().toISOString();
+  const block = [
+    '<!-- arch-cache',
+    `generated: ${generated}`,
+    `project: ${cache.project}`,
+    `scope: ${cache.scope}`,
+    'files:',
+    ...rows.map(r => `  - path: ${r.path}\n    mtime: ${r.mtime}\n    size: ${r.size}`),
+    '-->'
+  ].join('\n');
+  // 函数式替换：指纹块里可能出现 $ 序列，字符串式 replace 会把它当替换模式解释。
+  const next = content.replace(cache.raw, () => block);
+  const tmp = abs + '.tmp';
+  writeFileSync(tmp, next, 'utf-8');
+  renameSync(tmp, abs);
+  return { ok: true, path: rel, generated, files: rows.length, rows };
+}
+
 // ---- reference docs registry (project reference foundation) ----
 
 export function createEmptyDocs() {

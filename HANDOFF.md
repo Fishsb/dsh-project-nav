@@ -1512,3 +1512,30 @@ v0.7.1~0.7.3 修的是**误报**，v0.7.4 修的是**漏报与不可收口**—�
    **用户裁定**：收口本动作后**停止越界**；已推送的 shoucang 修复保留在线（回退方法：`git revert 8bec0d4` + profile pin 退回 `d22897f` 并重装）。
 
 _本文件应随项目推进持续更新。最后更新：2026-09-10T13:55Z（shoucang 修复实机验收 PASS + 记录范围教训：他项目源码/远端/共享 profile 须先明确获批）_
+
+---
+
+## 39. v0.8.0 架构文档层接入治理循环（ADR-011；lk 2026-09-10 指令「接入当前治理方案 + 清理旧治理插件遗留」）
+
+**缺口（§24 起就明示的开环 G1）**：§24 已把「架构文档 = 核心维护文档」定为决策入口，但治理链路六环节里**没有任何一环引导 agent 读架构档、也没有一环报它过期**——过期管理只存在于 arch-view 技能侧的手工 mtime 比对里。实测后果：本次开工时 5 档里 2 档指纹已过期而无人报，其中 1 档（`project-nav-PN-F01`）的行号依据已整体位移。
+
+**设计（ADR-011，五条）**：① 架构档本体（`.internal/arch/*.md` + 头部 `arch-cache` 指纹块）是唯一事实源，**插件只读不复制、零新数据文件**；② 新工具 `nav_arch`（`list` / `check` / `stamp`，除 stamp 外只读，**正文永不被工具改写**）；③ 四处既有输出接线：`nav_query` 架构档指针行、`nav_plan` `archBasis` + 架构对照段、`nav_mark done` 报本次改动使哪几档过期、`nav_status` 汇总全档新鲜度；④ **渲染（SVG/HTML 投影）不进插件**——投影零维护且无机检状态，留在技能侧；⑤ 模型面 10 → 11 工具，**闸门一个不加**（复杂度预算）。
+
+**实测发现一（真问题，已修）**：库里同一个瞬时存在**两套指纹写法**——project-nav 各档 = UTC 毫秒（`toISOString`），shoucang 各档 = **本地墙上时间且截到秒**（§38 那次「校准」把它定为约定，但只校准了 shoucang 一侧）。字符串比较会让一半的档**永久假过期**，正是本项目反复对抗的「假信号腐蚀信任」。改为按**瞬时**判定：UTC 或本机本地渲染任一命中即新鲜，±1s 容忍秒级截断；**既非 UTC 也非本机本地**的整点偏移记 `tzOnly`「写法不符」（只需 `stamp`，**不得**逼 agent 重生成一档仍与代码一致的文档）；`size` 不一致 / 文件缺失 / 超 1 秒瞬时差仍记真漂移。
+
+**实测发现二（越界，未处置）**：`.internal/arch/shoucang-SC-S07-deepsleep.md` 因 **shoucang 自身的在制品**（`shoucang/skill/scripts/memory_write_gate.mjs` 8517 → 8851 字节）真过期；`shoucang-SC-S05-MCL-实施方案.md` 无指纹头（实施方案类文档）。两者属他项目域，**本动作未处置**，留给 shoucang 会话按 `nav_arch` 提示处理。
+
+**交付与验证**：
+| 项 | 证据 |
+|---|---|
+| 回归 | `node --test test/core.test.mjs test/concurrency.test.mjs` → **82/82**（新增 8 项架构层用例：指纹解析 / 新鲜度多态 / 递归列档跳过 render/ / 覆盖判定 / stamp 成功与两种拒绝 / 双写法同一瞬时 / 指针四态） |
+| 新增面 | `shared/index.js` +244 行（7 个导出：`parseArchCache:907` `archDocStatus:936` `listArchDocs:994` `archDocsFor:1014` `archDocsForScope:1055` `renderArchPointer:1064` `stampArchDoc:1094`）；`host/index.js` +107 行（四处接线 + `nav_arch:1140`） |
+| L3 冒烟 | 对**已装副本**用 stub ctx 加载（bare import 走 profile node_modules，与生产同路径）：**11 工具注册成功**；`nav_arch list` 正确报全档新鲜度；`nav_arch check PN-F01` 给出覆盖档 + 过期原因 + 下一步命令；`nav_query project-nav/host/index.js` 输出含架构档指针行；`nav_status` 输出 `Arch Docs: 5 档（新鲜 1 / 过期 4）` |
+| 装配 | 外科对齐（无 pnpm 出网）：备份 `package.json.bak-v080-install-20260910154639` / `pnpm-lock.yaml.bak-v080-install-20260910154639` → profile dep 指向 `dsh-external-project-nav-0.8.0.tgz` → lock 三处包键（importers / packages / snapshots）+ 按新 tgz 重算 `sha512` integrity → 覆盖 `node_modules/@dsh-external/project-nav`；复核：lock 里 `0.7.4` 出现 **0** 次 / `0.8.0` **6** 次，`host/index.js`、`shared/index.js`、`package.json` **SHA256 树=装 MATCH**，profile JSON 无 BOM |
+| 架构档自证 | `.internal/arch/` 三档（L1 overview 重生成 / PN-F01 主链随接线更新 / **新增 PN-F08 L2 档**）全部 **FRESH**（用 `stampArchDoc` 写指纹，非手抄） |
+
+**⚠ 生效方式**：profile bundle 只在**进程启动时**读一次（§38 已记录「热重载通道不覆盖 profile bundle」），所以 `nav_arch` 要在**下次重启 DSH** 后才出现在工具面；本轮的 L3 冒烟是对磁盘上的模块直接加载，证明的是**代码正确**，不是**进程已换**。
+
+**待办（明示未做）**：① 渲染仍未工具化（按 ADR-011 有意如此；若用户侧抱怨投影过期再评估）；② `nav_status` 把「无指纹头」的档归入「过期」计数（当前实现），若实施方案类文档增多需再分一档；③ 索引里 `nav_plan`/`nav_mark`/`nav_adr`/`nav_map`/`nav_sync_docs` 仍未作为独立特征登记（索引粒度是功能面）；④ `dsh-external-project-nav-0.7.4.tgz` 在本次 0.8.0 打包时被同源重生成（内容 = v0.8.0 代码但版本号仍是 0.7.4），**已改名归档**为 `.polluted-by-080-repack-20260910`，真 0.7.4 可从 `61624c8` 重新打包。
+
+_最后更新：2026-09-10T16:05Z（v0.8.0 架构文档层接入 + 两处实测发现：指纹双写法按瞬时判定 / shoucang 档真过期未越界处置）_

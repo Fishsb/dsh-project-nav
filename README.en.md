@@ -4,7 +4,7 @@
 
 **Anti-drift project governance plugin for DeepSeek Harness (DSH)**
 
-[![version](https://img.shields.io/badge/version-0.7.3-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.8.0-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -36,7 +36,7 @@ Long-running AI coding projects drift: files pile up without feature mapping, pl
 ## ✨ Features
 
 - 🗺️ **Bidirectional governance map** — project→module→feature→file four-way cross index, single source of truth, one map for everything
-- 🏛️ **Architecture doc layer (ecosystem, NOT in this package)** — L1 overview + L2 feature chains (through-style flow, line-number evidence) with fingerprint-expired auto-regeneration are provided by the companion arch-view skill; this repo ships the index + governance loop only
+- 🏛️ **Architecture doc layer wired into the loop (v0.8.0)** — arch docs (`.internal/arch/*.md` with an `arch-cache` fingerprint header declaring which version of which files the doc was derived from) no longer rely on the agent remembering to look: `nav_query` prints an **arch pointer line** (fresh / stale / soft "no doc yet"), `nav_plan` records `archBasis` and prints an **architecture cross-check**, `nav_mark done` reports **which docs this change made stale**, `nav_status` summarizes freshness, and `nav_arch` provides list / coverage check / fingerprint stamping. **Rendering (SVG/HTML projection) stays out of the plugin** — projections cost zero maintenance and remain the companion arch-view skill's job; this package owns only the three machine-checkable facts: where the doc is, whether it is fresh, and whether it covers the target
 - 🏛️ **Architecture-first protocol (v0.5.0+)** — a task must anchor to an architecture node before it enters the ledger: a single-target scope auto-anchors, an ambiguous multi-target scope must pass `anchor=`; ≥3 **patches** on one anchor since the last architecture decision trip the **repeat-patch gate**; `nav_adr` records the decision and resets the counter. A patch means the action *actually changed something* (v0.7.3): a bookkeeping pass whose fingerprint proves the scope is byte-identical is not counted — otherwise it manufactures hollow ADRs and dilutes the decision ledger.
 - 🎯 **Governance-first action ledger** — `nav_plan` → `begin` → change → `done` (with `abort`); open actions = drift signal, marked red on the map; **one in-progress action per session**
 - 🔍 **Scope fingerprints (v0.4.0)** — `begin` records size/mtime/sha1 for every file in scope; `done` reports `⚠ Scope drift` (modified / vanished / appeared) and `nav_status` shows live drift for running actions. Leases stop two sessions from starting together; fingerprints catch files moved underneath a running action.
@@ -49,19 +49,20 @@ Long-running AI coding projects drift: files pile up without feature mapping, pl
 - 🌳 **Progressive mindmap** — self-contained offline HTML, no CDN, double-click to open
 - 🩺 **Disk drift probe** — files registered but missing on disk (STALE) surfaced at a glance, dual path-shape compatible
 
-## 🔧 The 10 tools (single responsibility)
+## 🔧 The 11 tools (single responsibility)
 
 | Tool | Purpose |
 |------|---------|
-| `nav_query` | Look up structure/modules/features before changes (scope gate + mainline warning + **cross-session occupancy notice**) |
-| `nav_plan` | Governance-first gate: register action (**anchor gate** + scope pre-check + anti-goal rejection + **repeat-patch gate**) |
-| `nav_mark` | Action lifecycle: begin / done / abort (begin: scope-conflict gate + lease + queueing; done: scope drift + patch pressure) |
+| `nav_query` | Look up structure/modules/features before changes (scope gate + mainline warning + **cross-session occupancy notice** + **arch pointer line**) |
+| `nav_plan` | Governance-first gate: register action (**anchor gate** + scope pre-check + anti-goal rejection + **repeat-patch gate** + **architecture cross-check and `archBasis`**) |
+| `nav_mark` | Action lifecycle: begin / done / abort (begin: scope-conflict gate + lease + queueing; done: scope drift + patch pressure + **which arch docs the change made stale**) |
 | `nav_adr` | **Architecture decision record** (anchor + reason + decision + impact); recording it resets that anchor's patch counter |
+| `nav_arch` | **Architecture doc layer**: `list` (freshness of every doc / expiry management), `check` (which docs cover one target and whether they are fresh), `stamp` (re-derive a doc's fingerprint from its own declared file list — the agent regenerates content, the tool writes the fingerprint). Read-only except `stamp`; the body is never rewritten |
 | `nav_update` | **The single registration entry point (upsert and retire)**: update an existing entry, or create a feature/module (feature: `files=`; module: `features=`/`project=`). When something is genuinely gone, `retire=true` removes it and cascades (a feature drops its file mappings in both directions + module membership; a module drops its project attachments but its features survive; a project detaches its modules but they survive). Refused while an open action still references the target |
 | `nav_docs` | Reference docs: pass `title`+`path`+`when` to register (`when` is the routing rule); otherwise list or rank by `task` |
 | `nav_map` | Governance map: `text` (agent orientation) / `html` (human mindmap) |
 | `nav_sync_docs` | Auto-align PROJECT.md (derived sections: feature map + mainline vector + **architecture decisions**) |
-| `nav_status` | Health snapshot: coverage + open actions + STALE files + **cross-session concurrency view** |
+| `nav_status` | Health snapshot: coverage + open actions + STALE files + **cross-session concurrency view** + **architecture docs freshness summary** (v0.8.0) |
 | `nav_set_vector` | Set the mainline vector |
 
 ## 🔄 Governance loop
