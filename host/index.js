@@ -22,7 +22,7 @@ import {
   queryIndex, partialSearch, normalizePath,
   renderTreeText, renderMapHtml, renderProjectDocSection,
   findStaleFiles, scopeTargetsOfOpenActions,
-  snapshotScopeFiles, verifyScopeFingerprint, resolveScopeFile, indexedOwnersOf,
+  snapshotScopeFiles, verifyScopeFingerprint, resolveScopeFile, indexedOwnersOf, governedWorkspaceOf,
   loadArch, nextDecisionId, checkAnchor, repeatPressure, REPEAT_PATCH_THRESHOLD, lastDecisionFor,
   listArchDocs, archDocsFor, archDocsForScope, archDocStatus, renderArchPointer, stampArchDoc, parseArchCache
 } from '../shared/index.js'
@@ -41,7 +41,13 @@ export const Config = z.object({
   root: z.string().default(''),
   // Multi-session leases: how long an in_progress action keeps its scope lock
   // without a heartbeat before another session may claim the same scope.
-  leaseTtlMs: z.number().default(0)
+  leaseTtlMs: z.number().default(0),
+  // Workspace boundary (ADR-014): bind every session whose cwd belongs to a GOVERNED
+  // workspace to the native `workspace-write` sandbox, so its write actions cannot leave
+  // that workspace while reads stay unrestricted everywhere. The boundary itself is the
+  // harness's — this plugin only decides which workspaces are governed. Set false to
+  // leave every session untouched.
+  autoBindWorkspace: z.boolean().default(true)
 })
 
 // ---- helpers ----
@@ -228,6 +234,42 @@ export function apply(ctx, config) {
   try { fsCapability = ctx.get?.('fs') ?? ctx.fs ?? null } catch { fsCapability = null }
   if (fsCapability && ctx.logger?.warn) {
     ctx.logger.warn('[project-nav] a sandboxed fs capability (ctx.fs) is present, but this plugin reads/writes .internal/ through node:fs directly. If this deployment confines plugin fs access, governance data may bypass the fence — see HANDOFF §33 (G3).')
+  }
+
+  // ---- workspace boundary (ADR-014) ----
+  // The harness owns the boundary: a session's cwd IS its workspace, and `workspace-write`
+  // confines every write (files, shell, subprocesses, third-party plugins) to it while
+  // leaving reads unrestricted everywhere. The plugin contributes the one fact the harness
+  // cannot know — whether THIS deployment governs that workspace — by binding matching
+  // sessions to that mode once, at session start. Enforcement, the approval path, and
+  // projecting the policy into the model's own context are all native; nothing is
+  // re-implemented here.
+  if (config?.autoBindWorkspace !== false && typeof ctx.on !== 'function') {
+    // Fail VISIBLE: a context without ctx.on would silently leave every session unbound,
+    // and a boundary that reports nothing is worse than one that reports it is missing.
+    ctx.logger?.warn?.('[project-nav] workspace boundary: this context exposes no ctx.on — sessions will NOT be bound to their workspace. Set autoBindWorkspace=false to silence.')
+  }
+  if (config?.autoBindWorkspace !== false && typeof ctx.on === 'function') {
+    ctx.on('agent/session-start', (payload) => {
+      try {
+        const session = payload?.agent?.session
+        const cwd = session?.header?.cwd
+        if (!session || !cwd || typeof session.append !== 'function') return
+        // Not governed → leave the session completely alone (its workspace may merely share the root).
+        const zone = governedWorkspaceOf(loadIndex(root), root, cwd)
+        if (!zone) return
+        const policy = ctx.get?.('sandboxPolicy')
+        if (!policy || typeof policy.overrideOf !== 'function') return
+        // Someone already chose a mode for this session (the user's /permission, or an earlier
+        // bind): never override an explicit choice, and never append the same event twice.
+        if (policy.overrideOf(session) !== undefined) return
+        session.append('sandbox/mode', { mode: 'workspace-write' })
+        ctx.logger?.info?.(`[project-nav] workspace boundary: session ${sessionLabel(payload?.agent?.id)} bound to workspace-write (${zone})`)
+      } catch (e) {
+        // Fail-safe: a boundary that cannot be set must never break session establishment.
+        ctx.logger?.warn?.(`[project-nav] workspace boundary: left session untouched (${e.message})`)
+      }
+    })
   }
 
   // ---- 1. nav_query — bidirectional mapping + gates ----

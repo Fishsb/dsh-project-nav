@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, statSync, re
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import {
-  normalizePath,
+  normalizePath, governedWorkspaceOf,
   createEmptyIndex, saveIndex, loadIndex,
   createDefaultVector, saveVector, loadVector,
   createEmptyActions, saveActions, loadActions, nextActionId,
@@ -42,6 +42,29 @@ function seededIndex(root) {
 test('normalizePath turns backslashes into forward slashes', () => {
   assert.equal(normalizePath('host\\index.js'), 'host/index.js')
   assert.equal(normalizePath('a/b/c'), 'a/b/c')
+})
+
+test('governedWorkspaceOf governs registered projects only, and never the rest of the root', () => {
+  const idx = createEmptyIndex()
+  idx.projectPaths = { 'PN-P01': 'project-nav', alpha: 'deepseek/alpha' }
+  const root = 'D:\\FF'
+
+  // inside a registered project → that project directory (any spelling of the cwd)
+  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:\\FF\\project-nav\\host')), 'D:/FF/project-nav')
+  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:/FF/deepseek/alpha')), 'D:/FF/deepseek/alpha')
+  // the root itself is governed
+  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:\\FF')), 'D:/FF')
+  // a directory inside the root that is NOT a registered project → untouched
+  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FF\\scratch'), '')
+  // outside the root entirely → untouched
+  assert.equal(governedWorkspaceOf(idx, root, 'C:\\Users\\lk\\elsewhere'), '')
+  // a sibling whose name merely starts with the root's must not read as containment
+  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FFx'), '')
+  // an index with no project table governs only the root, never a subdirectory
+  assert.equal(governedWorkspaceOf(createEmptyIndex(), root, 'D:\\FF\\project-nav'), '')
+  // missing inputs never throw — the caller relies on this being total
+  assert.equal(normalizePath(governedWorkspaceOf(null, root, 'D:\\FF')), 'D:/FF')
+  assert.equal(governedWorkspaceOf(idx, root, ''), '')
 })
 
 test('index/vector/actions/docs round-trip through atomic JSON in a temp root', (t) => {

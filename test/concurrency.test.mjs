@@ -74,16 +74,19 @@ function makeRoot() {
   return root
 }
 
-/** Boot the real host module against a temp root and hand back its tool table. */
-function boot(root, config = {}) {
+/** Boot the real host module against a temp root and hand back its tool table + listeners. */
+function boot(root, config = {}, sandboxPolicy = undefined) {
   const tools = new Map()
+  const handlers = []
   const ctx = {
     logger: { info() {}, warn() {} },
     effect: (fn) => { fn(); return () => {} },
+    on: (name, listener) => { handlers.push({ name, listener }); return () => {} },
+    get: (name) => (name === 'sandboxPolicy' ? sandboxPolicy : undefined),
     tools: { register: (t) => { tools.set(t.name, t); return () => {} } }
   }
   hostMod.apply(ctx, { root, ...config })
-  return tools
+  return { tools, handlers }
 }
 
 /** Call one tool as one session (exec.agent.id is the SessionId the host reads). */
@@ -96,8 +99,47 @@ async function call(tools, name, args, sessionId) {
 
 async function booted() {
   const root = makeRoot()
-  return { root, tools: boot(root) }
+  return { root, ...boot(root) }
 }
+
+test('workspace boundary: binds governed sessions once, and never touches the rest', async () => {
+  const root = makeRoot()
+  const appended = []
+  const policy = { overrideOf: () => undefined }
+  const { handlers } = boot(root, {}, policy)
+  const start = handlers.find(h => h.name === 'agent/session-start')?.listener
+  assert.ok(start, 'the boundary listener is registered at session start')
+
+  const session = (cwd, id) => ({ header: { cwd }, append: (type, data) => appended.push({ id, type, data }) })
+
+  // governed workspace → bound to workspace-write
+  start({ agent: { id: 'session-a', session: session(join(root, 'project-nav'), 'session-a') } })
+  assert.deepEqual(appended.map(a => a.type), ['sandbox/mode'])
+  assert.equal(appended[0].data.mode, 'workspace-write')
+
+  // the same session again (resume) already carries a mode → never appended twice
+  policy.overrideOf = () => 'workspace-write'
+  start({ agent: { id: 'session-a', session: session(join(root, 'project-nav'), 'session-a') } })
+  assert.equal(appended.length, 1)
+
+  // a user's explicit choice is respected, not overridden
+  policy.overrideOf = () => 'danger-full-access'
+  start({ agent: { id: 'session-b', session: session(join(root, 'project-nav'), 'session-b') } })
+  assert.equal(appended.length, 1)
+
+  // a directory inside the root that is not a registered project → untouched
+  policy.overrideOf = () => undefined
+  start({ agent: { id: 'session-c', session: session(join(root, 'scratch'), 'session-c') } })
+  // outside the root entirely → untouched
+  start({ agent: { id: 'session-d', session: session('C:\\elsewhere', 'session-d') } })
+  // no cwd at all → untouched, and must not throw
+  start({ agent: { id: 'session-e', session: { header: {}, append: () => assert.fail('must not append') } } })
+  assert.equal(appended.length, 1)
+
+  // autoBindWorkspace=false leaves even a governed session alone
+  const off = boot(root, { autoBindWorkspace: false }, policy)
+  assert.equal(off.handlers.filter(h => h.name === 'agent/session-start').length, 0)
+})
 
 test('disjoint scopes: two sessions hold live locks at the same time', async () => {
   const { tools } = await booted()

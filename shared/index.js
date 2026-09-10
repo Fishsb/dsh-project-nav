@@ -168,6 +168,34 @@ export function normalizePath(p) {
   return String(p).replace(/\\/g, '/');
 }
 
+/**
+ * Which governed workspace contains `cwd`? Returns the absolute workspace directory,
+ * or '' when this plugin does not govern it.
+ *
+ * This is the ONE fact the harness cannot supply. The harness already knows that a
+ * session's cwd is its workspace and that `workspace-write` confines writes to it; what
+ * it cannot know is which directories THIS deployment claims as governed projects. So the
+ * plugin contributes exactly this decision and nothing else — enforcement, the approval
+ * path, and projecting the policy into the model's context all stay native (ADR-014).
+ *
+ * The root itself counts as governed (a session opened at the root governs the whole
+ * root). A directory inside the root that matches no `projectPaths` entry is NOT governed,
+ * so an unrelated workspace that merely shares the root is left completely alone.
+ */
+export function governedWorkspaceOf(index, rootPath, cwd) {
+  const fold = (p) => normalizePath(p || '').trim().replace(/\/+$/, '').toLowerCase();
+  const within = (p, zone) => p === zone || p.startsWith(zone + '/');
+  const c = fold(cwd);
+  const root = fold(rootPath);
+  if (!c || !root || !within(c, root)) return '';
+  for (const rel of Object.values(index?.projectPaths || {})) {
+    const dir = resolve(rootPath, String(rel));
+    const zone = fold(dir);
+    if (zone && within(c, zone)) return dir;
+  }
+  return c === root ? resolve(rootPath) : '';
+}
+
 // ---- atomic JSON IO ----
 
 /**
