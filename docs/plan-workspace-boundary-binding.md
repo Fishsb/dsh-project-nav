@@ -2,9 +2,9 @@
 
 > 整理日期：2026-09-11（本地）
 > 架构依据：**ADR-014**（现行，收敛 ADR-012/ADR-013）
-> 状态（2026-09-11 02:05，v0.8.4）：机制链已完整并全部实证 —— **覆盖判定**（白名单 opt-in，空名单即惰性）、**能力判定**（只读探针，宿主不能强制就不绑）、**绑定**（`agent/session-start`，实测生效过）、**原生强制**（fs 边界实测拦截）。
-> **前置门（§3）已开**：宿主侧沙箱后端 PASS —— nssm 服务已卸载，`dsh-web` 改以 `lk` 身份前台运行（`D:\lk\tools\dsh-web.cmd`）→ 受限令牌 runner 可创建；**read-only**（=插件探针形态）与 **workspace-write** 双探针实测通过，workspace-write 下区内写成功、区外写被拒（`Access is denied.`）。实证与现行宿主形态见 runbook §0。
-> 故本机**已启用**：profile `autoBindWorkspace: true` + `boundaryWorkspaces: 'project-nav'`（只治理 project-nav；shoucang 等主线工作不受影响）——待**重启 dsh-web** 后按 §8 验收。启用后仍受插件自带一次性只读探针兜底（探针不绿即不绑，绝不夺会话 shell）。事故经过与架构调整见 §12/§13 与 ADR-016。
+> 状态（2026-09-11 02:40，v0.8.5）：**已上线，§8 验收全套 PASS**。机制链四项 —— **覆盖判定**（白名单 opt-in，空名单即惰性）、**能力判定**（只读探针，宿主不能强制就不绑）、**绑定**（`agent/session-start`）、**原生强制**（fs 边界实测拦截）—— 全部在真实部署上实证。本机 profile 已写 `autoBindWorkspace: true` + `boundaryWorkspaces: 'project-nav'`。
+> **验收证据**：① 全新会话与恢复会话的策略行均为 `workspace-write … workspace: "D:\FF\project-nav"`；② 未治理工作区零影响 —— `boundary-diag.json` 记录 `D:\FF\shoucang`×4、`D:\FF\dsh-managing-memory`×1 全为 `not-governed`（不绑）；③ 区内写成功、区外写被拒（`D:\FF\__probe4.tmp`，连 `~/.dsh/profiles/web/cordis.patch.yml` 也被拒）；④ 受限 shell 正常执行（`Get-Date`，未 fail-closed）；⑤ 判定留痕于 `D:\FF\.internal\boundary-diag.json`（probe verdict/attempts + 每会话决策）；⑥ 全量测试 85/85；⑦ 工作树 / tgz / 安装副本 SHA256 三者一致。宿主侧前置门与现行形态见 runbook §0。
+> **上线前拦下的真缺陷（v0.8.5，ADR-017）**：v0.8.4 的探针"apply 时只探一次 + 首次结论永久缓存 + 早退无日志"，会把一次**启动竞态**固化成**永久惰性且零痕迹** —— 配置、挂载、白名单、宿主后端全对，却一个会话都不绑。根因是判定语义本身，不是探针参数；诊断链与修法见 §14。
 
 ---
 
@@ -198,3 +198,23 @@ CreateRestrictedToken prerequisite failed: no logon SID found among 4 token grou
 | ① | 保持人工前置（现状）：宿主先修好，再打开开关 | 顺序靠人守——已被现实否证两次 |
 | ② | 插件加**一次性能力探针**：真正起一次受限进程，失败则不绑（按进程缓存） | ✅ **已落 v0.8.4**——不需要新数据文件：`shell.resolve`/`run` 是公开 seam，且 `ShellRunResult.sandbox.runnerFailed` 是一等字段；探针用 `read-only`（零授权、无 ACL 变更），避开 `workspace-write` 的 eager ACE 传播 |
 | ③ | 把"宿主可强制"做成**显式能力声明**（`.internal/` 下一份标记），由验证流程写入、插件只读 | 引入一个新数据文件（无进程开销，天然可审计） |
+
+## 14. v0.8.5：启动竞态把 fail-safe 变成永久惰性（上线前拦下的真缺陷）
+
+**现象（2026-09-11 二次重启后）**：宿主机已修好（runbook §0 双探针 PASS）、profile 配置在位、插件挂载正常、白名单匹配链成立 —— 但 `D:\FF\project-nav` 的新会话**一律** `danger-full-access`，区外写不被拒。边界根本没生效，且**零痕迹**（宿主 stdout 未落盘，`ctx.logger` 的输出无处可查）。
+
+**逐层取证（动态 Cordis 插件 + A/B 对照，全部实证）**
+
+| 层 | 证据 | 结论 |
+|---|---|---|
+| 事件 | 监听 `agent/session-start`：收到新会话，`source=startup`、`agent.session` 存在、`hasAppend=true`、`cwd` 正确 | OK |
+| 服务 | 同一上下文能取到 `shell`（`resolve`/`run`）与 `sandboxPolicy`（`overrideOf`） | OK |
+| 探针 | 就地跑**同规格**只读探针：`exitCode=0`、`runnerFailed=false` | **PASS** |
+| 绑定 | 在**同一时刻**由探针插件 `session.append('sandbox/mode', …)` → 新会话立刻 `workspace-write`，区外写被拒 | OK |
+
+⇒ 事件、服务、探针、append、宿主后端**全部正常**。唯一剩下的卡点就是 v0.8.4 探针的**判定语义**：`apply()` 只探一次 + `boundaryUsable !== null → return` 把**首次**判定永久缓存 + 三条早退路径**都不打日志**。启动竞态一旦让它为 `false`（seam 已注册但执行器/后端尚未 live），一次瞬时故障就固化为永久失效。
+
+**修复（v0.8.5，ADR-017）**：① `inject: ['tools'] → ['tools','shell']` —— 探针经 shell seam 是**真依赖**，Cordis 会等它就绪再 apply；② 只缓存**成功**，失败可重探（首次失败后下一次 session-start 立即重试，其后 10s 节流）；③ 每次判定与每个会话决策写入 `<root>/.internal/boundary-diag.json`，所有失败分支必须 `warn`；④ 新增回归用例「boot 探针失败 → 不绑 → 重探成功 → 下一会话绑定」。
+**复验**：探针 `attempt 1 / trigger=boot` 即 PASS；新会话与恢复会话均绑定；未治理工作区（shoucang / dsh-managing-memory）全部 `not-governed`；区外写（含 `~/.dsh` 配置）被拒；受限 shell 正常；全量 85/85。
+
+**教训（与 §12 同源）**：**"能不能强制"必须是状态，不能是一次性事件**。任何"探一次就定终身"的 fail-safe，都会把瞬时故障放大成永久失效；而 fail-safe 的早退路径若不发声，失效就与"正常惰性"无法区分 —— 这正是本项目 doctrine 的头号敌人（不可信信号）。判定必须留痕，且**失败不可缓存**。

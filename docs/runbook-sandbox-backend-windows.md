@@ -26,7 +26,8 @@ D:\lk\tools\dsh-web.cmd        # 现唯一启动方式；无自启 —— 重启
 
 > ⚠️ **判据只能跑 runner，不能看 `whoami`**：`.NET WindowsIdentity.Groups` 与 `whoami /groups` **都看不到** logon SID（`S-1-5-5-*`），但那**不等于令牌里没有** —— runner 的 `findLogonSid` 是按 token group 的 `SE_GROUP_LOGON_ID` **属性**取的（`types-DuU3lSVe.js:584-610`）；真没有才会打印 `windows-acl-run: CreateRestrictedToken prerequisite failed: no logon SID found among N token groups` 并退 127。**曾据 `whoami` 输出误判"令牌仍无 logon SID"，实为工具口径问题。**
 
-**回归到边界**：前置门已开 → profile `cordis.patch.yml` 已写 `autoBindWorkspace: true` + `boundaryWorkspaces: 'project-nav'`（YAML 解析 + 插件 Config schema 双校验通过）。**重启 dsh-web** 后按本文 §四与 `plan-workspace-boundary-binding.md` §8 验收。
+**回归到边界（2026-09-11 02:40 收口：已上线 + 验收 PASS）**：前置门已开 → profile 已写 `autoBindWorkspace: true` + `boundaryWorkspaces: 'project-nav'`，边界**已生效**：全新会话与恢复会话的策略行均为 `workspace-write … workspace: "D:\FF\project-nav"`；区内写成功、区外写被拒（含 `~/.dsh/profiles/web/cordis.patch.yml`）；受限 shell 正常执行；未治理工作区（`D:\FF\shoucang`、`D:\FF\dsh-managing-memory`）全部 `not-governed`、零影响。
+**上线过程中还拦下一个真缺陷**：v0.8.4 的"一次性探针 + 首次结论永久缓存 + 早退无日志"会把一次**启动竞态**固化成"永久惰性且零痕迹"（配置、挂载、白名单、宿主后端全对，却一个会话都不绑）。已由 **v0.8.5** 修复：shell 升为硬依赖、只缓存成功（失败可重探并节流）、每次判定与会话决策留痕于 `D:\FF\.internal\boundary-diag.json`。诊断链与修法见 `plan-workspace-boundary-binding.md` §14 与 **ADR-017**。
 
 **已知缺口（nssm 卸载的后果，不属边界本身）**：
 
