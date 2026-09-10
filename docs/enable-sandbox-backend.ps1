@@ -98,22 +98,63 @@ Step 2 "切换服务账户 -> $Account"
 $before = (& sc.exe qc $Service | Select-String 'SERVICE_START_NAME').ToString().Trim()
 Write-Host "    当前: $before"
 
-$sec = Read-Host -Prompt "    请输入 $Account 的密码（输入不回显，仅传给 nssm；无密码账户直接回车）" -AsSecureString
-$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-try {
-  $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
-  if ([string]::IsNullOrEmpty($plain)) {
-    # Accepted on purpose: an account with no password must not be blocked here. If it actually
-    # has one, the service fails to start and Restore-Service rolls the change back.
-    Warn '密码为空 —— 仅当该账户确实无密码时才正确；否则服务会启动失败并自动回滚'
-  }
-  & $Nssm set $Service ObjectName $Account $plain | Out-Null
-  if ($LASTEXITCODE -ne 0) { Die "nssm set 失败（exit $LASTEXITCODE）" }
-} finally {
-  if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-  $plain = $null
-  $sec = $null
+$sec  = Read-Host -Prompt "    请输入 $Account 的密码（输入不回显）" -AsSecureString
+$sec2 = Read-Host -Prompt "    再输一次以确认" -AsSecureString
+function ConvertFrom-Sec([Security.SecureString]$s) {
+  $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)
+  try { return [Runtime.InteropServices.Marshal]::PtrToStringAuto($b) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
 }
+$plain = ConvertFrom-Sec $sec
+$plain2 = ConvertFrom-Sec $sec2
+$sec = $null; $sec2 = $null
+if ($plain -cne $plain2) { Die '两次输入不一致 —— 已中止，未做任何修改' }
+
+# Verify the credential BEFORE touching the service. SCM performs a SERVICE logon, so test exactly
+# that with LogonUser(LOGON32_LOGON_SERVICE): a wrong password then fails here, cleanly, instead of
+# setting the account and discovering it at service start (which the event log reports as
+# "The user name or password is incorrect" after a pointless rollback cycle).
+if (-not ('LsaLogonCheck' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class LsaLogonCheck {
+  [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  private static extern bool LogonUser(string user, string domain, string password, int logonType, int logonProvider, out IntPtr token);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  private static extern bool CloseHandle(IntPtr handle);
+  public static int ServiceLogon(string domain, string user, string password) {
+    IntPtr token;
+    bool ok = LogonUser(user, domain, password, 5 /* LOGON32_LOGON_SERVICE */, 0 /* DEFAULT */, out token);
+    if (ok) { CloseHandle(token); return 0; }
+    return Marshal.GetLastWin32Error();
+  }
+}
+'@
+}
+$dom = if ($Account -match '\\') { ($Account -split '\\')[0] } else { $env:COMPUTERNAME }
+if ($dom -eq '.') { $dom = $env:COMPUTERNAME }
+$user = ($Account -split '\\')[-1]
+$err = [LsaLogonCheck]::ServiceLogon($dom, $user, $plain)
+if ($err -ne 0) {
+  $hint = switch ($err) {
+    1326 { '用户名或密码不正确。常见原因：你用 Windows Hello 的 PIN 登录，而 PIN ≠ 账户密码；微软账户请用账户密码。' }
+    1327 { '账户受限 —— 典型原因是空密码账户默认禁止用于服务登录。' }
+    1385 { '该账户没有「作为服务登录」权限。' }
+    1331 { '账户已被禁用。' }
+    1907 { '该账户需要先修改密码才能登录。' }
+    default { "Win32 错误码 $err" }
+  }
+  $plain = $null; $plain2 = $null
+  Write-Host ""
+  Write-Host "    FAIL  凭据校验失败（服务登录被拒）：$hint" -ForegroundColor Red
+  Write-Host "    未做任何修改 —— 服务仍在 $before 下运行。请用正确的账户密码重跑。" -ForegroundColor Yellow
+  exit 1
+}
+Ok '凭据校验通过（LOGON32_LOGON_SERVICE 成功）'
+
+& $Nssm set $Service ObjectName $Account $plain | Out-Null
+if ($LASTEXITCODE -ne 0) { Die "nssm set 失败（exit $LASTEXITCODE）" }
+$plain = $null; $plain2 = $null
 $after = (& sc.exe qc $Service | Select-String 'SERVICE_START_NAME').ToString().Trim()
 Write-Host "    之后: $after"
 # Compare the ACCOUNT NAME only. SCM normalises the reference — it reports `.\lk` for a local
