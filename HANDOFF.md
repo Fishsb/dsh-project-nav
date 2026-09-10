@@ -994,6 +994,31 @@ _本文件应随项目推进持续更新。最后更新：2026-09-10 10:05_
 | 实机验证 | 真工具 + 真 root `D:\FF`：begin 落指纹快照（size/mtime/sha1）→ 外部改动文件 → `nav_status` 实时 `DRIFT since begin` → `done` 报 `⚠ Scope drift` 并落 `a.drift` → 租约清空、锁文件无残留 |
 | 装配声明风险 | **已消除**：此前声明（0.2.10）与实体（0.4.0）不一致，任何重装/依赖刷新都会静默回退 |
 
+### 30.9 同步期发现（2026-09-10 第二轮）
+
+1. **PN-P01 索引被再次回退**：`shared/tools/*`（5）、`client/index.js`、`scripts/build.mjs` 的死条目、`PN-F01..F05` 三重挂载（M01/M02/M03）、空壳 `PN-M04/M05`、以及 `host/cordis.patch.yml → PN-M01` / `package.json → PN-P01` 这类「模块码/项目码写进特征码位」的层级错置**全部复现**——v0.2.9 清理过同一问题。已按 PROJECT.md 自动区（上次核验的良好状态）重建索引：PN 模块 5→2、PN-P01 双重挂载收敛、死文件引用归零；`functionToModule` 中 4 条层级错置键清除。**根因未除**：多个会话的索引写路径没有互斥（v0.4.0 只给账本加了锁，索引写入仍是「读-改-写」），反复清理不解决复发。
+2. **参考文档库（nav-docs.json）整体丢失**：`D:\FF\refs` 下文档实体已不在（仅剩 `refs/README.md`），登记表文件消失且**无任何历史副本**（全盘搜索仅命中测试临时目录里的空表）。已重建为 8 条现存真实文档（见 §30.10），但**原登记内容不可恢复**。
+3. **装配声明与实体不一致（已消除）**：profile 依赖原为 `file:…0.2.10.tgz` 而实体是 0.4.0——任何重装/依赖刷新都会静默回退到 0.2.10。已改为 `file:D:/FF/project-nav/dsh-external-project-nav-0.4.0.tgz` 并经官方通道安装核对。
+
+### 30.10 参考文档登记清单（重建后，`.internal/nav-docs.json`）
+
+| ID | 文档 | when（路由规则） |
+|---|---|---|
+| DOC-001 | `refs\project-nav\2026-09-10-v040-并发与指纹设计要点.md`（§30 摘录） | project-nav 并发 / scope 锁 / 租约 / 冲突判定 / 文件指纹 / 多会话 |
+| DOC-002 | `project-nav\docs\devref\shoucang\2026-09-10-how-to-project-nav-沙箱兼容改造.md` | 沙箱兼容 / ctx.get('fs') / node:fs 替换 / 受限沙箱 |
+| DOC-003 | 同上目录 `…-reference-沙箱改造-vs-文件锁冲突.md` | 账本文件锁 / openSync 独占 / 锁降级告警 |
+| DOC-004 | 同上目录 `…-reference-scope-指纹契约-v0-4-0.md` | scopeState / drift 三类 / 空 scope 语义 |
+| DOC-005 | 同上目录 `…-reference-project-nav-已知代码问题.md` | 已知问题 / 开放项 / 索引死条目 / 装配声明 |
+| DOC-006 | `project-nav\HANDOFF.md` | 交接 / 决策记录 / 事故复盘 / 发布路径 |
+| DOC-007 | `C:\Users\lk\.dsh\skills\arch-view\SKILL.md` | 架构图 / 逻辑图 / 数据流 / 怎么实现的 / 下钻 |
+| DOC-008 | `.internal\arch\project-nav-PN-F01-nav_query.md` | nav_query 实现 / 查询链路 / 占用判定 / 影响面展开 |
+
+> `D:\FF\refs` 实体目录当前仅存 README；上表 DOC-001 是本次新建，其余指向仓库内文档。原 13 条登记（多为 DSH 官方文档与 shoucang 参考）已不可考——如需恢复请重新放入 refs 目录并 `nav_add_doc`。
+
+### 30.11 架构文档（arch-view）现状
+
+- 已补：`.internal/arch/project-nav-overview.md`（L1 总览，含 import 依赖图 + 索引锚定表）、`.internal/arch/project-nav-PN-F01-nav_query.md`（L2 贯通式主链，含行号依据）。此前 `arch/` 下只有 shoucang 两档 → project-nav 自身**无架构档**，本轮补齐。
+- 档位更细的 L2（nav_plan / nav_mark / 冲突判定 / 指纹）尚未出档，按 arch-view「按需生成」纪律留待需要时生成。
 ### 30.8 下一步（未做）
 
 
