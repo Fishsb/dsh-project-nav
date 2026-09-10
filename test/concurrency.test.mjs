@@ -498,4 +498,69 @@ test('G2: the file lock is mutually exclusive, stale-safe and always released', 
   assert.equal(existsSync(lockPath), false, 'the lock must be released when the section ends')
 })
 
+// ---- retire: the index lifecycle needs a deletion, or drift reports become noise ----
+
+test('retire: a feature cascades its file mappings and module membership', async () => {
+  const { root, tools } = await booted()
+  const out = await call(tools, 'nav_update', { target: 'PN-F01', retire: true }, 'session-A')
+  assert.match(out, /Retired feature PN-F01/)
+  const idx = shared.loadIndex(root)
+  assert.equal(idx.indexes.featureToFiles['PN-F01'], undefined, 'feature entry gone')
+  assert.equal(idx.indexes.fileToFeature['project-nav/host/index.js'], undefined, 'sole-owned file mapping gone')
+  assert.deepEqual(idx.indexes.moduleToFeatures['PN-M01'], ['PN-F02'], 'module membership cleaned')
+  assert.equal(idx.descriptions['PN-F01'], undefined, 'description gone')
+  assert.deepEqual(idx.indexes.fileToFeature['project-nav/shared/index.js'], ['PN-F02'], 'other features untouched')
+})
+
+test('retire: a file still owned by another feature keeps that owner', async () => {
+  const { root, tools } = await booted()
+  await call(tools, 'nav_update', { target: 'DM-F01', field: 'files', value: 'project-nav/host/index.js,demo/host/index.js' }, 'session-A')
+  await call(tools, 'nav_update', { target: 'PN-F01', retire: true }, 'session-A')
+  const idx = shared.loadIndex(root)
+  assert.deepEqual(idx.indexes.fileToFeature['project-nav/host/index.js'], ['DM-F01'], 'the surviving owner must remain')
+})
+
+test('retire: unknown target is refused; a project detaches its modules without deleting them', async () => {
+  const { root, tools } = await booted()
+  const bad = await call(tools, 'nav_update', { target: 'NOPE-F99', retire: true }, 'session-A')
+  assert.match(bad, /^ERROR/)
+  const out = await call(tools, 'nav_update', { target: 'DEMO', retire: true }, 'session-A')
+  assert.match(out, /Retired project DEMO/)
+  const idx = shared.loadIndex(root)
+  assert.equal(idx.indexes.projectToModules['DEMO'], undefined, 'project entry gone')
+  assert.deepEqual(idx.indexes.moduleToFeatures['DM-M01'], ['DM-F01'], 'modules survive a project retirement')
+})
+
+test('retire: refused while an open action still references the target', async () => {
+  const { root, tools } = await booted()
+  await call(tools, 'nav_plan', { task: 'work on PN-F01', anchor: 'PN-F01', features: 'PN-F01' }, 'session-A')
+  const out = await call(tools, 'nav_update', { target: 'PN-F01', retire: true }, 'session-B')
+  assert.match(out, /^ERROR/)
+  assert.match(out, /open action/)
+  const idx = shared.loadIndex(root)
+  assert.ok(idx.indexes.featureToFiles['PN-F01'], 'nothing may be retired while work is in flight')
+})
+
+test('retire: a fileless feature (module member only) is retirable', async () => {
+  const { root, tools } = await booted()
+  await call(tools, 'nav_update', { target: 'PN-M01', features: 'PN-F01,PN-F02,NEW-F01' }, 'session-A')
+  assert.equal(shared.loadIndex(root).indexes.featureToFiles['NEW-F01'], undefined, 'precondition: no files declared')
+  const out = await call(tools, 'nav_update', { target: 'NEW-F01', retire: true }, 'session-A')
+  assert.match(out, /Retired feature NEW-F01/)
+  assert.deepEqual(shared.loadIndex(root).indexes.moduleToFeatures['PN-M01'], ['PN-F01', 'PN-F02'], 'membership cleaned')
+})
+
+test('retire: a reverse-only mapping is swept too (asymmetric index)', async () => {
+  const { root, tools } = await booted()
+  // The real workspace carried exactly this shape: fileToFeature points at a feature
+  // that never declared the file forward, so a forward-only cleanup leaves an orphan
+  // that keeps reporting a deleted file forever.
+  const file = join(root, '.internal', 'nav-index.json')
+  const raw = JSON.parse(readFileSync(file, 'utf-8'))
+  raw.indexes.fileToFeature['ghost/file.mjs'] = ['PN-F02']
+  writeFileSync(file, JSON.stringify(raw, null, 2))
+  await call(tools, 'nav_update', { target: 'PN-F02', retire: true }, 'session-A')
+  assert.equal(shared.loadIndex(root).indexes.fileToFeature['ghost/file.mjs'], undefined, 'the orphan must not survive')
+})
+
 process.on('exit', () => { try { rmSync(join(tmpdir(), 'nav-conc-'), { recursive: true, force: true }) } catch {} })

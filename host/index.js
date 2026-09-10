@@ -11,7 +11,7 @@ import {
   loadIndex, getIndexAge,
   loadVector,
   loadActions, loadActionsReconciled, mutateActions,
-  mutateIndex, mutateVector, mutateDocs, mutateArch, withFileLock,
+  mutateIndex, mutateVector, mutateDocs, mutateArch, withFileLock, retireEntry, indexEntryKind,
   nextActionId, selfOwner, DEFAULT_LEASE_TTL_MS,
   isLeaseExpired, canonPath, scopeOwnModules, sessionLabel, sessionBusyWith, checkScopeConflicts, queuePosition, actorLabel, describeConflicts,
   loadDocs, nextDocId, suggestDocs,
@@ -595,11 +595,62 @@ export function apply(ctx, config) {
       systemView: { type: 'string', description: 'CREATE feature: system perspective description' },
       files: { type: 'string', description: 'CREATE feature: comma-separated file paths' },
       features: { type: 'string', description: 'CREATE module: comma-separated feature codes belonging to it (empty = module shell); also replaces an existing module list' },
-      project: { type: 'string', description: 'CREATE module: project name to attach it to' }
+      project: { type: 'string', description: 'CREATE module: project name to attach it to' },
+      retire: { type: 'boolean', description: 'RETIRE (inverse of upsert): remove this entry from the index and cascade — feature drops its file mappings + module membership, module drops its project attachments (its features survive), project detaches its modules (they survive as unattached). Use when something is genuinely gone from the workspace, so it stops being reported as false STALE. Refused while an open action still references the target. If a module and a project share a name, one call retires one layer — repeat for the next (the reply names what was retired).' }
     },
     output: OUTPUT,
     async execute(args) {
       try {
+        // RETIRE — the inverse of upsert. The index is the source of truth for what
+        // EXISTS, so a deletion must be expressible; otherwise the entry stays mapped
+        // forever and nav_status reports permanent false STALE (alarm fatigue erodes
+        // the drift signal this plugin exists for).
+        if (args.retire) {
+          const idx0 = loadIndex(root)
+          // Single source of truth for "what is this node" — a fileless feature lives
+          // only in a module's membership list, so a forward-only check would call it unknown.
+          if (indexEntryKind(idx0, args.target) === null) {
+            return `ERROR: nothing to retire for "${args.target}" — not a known feature, module or project.\n  Run nav_query ${args.target} to check the identifier (retire never invents an entry).`
+          }
+          // Integrity gate: an entry with work in flight must not vanish under it.
+          const targetPath = normalizePath(String(args.target))
+          const openNow = (loadActions(root).actions || []).filter(a => a.status === 'planned' || a.status === 'in_progress')
+          const blocker = openNow.find(a => {
+            const sc = a.scope || {}
+            return (sc.features || []).includes(args.target)
+              || (sc.modules || []).includes(args.target)
+              || (sc.files || []).map(normalizePath).includes(targetPath)
+          })
+          if (blocker) {
+            return [
+              `ERROR: "${args.target}" is still referenced by open action ${blocker.id} ("${blocker.task}", ${blocker.status}).`,
+              `  Close it first — nav_mark id=${blocker.id} action=done (or abort). Retiring an entry under a live action would orphan that action's scope.`
+            ].join('\n')
+          }
+          const r = await mutateIndex(root, (index) => retireEntry(index, args.target))
+          if (!r) {
+            return `ERROR: "${args.target}" vanished between the check and the retirement — re-run nav_query ${args.target} and retry.`
+          }
+          if (r.kind === 'feature') {
+            return [
+              `✓ Retired feature ${args.target}`,
+              `  file mappings removed: ${r.files.length}${r.files.length ? ' (' + r.files.join(', ') + ')' : ''}`,
+              ...(r.modules.length ? [`  detached from module(s): ${r.modules.join(', ')}`] : [])
+            ].join('\n')
+          }
+          if (r.kind === 'module') {
+            return [
+              `✓ Retired module ${args.target}`,
+              `  project attachments removed: ${r.projects.length ? r.projects.join(', ') : '(none)'}`,
+              `  its ${r.features.length} feature(s) survive — re-attach any that belong elsewhere: ${r.features.length ? r.features.join(', ') : '(none)'}`
+            ].join('\n')
+          }
+          return [
+            `✓ Retired project ${args.target}`,
+            `  its ${r.modules.length} module(s) were detached, NOT deleted: ${r.modules.length ? r.modules.join(', ') : '(none)'}`,
+            '  ⚠ they now surface as "(unattached modules)" on the map — retire or re-home each one so the map stays truthful.'
+          ].join('\n')
+        }
         return await mutateIndex(root, (index) => {
         if (index.indexes?.featureToFiles?.[args.target]) {
           if (args.field === 'files') {

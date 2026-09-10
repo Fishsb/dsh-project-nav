@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/project-nav",
-  "version": "0.7.0",
-  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, and a governance-first action ledger. v0.4.0: multi-session concurrency (per-scope leases + queueing) and scope file fingerprints. v0.5.0: architecture-first protocol (anchor gate, repeat-patch gate, nav_adr decision ledger). v0.6.0: convergence — architecture stays the core and everything else is auxiliary (10 tools, 5 data files). v0.7.0: every read-modify-write of shared state runs under a per-target file lock (index / docs / vector / ADR ledger / PROJECT.md), a lock whose owner died is broken by age, and the acquire loop waits asynchronously instead of blocking the event loop.",
+  "version": "0.7.1",
+  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, and a governance-first action ledger. v0.4.0: multi-session concurrency (per-scope leases + queueing) and scope file fingerprints. v0.5.0: architecture-first protocol (anchor gate, repeat-patch gate, nav_adr decision ledger). v0.6.0: convergence — architecture stays the core and everything else is auxiliary (10 tools, 5 data files). v0.7.0: every read-modify-write of shared state runs under a per-target file lock (index / docs / vector / ADR ledger / PROJECT.md), a lock whose owner died is broken by age, and the acquire loop waits asynchronously instead of blocking the event loop. v0.7.1: retirement semantics (nav_update retire=true) so a deleted feature/module/project can actually leave the index and cascade — without it the index could only grow and every deletion left permanent false STALE.",
   "type": "module",
   "main": "./host/index.js",
   "exports": {

@@ -199,6 +199,103 @@ export function saveIndex(rootPath, index) {
   atomicWriteJson(resolve(rootPath, INDEX_FILENAME), index);
 }
 
+/**
+ * What kind of node is `target` in this index? The single source of truth shared by
+ * the retire pre-check in the host and retireEntry itself — keeping the rule in one
+ * place is what stops the two from disagreeing (a fileless feature exists only as a
+ * module member, and a forward-only check would call it unknown).
+ * Returns 'feature' | 'module' | 'project' | null.
+ */
+export function indexEntryKind(index, target) {
+  const id = normalizePath(String(target == null ? '' : target).trim());
+  const ix = index.indexes || {};
+  const featureToFiles = ix.featureToFiles || {};
+  const moduleToFeatures = ix.moduleToFeatures || {};
+  const projectToModules = ix.projectToModules || {};
+  const isMember = Object.keys(moduleToFeatures).some(mod => (moduleToFeatures[mod] || []).includes(id));
+  if (featureToFiles[id] || (isMember && !moduleToFeatures[id])) return 'feature';
+  if (moduleToFeatures[id]) return 'module';
+  if (projectToModules[id]) return 'project';
+  return null;
+}
+
+/**
+ * Retire one index entry — the inverse of the upsert path (pure; the caller
+ * supplies the lock).
+ *
+ * The index is the source of truth for what EXISTS, so a deletion has to be
+ * expressible: without retirement a removed feature/module/project stays mapped
+ * forever and `nav_status` reports permanent false STALE — and that alarm
+ * fatigue trains the model to ignore the drift signal this plugin exists for.
+ *
+ * Cascade rules (no half-retired node is left behind):
+ *   feature → drop its file mappings in BOTH directions — a full reverse sweep, so an
+ *             entry pointing at this feature without being declared forward is cleaned
+ *             too (asymmetric data would otherwise survive as an unreachable orphan);
+ *             a file another feature still owns keeps that owner. Also drops its module
+ *             memberships and description. A feature that exists only as a module member
+ *             (a registered capability with no code yet) is retirable as well.
+ *   module  → drop its feature list, its project attachments, its meta/description;
+ *             the FEATURES survive (they may legitimately belong elsewhere)
+ *   project → detach its modules; the MODULES survive and surface as unattached
+ *
+ * Returns null when the target is not a known entry. When a module and a project
+ * share a name, one call retires one layer — repeat to retire the next.
+ */
+export function retireEntry(index, target) {
+  const id = normalizePath(String(target == null ? '' : target).trim());
+  const ix = index.indexes || (index.indexes = {});
+  const featureToFiles = ix.featureToFiles || (ix.featureToFiles = {});
+  const fileToFeature = ix.fileToFeature || (ix.fileToFeature = {});
+  const moduleToFeatures = ix.moduleToFeatures || (ix.moduleToFeatures = {});
+  const projectToModules = ix.projectToModules || (ix.projectToModules = {});
+
+  if (indexEntryKind(index, target) === 'feature') {
+    const memberOf = Object.keys(moduleToFeatures).filter(mod => (moduleToFeatures[mod] || []).includes(id));
+    const declared = featureToFiles[id] ? [...featureToFiles[id]] : [];
+    delete featureToFiles[id];
+    // Full reverse sweep (not just the forward-declared files): the index can carry a
+    // reverse entry that no feature declares forward, and leaving it behind would keep
+    // reporting a deleted file forever.
+    const touched = new Set(declared);
+    for (const file of Object.keys(fileToFeature)) {
+      const list = fileToFeature[file] || [];
+      if (!list.includes(id)) continue;
+      touched.add(file);
+      const rest = list.filter(code => code !== id);
+      if (rest.length) fileToFeature[file] = rest;
+      else delete fileToFeature[file];
+    }
+    for (const mod of memberOf) moduleToFeatures[mod] = moduleToFeatures[mod].filter(code => code !== id);
+    if (index.descriptions) delete index.descriptions[id];
+    return { kind: 'feature', files: [...touched], modules: memberOf };
+  }
+
+  if (moduleToFeatures[id]) {
+    const features = [...moduleToFeatures[id]];
+    delete moduleToFeatures[id];
+    const projects = [];
+    for (const proj of Object.keys(projectToModules)) {
+      if ((projectToModules[proj] || []).includes(id)) {
+        projectToModules[proj] = projectToModules[proj].filter(mod => mod !== id);
+        projects.push(proj);
+      }
+    }
+    if (index.moduleMeta) delete index.moduleMeta[id];
+    if (index.descriptions) delete index.descriptions[id];
+    return { kind: 'module', features, projects };
+  }
+
+  if (projectToModules[id]) {
+    const modules = [...projectToModules[id]];
+    delete projectToModules[id];
+    if (index.projectPaths) delete index.projectPaths[id];
+    return { kind: 'project', modules };
+  }
+
+  return null;
+}
+
 export function getIndexAge(rootPath) {
   const indexPath = resolve(rootPath, INDEX_FILENAME);
   if (!existsSync(indexPath)) return null;
