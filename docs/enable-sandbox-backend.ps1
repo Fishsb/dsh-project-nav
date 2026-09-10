@@ -98,11 +98,15 @@ Step 2 "切换服务账户 -> $Account"
 $before = (& sc.exe qc $Service | Select-String 'SERVICE_START_NAME').ToString().Trim()
 Write-Host "    当前: $before"
 
-$sec = Read-Host -Prompt "    请输入 $Account 的密码（输入不回显，仅传给 nssm）" -AsSecureString
+$sec = Read-Host -Prompt "    请输入 $Account 的密码（输入不回显，仅传给 nssm；无密码账户直接回车）" -AsSecureString
 $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
 try {
   $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
-  if ([string]::IsNullOrEmpty($plain)) { Die '密码为空，已中止（未做任何修改）' }
+  if ([string]::IsNullOrEmpty($plain)) {
+    # Accepted on purpose: an account with no password must not be blocked here. If it actually
+    # has one, the service fails to start and Restore-Service rolls the change back.
+    Warn '密码为空 —— 仅当该账户确实无密码时才正确；否则服务会启动失败并自动回滚'
+  }
   & $Nssm set $Service ObjectName $Account $plain | Out-Null
   if ($LASTEXITCODE -ne 0) { Die "nssm set 失败（exit $LASTEXITCODE）" }
 } finally {
