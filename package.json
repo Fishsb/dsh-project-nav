@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/project-nav",
-  "version": "0.2.10",
-  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, governance-first action ledger (plan/begin/done), and a reference-docs registry consulted at plan time. v0.2.10: portable root — no machine-specific default (config.root with cwd fallback + boot log); neutral doc-location hints; real regression tests (test/core.test.mjs); README corrected (root config docs, arch layer marked as companion skill, not packaged).",
+  "version": "0.4.0",
+  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, and a governance-first action ledger (plan/begin/done). v0.3.0: multi-session concurrency — scope locks instead of a global single-in_progress rule (disjoint scopes run in PARALLEL, overlapping ones QUEUE via wait=true), self-healing leases, and a cross-process ledger lock so concurrent planners never lose an action. v0.4.0: scope fingerprints — nav_mark begin records size/mtime/sha1 of every file in scope, nav_mark done reports DRIFT when a file changed or vanished WHILE the action ran, and nav_status shows live drift for running actions.",
   "type": "module",
   "main": "./host/index.js",
   "exports": {
@@ -13,9 +13,6 @@
     "shared",
     "package.json"
   ],
-  "scripts": {
-    "test": "node --test"
-  },
   "dsh": {
     "bundle": {
       "patch": "./host/cordis.patch.yml"
@@ -54,5 +51,8 @@
   },
   "bugs": {
     "url": "https://github.com/Fishsb/dsh-project-nav/issues"
+  },
+  "scripts": {
+    "test": "node --test test/core.test.mjs test/concurrency.test.mjs"
   }
 }

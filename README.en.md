@@ -4,7 +4,7 @@
 
 **Anti-drift project governance plugin for DeepSeek Harness (DSH)**
 
-[![version](https://img.shields.io/badge/version-0.2.10-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.4.0-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -28,7 +28,9 @@ Long-running AI coding projects drift: files pile up without feature mapping, pl
 - 🗺️ **Bidirectional governance map** — project→module→feature→file four-way cross index, single source of truth, one map for everything
 - 🏛️ **Architecture doc layer (ecosystem, NOT in this package)** — L1 overview + L2 feature chains (through-style flow, line-number evidence) with fingerprint-expired auto-regeneration are provided by the companion arch-view skill; this repo ships the index + governance loop only
 - 🏛️ **Architecture-first protocol** — a task must anchor to an architecture node before it enters the ledger; no anchor = architecture gap → revise architecture first; ≥3 patches on the same node force a full review
-- 🎯 **Governance-first action ledger** — `nav_plan` → `begin` → change → `done` (with `abort`), single in-progress enforced, open actions = drift signal, marked red on the map
+- 🎯 **Governance-first action ledger** — `nav_plan` → `begin` → change → `done` (with `abort`); open actions = drift signal, marked red on the map; **one in-progress action per session**
+- 🔍 **Scope fingerprints (v0.4.0)** — `begin` records size/mtime/sha1 for every file in scope; `done` reports `⚠ Scope drift` (modified / vanished / appeared) and `nav_status` shows live drift for running actions. Leases stop two sessions from starting together; fingerprints catch files moved underneath a running action.
+- 🧵 **Multi-session concurrency (v0.3.0)** — the lock is per **scope**, not per workspace: sessions with disjoint scopes really do run in parallel, and only overlapping scopes queue (same feature / same module / same file / the same file reached through the index). `nav_mark begin wait=true` blocks until the holder finishes, a crashed session's lease expires and self-heals, and the ledger holds a cross-process file lock so concurrent planners never lose an action
 - 🧭 **Mainline vector with teeth** — doing / next / notDoing / exitCondition — plans colliding with `notDoing` are **hard-rejected**
 - 📚 **Reference-docs foundation** — registered by `when` routing rules, recommended automatically at plan time
 - 🔄 **Once-Only / SSOT** — hand-written `PROJECT.md` narrative stays untouched; `nav:auto` marked sections are auto-derived
@@ -39,15 +41,15 @@ Long-running AI coding projects drift: files pile up without feature mapping, pl
 
 | Tool | Purpose |
 |------|---------|
-| `nav_query` | Look up structure/modules/features before changes (scope gate + mainline warning) |
+| `nav_query` | Look up structure/modules/features before changes (scope gate + mainline warning + **cross-session occupancy notice**) |
 | `nav_plan` | Governance-first gate: register action (scope pre-check + anti-goal hard rejection) |
-| `nav_mark` | Action lifecycle: begin / done / abort |
+| `nav_mark` | Action lifecycle: begin / done / abort (begin carries the scope-conflict gate, lease, and queueing) |
 | `nav_update` | Incremental feature ↔ file mapping updates |
 | `nav_add_feature` / `nav_add_module` | Register feature / module (orphan hints, dual-mount warnings) |
 | `nav_add_doc` / `nav_docs` | Register / query reference docs (dead links rejected) |
 | `nav_map` | Governance map: `text` (agent orientation) / `html` (human mindmap) |
 | `nav_sync_docs` | Auto-align PROJECT.md (marked sections derived) |
-| `nav_status` | Health snapshot: coverage + open actions + STALE files |
+| `nav_status` | Health snapshot: coverage + open actions + STALE files + **cross-session concurrency view (who holds which scope)** |
 | `nav_set_vector` | Set the mainline vector |
 
 ## 🔄 Governance loop
@@ -94,6 +96,8 @@ Add a `config` block to the plugin entry in your profile's patch layer (e.g. `~/
 
 Restart the profile after configuring. Always confirm the root shown in the boot log before using the `nav_*` tools.
 
+Optional `leaseTtlMs` (default 30 minutes): how long a crashed session's scope lock stays valid before it expires and is released.
+
 ## 🗃️ Data
 
 Single source of truth at `<root>/.internal/` (nav-index / vector / nav-actions / nav-docs); everything else is derived — **zero per-project config other than `root`**. Index and data files stay out of git (`.gitignore`); data surgeries always back up first. `.internal/arch/*.md` is maintained by the companion arch-view skill and is not part of this package's data flow.
@@ -102,7 +106,7 @@ Single source of truth at `<root>/.internal/` (nav-index / vector / nav-actions 
 
 ```bash
 pnpm install
-pnpm test      # node --test (real regression suite: test/core.test.mjs, all in temp dirs — never touches a real workspace)
+pnpm test      # node --test test/core.test.mjs test/concurrency.test.mjs (27 real regression cases, all in temp dirs — never touches a real workspace)
 pnpm pack      # build publishable tarball
 ```
 

@@ -10,11 +10,13 @@ import { resolve, dirname } from 'node:path'
 import {
   loadIndex, saveIndex, getIndexAge,
   loadVector, saveVector,
-  loadActions, saveActions, nextActionId,
+  loadActions, loadActionsReconciled, mutateActions, nextActionId, selfOwner, DEFAULT_LEASE_TTL_MS,
+  isLeaseExpired, canonPath, scopeOwnModules, sessionLabel, sessionBusyWith, checkScopeConflicts, queuePosition, actorLabel, describeConflicts,
   loadDocs, saveDocs, nextDocId, suggestDocs,
   queryIndex, partialSearch, normalizePath,
   renderTreeText, renderMapHtml, renderProjectDocSection,
-  findStaleFiles, scopeTargetsOfOpenActions
+  findStaleFiles, scopeTargetsOfOpenActions, withLedgerLock,
+  snapshotScopeFiles, verifyScopeFingerprint
 } from '../shared/index.js'
 
 // ---- Plugin metadata (Cordis contract) ----
@@ -28,7 +30,10 @@ export const Config = z.object({
   // No machine-specific default: leave empty to fall back to the process
   // working directory at load time (a boot log reports the resolved root).
   // Set config.root to govern a specific workspace explicitly.
-  root: z.string().default('')
+  root: z.string().default(''),
+  // Multi-session leases: how long an in_progress action keeps its scope lock
+  // without a heartbeat before another session may claim the same scope.
+  leaseTtlMs: z.number().default(0)
 })
 
 // ---- helpers ----
@@ -41,36 +46,140 @@ function splitList(s) {
   return s ? String(s).split(',').map(x => x.trim()).filter(Boolean) : []
 }
 
-/** Does a query target fall inside an action's scope? (exact or suffix path match) */
-function targetInScope(target, scope) {
-  const t = normalizePath(target).toLowerCase();
+/**
+ * Session identity of the caller. The governed workspace is shared by every DSH
+ * session, so this is what tells two concurrent sessions apart; `exec.agent.id`
+ * is the agent's SessionId. Returns null outside a session (tests, CLI), which
+ * makes the gates fall back to the legacy global-single-lock behaviour.
+ */
+function sidOf(exec) {
+  return exec?.agent?.id ? String(exec.agent.id) : null
+}
+
+/** Lease TTL: config override wins, otherwise the shared default. */
+function ttlOf(config) {
+  return Number(config?.leaseTtlMs) > 0 ? Number(config.leaseTtlMs) : DEFAULT_LEASE_TTL_MS
+}
+/** Names of known project directories (used to fold workspace-relative paths). */
+function dirNamesOf(index) {
+  const out = new Set();
+  for (const p of Object.values(index?.projectPaths || {})) {
+    const parts = String(p).replace(/\\/g, '/').split('/').filter(Boolean);
+    if (parts.length) out.add(parts[parts.length - 1].toLowerCase());
+  }
+  return out;
+}
+
+/**
+ * Does a query target fall inside an action's scope?
+ * Canonical paths only (so "project-nav/host/index.js" and "host/index.js" are
+ * the SAME file). A target that IS a feature code or module name matches
+ * literally; a target that is a FILE matches scope files exactly (or inside a
+ * scope directory) — bare filenames match only exactly, so a scope "index.js"
+ * cannot claim every index.js in the repo.
+ */
+function targetInScope(target, scope, index = null) {
+  const dirs = dirNamesOf(index);
+  const t = canonPath(target, dirs);
+  if (!t) return false;
   for (const f of (scope.features || [])) if (f.toLowerCase() === t) return true;
   for (const m of (scope.modules || [])) if (m.toLowerCase() === t) return true;
   for (const f of (scope.files || [])) {
-    const nf = normalizePath(f).toLowerCase();
+    const nf = canonPath(f, dirs);
+    if (!nf) continue;
     // exact match, or target inside a scope DIRECTORY, or scope path expressed
-    // relative to the query's directory. Bare filenames match only exactly —
-    // prevents 'index.js' in scope from matching every index.js in the repo.
+    // relative to the query's directory.
     if (t === nf) return true;
     if (nf.includes('/') && t.startsWith(nf + '/')) return true;
     if (t.includes('/') && nf.startsWith(t + '/')) return true;
   }
-  return false;
+  return false
 }
 
 /**
- * Scope gate: check open (planned/in_progress) actions against a query target.
- * Returns a human-readable gate notice (possibly empty).
+ * The live action holding this target, if any: matches by literal path scope OR
+ * by feature — a file that the index maps to a feature the other action holds is
+ * an overlap even though the two scopes name different things.
  */
-function scopeGate(ledger, target) {
-  const open = (ledger.actions || []).filter(a => a.status === 'planned' || a.status === 'in_progress')
-  if (open.length === 0) return ''
-  const hit = open.find(a => targetInScope(target, a.scope || {}))
-  if (hit) {
-    return `Gate: this target is inside OPEN action ${hit.id} (${hit.status}) "${hit.task}". Changes here must run under that action.`
+function occupyingAction(ledger, target, index = null) {
+  const dirs = dirNamesOf(index)
+  const targetFeatures = featuresOfTarget(index, target, dirs)
+  return (ledger.actions || []).find(a => {
+    if (a.status !== 'in_progress' || isLeaseExpired(a)) return false
+    const scope = a.scope || {}
+    return targetInScope(target, scope, index) || featureTouch(scope, targetFeatures)
+  }) || null
+}
+
+/**
+ * Scope gate for nav_query: answers the question a parallel session actually has
+ * — "is somebody else on this file right now?". A live action held by ANOTHER
+ * session is reported as OCCUPIED (and nav_mark begin will queue behind it); the
+ * caller's own open actions keep the original plan-first gate, and other
+ * sessions' unrelated actions are reported as free-to-work context instead of noise.
+ */
+/** Does this scope name (or own, through the index) any of these feature codes? */
+function featureTouch(scope, featureCodes) {
+  if (!featureCodes || featureCodes.size === 0) return false
+  return (scope?.features || []).some(c => featureCodes.has(c))
+}
+
+function featuresOfTarget(index, target, dirs) {
+  const f2f = index?.indexes?.fileToFeature || {};
+  const t = canonPath(target, dirs);
+  const out = new Set();
+  for (const [file, codes] of Object.entries(f2f)) {
+    if (canonPath(file, dirs) === t) for (const c of codes) out.add(c);
   }
-  const list = open.map(a => `${a.id} [${a.status}] ${a.task}`).join('; ')
-  return `⚠ Gate: ${open.length} open action(s) exist (${list}) and this target is NOT in their scope. Plan first (nav_plan) or finish them (nav_mark).`
+  return out;
+}
+
+function scopeGate(ledger, target, sessionId = null, index = null) {
+  const sid = sessionId ? String(sessionId) : ''
+  const dirs = dirNamesOf(index)
+  const targetFeatures = featuresOfTarget(index, target, dirs)
+  const actions = ledger.actions || []
+  const covers = a => {
+    const scope = a.scope || {}
+    return targetInScope(target, scope, index) || featureTouch(scope, targetFeatures)
+  }
+  // 1. Somebody else's live lock on this target → the parallel-session warning.
+  const occupier = actions.find(a => a.status === 'in_progress' && !isLeaseExpired(a) && covers(a)) || null
+  if (occupier && (!sid || occupier.owner?.sessionId !== sid)) {
+    return `\n⚠ OCCUPIED: ${actorLabel(occupier)} is changing this target right now.\n  A live action from another session holds it. Options: wait for it (your own nav_mark begin with wait=true blocks until it is released), pick a different target, or re-scope so the two do not overlap (nav_plan).`
+  }
+  // 2. The caller's own open action covers it → plan-first reminder.
+  const mine = actions.find(a => (a.status === 'planned' || a.status === 'in_progress') && (!sid || a.owner?.sessionId === sid) && covers(a))
+  if (mine) {
+    return `Gate: this target belongs to your OPEN action ${mine.id} (${mine.status}) "${mine.task}". Changes here must run under that action.`
+  }
+  const open = actions.filter(a => a.status === 'planned' || a.status === 'in_progress')
+  if (open.length === 0) return ''
+  const others = open.filter(a => !sid || a.owner?.sessionId !== sid)
+  // 3. The caller's own open actions cover nothing here → plan-first reminder.
+  if (others.length === 0) {
+    const list = open.map(a => `${a.id} [${a.status}] ${a.task}`).join('; ')
+    return `⚠ Gate: ${open.length} open action(s) exist (${list}) and this target is NOT in their scope. Plan first (nav_plan) or finish them (nav_mark).`
+  }
+  // 4. Others are working somewhere inside the module this query names → partial occupancy.
+  const modulesOfTarget = new Set()
+  for (const [mod, feats] of Object.entries(index?.indexes?.moduleToFeatures || {})) {
+    if ((feats || []).some(c => targetFeatures.has(c))) modulesOfTarget.add(mod)
+  }
+  if (modulesOfTarget.size) {
+    const busyModules = []
+    for (const a of others) {
+      for (const m of scopeOwnModules(index, a.scope || {})) {
+        if (modulesOfTarget.has(m)) busyModules.push(`${a.id} holds ${m}`)
+      }
+    }
+    if (busyModules.length) {
+      return `\n⚠ PARTIALLY OCCUPIED: this target sits in module(s) ${[...modulesOfTarget].join(', ')} and other sessions are live inside them (${busyModules.join('; ')}).\n  Their scopes are narrower than the whole module, so check the overlap before touching anything: ${others.map(actorLabel).join('; ')}`
+    }
+  }
+  // 5. Others' unrelated open actions → context, not a blocker.
+  const list = others.map(actorLabel).join('; ')
+  return `⚠ Gate: ${others.length} open action(s) belong to OTHER sessions (${list}) and this target is not in their scope — free to work, but register your own scope (nav_plan) so the two cannot drift into each other.`
 }
 
 /** Mainline gate heuristic: are the query hits referenced in doing/next text? */
@@ -111,7 +220,9 @@ export function apply(ctx, config) {
       format: { type: 'string', description: 'Output format: text (default) or json' }
     },
     output: OUTPUT,
-    async execute(args) {
+    async execute(args, exec) {
+      const sid = sidOf(exec)
+      const ttl = ttlOf(config)
       try {
         const index = loadIndex(root)
         const result = queryIndex(index, args.target)
@@ -122,7 +233,8 @@ export function apply(ctx, config) {
           }
           return `No mapping found for "${args.target}". Register it via nav_add_feature (and nav_add_module if needed).`
         }
-        const notices = [scopeGate(loadActions(root), args.target), mainlineGate(loadVector(root), result)].filter(Boolean)
+        const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
+        const notices = [scopeGate(ledger, args.target, sid, index), mainlineGate(loadVector(root), result)].filter(Boolean)
         if (args.format === 'json') return JSON.stringify({ ...result, notices }, null, 2)
         const lines = [
           `Query: ${result.query} (${result.type})`,
@@ -155,7 +267,9 @@ export function apply(ctx, config) {
       files: { type: 'string', description: 'Comma-separated file paths in scope' }
     },
     output: OUTPUT,
-    async execute(args) {
+    async execute(args, exec) {
+      const sid = sidOf(exec)
+      const ttl = ttlOf(config)
       try {
         const scope = {
           features: splitList(args.features),
@@ -175,7 +289,7 @@ export function apply(ctx, config) {
             return `ERROR: scope collides with mainline anti-goal (notDoing: "${vector.notDoing}") via "${collide}". Re-scope the plan or update the vector first (nav_set_vector).`
           }
         }
-        const ledger = loadActions(root)
+        const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
         const index = loadIndex(root)
         // B4: scope-vs-index pre-validation at plan time — every scope item must either exist in the
         // index or be explicitly new. Silent unknowns are how a plan quietly points at the wrong target.
@@ -187,25 +301,41 @@ export function apply(ctx, config) {
         const unknownNote = (unknown.features.length || unknown.modules.length || unknown.files.length)
           ? `\n  ⚠ Scope items not found in index: features=[${unknown.features.join(', ')}] modules=[${unknown.modules.join(', ')}] files=[${unknown.files.join(', ')}]\n    If this task CREATES them, ignore. If it should MODIFY existing ones, the identifier is likely wrong — re-check with nav_query.`
           : ''
-        const open = (ledger.actions || []).filter(a => a.status === 'in_progress')
-        if (open.length) {
-          // Enforce the AGENTS.md iron rule: one in_progress action at a time.
-          return `ERROR: ${open.length} action(s) already in_progress (${open.map(x => x.id).join(', ')}) — finish with nav_mark done, or abort, before planning a new one.`
-        }
+        // Multi-session gate: the old global "one in_progress action at a time" rule is gone —
+        // a workspace runs as many actions at once as it has DISJOINT scopes. The plan-time job
+        // is to warn the session up front whether its scope will collide at begin time, so it can
+        // split the scope instead of queueing behind another session.
+        const plannedAction = { scope, owner: { sessionId: sid || '' }, createdAt: new Date().toISOString() }
+        const conflicts = checkScopeConflicts(ledger, plannedAction, { index })
+        const conflictNote = conflicts.length
+          ? ['', `⚠ ${conflicts.length} live action(s) overlap YOUR planned scope — nav_mark begin will QUEUE behind them:`, ...describeConflicts(conflicts),
+             '  Better fix: narrow/split the scope (disjoint files ⇒ real parallelism), or wait for the holder to finish with nav_mark done.']
+          : []
+        const busy = sid ? sessionBusyWith(ledger, sid) : null
+        const busyNote = busy
+          ? [`⚠ Your session already holds ${actorLabel(busy)} — finish it (nav_mark done) or abort it (nav_mark abort) before beginning a new one. (Other sessions are unaffected: it is one in_progress per session, not one per workspace.)`]
+          : []
         const action = {
-          id: nextActionId(ledger),
+          id: null,   // assigned INSIDE the ledger lock: concurrent planners must not collide
           task: args.task,
           plan: args.plan || '',
           scope,
           status: 'planned',
+          owner: selfOwner(sid, { cwd: process.cwd() }),
+          lease: null,
           createdAt: new Date().toISOString(),
           startedAt: null,
           completedAt: null
         }
-        ledger.actions.push(action)
-        saveActions(root, ledger)
+        await mutateActions(root, { sessionId: sid, ttlMs: ttl }, (lg) => {
+          lg.actions = lg.actions || []
+          action.id = nextActionId(lg)   // id from the RECONCILED ledger, under the lock
+          lg.actions.push(action)
+        })
         const warns = []
         if (!vector.doing) warns.push('⚠ Mainline vector "doing" is empty — set it (nav_set_vector) so drift can be detected.')
+        warns.push(...busyNote, ...conflictNote)
+        warns.push(...busyNote, ...conflictNote)
         // Reference-doc suggestions: consult BEFORE finalizing the plan (方案确认参考).
         const suggestions = suggestDocs(loadDocs(root), {
           taskText: `${args.task} ${args.plan || ''}`,
@@ -237,46 +367,150 @@ export function apply(ctx, config) {
       action: { type: 'string', required: true, description: 'One of: begin, done, abort' }
     },
     output: OUTPUT,
-    async execute(args) {
+    async execute(args, exec) {
+      const sid = sidOf(exec)
+      const ttl = ttlOf(config)
       try {
-        const ledger = loadActions(root)
-        const a = (ledger.actions || []).find(x => x.id === args.id)
-        if (!a) return `ERROR: no action "${args.id}". Use nav_plan to create one.`
-        const now = new Date().toISOString()
+        const index = loadIndex(root)
         if (args.action === 'begin') {
-          if (a.status !== 'planned') return `ERROR: ${a.id} is "${a.status}", only "planned" actions can begin.`
-          a.status = 'in_progress'; a.startedAt = now
-        } else if (args.action === 'done') {
-          if (a.status !== 'in_progress') return `ERROR: ${a.id} is "${a.status}", only "in_progress" actions can be done.`
-          a.status = 'done'; a.completedAt = now
-          // Delta close-out (OpenSpec archive semantics): surface index deltas the
-          // agent must merge before this change counts as synced.
-          const index = loadIndex(root)
-          const f2f = index.indexes?.fileToFeature || {}
-          const f2files = index.indexes?.featureToFiles || {}
-          const missingFeatures = (a.scope?.features || []).filter(c => !f2files[c])
-          const unregisteredFiles = (a.scope?.files || []).filter(f => !f2f[normalizePath(f)])
-          var deltaLines = []
-          if (missingFeatures.length) deltaLines.push(`  - 未登记功能（需 nav_add_feature）: ${missingFeatures.join(', ')}`)
-          if (unregisteredFiles.length) deltaLines.push(`  - 索引外文件（需登记到所属功能，nav_update --field files）: ${unregisteredFiles.join(', ')}`)
-        } else if (args.action === 'abort') {
-          if (a.status !== 'planned' && a.status !== 'in_progress') return `ERROR: ${a.id} is already "${a.status}".`
-          a.status = 'aborted'; a.completedAt = now
-        } else {
-          return 'ERROR: action must be one of: begin, done, abort.'
+          // Multi-session gate: BEGIN is the moment a scope turns into a live lock.
+          // Disjoint scopes start immediately and in parallel; overlapping ones wait
+          // for the holder (or queue behind it). Leases self-heal, so a crashed
+          // session can never wedge the workspace.
+          let waited = 0
+          let result = null
+          for (;;) {
+            result = await mutateActions(root, { sessionId: sid, ttlMs: ttl }, (ledger) => {
+              const a = (ledger.actions || []).find(x => x.id === args.id)
+              if (!a) return { kind: 'no-action' }
+              if (a.owner?.sessionId && sid && a.owner.sessionId !== sid) {
+                return { kind: 'foreign', action: a }
+              }
+              if (a.status === 'in_progress') return { kind: 'reenter', action: a }
+              if (a.status !== 'planned') return { kind: 'bad-state', action: a }
+              const busy = sid ? sessionBusyWith(ledger, sid) : null
+              if (busy) return { kind: 'session-busy', action: a, busy }
+              const conflicts = checkScopeConflicts(ledger, a, { index })
+              if (conflicts.length) {
+                const q = queuePosition(ledger, a, { index })
+                return { kind: 'blocked', action: a, conflicts, q }
+              }
+              a.status = 'in_progress'
+              a.startedAt = new Date().toISOString()
+              a.owner = a.owner && a.owner.sessionId ? a.owner : selfOwner(sid, { cwd: process.cwd() })
+              // Fingerprint the scope now, so `done` can tell whether these files were
+              // touched by somebody else while this action was running.
+              const scopeNow = snapshotScopeFiles(root, index, a.scope || {})
+              a.scopeState = Object.keys(scopeNow).length ? { takenAt: a.startedAt, scope: a.scope || {}, files: scopeNow } : null
+              a.lease = { acquiredAt: a.startedAt, renewedAt: a.startedAt, ttlMs: ttl }
+              return { kind: 'begun', action: a }
+            })
+            if (result.kind !== 'blocked' || !args.wait) break
+            const budget = args.waitMs === undefined ? 120000 : Number(args.waitMs)
+            if (!(budget > 0) || waited >= budget) break
+            await new Promise(r => setTimeout(r, 2000))
+            waited += 2000
+          }
+          if (result.kind === 'no-action') return `ERROR: no action "${args.id}". Use nav_plan to create one.`
+          if (result.kind === 'foreign') return `ERROR: ${result.action.id} is held by ${actorLabel(result.action)} — a session can only drive its own actions. Create your own action (nav_plan) and begin that one.`
+          if (result.kind === 'reenter') return `✓ ${result.action.id} already in_progress (held by you) — go ahead and change the files.`
+          if (result.kind === 'bad-state') return `ERROR: ${result.action.id} is "${result.action.status}", only "planned" actions can begin.`
+          if (result.kind === 'session-busy') {
+            return [
+              `ERROR: your session already holds ${actorLabel(result.busy)}.`,
+              '  One in_progress action per session: finish it (nav_mark done) or abort it (nav_mark abort) before beginning another.',
+              '  (Other SESSIONS may work in parallel — the lock is per scope, not global.)'
+            ].join('\n')
+          }
+          if (result.kind === 'blocked') {
+            const q = result.q
+            return [
+              `⛔ BLOCKED: ${result.action.id} overlaps ${result.conflicts.length} live action(s)${q.ahead ? ` — queue position ${q.ahead}` : ''}:`,
+              ...describeConflicts(result.conflicts),
+              '',
+              `Your scope: features=[${(result.action.scope?.features || []).join(', ')}] modules=[${(result.action.scope?.modules || []).join(', ')}] files=[${(result.action.scope?.files || []).join(', ')}]`,
+              args.wait
+                ? `  Waited ${Math.round(waited / 1000)}s, still held. Ask again with a longer waitMs, or split/disjoint your scope (nav_plan) so the two can run in parallel.`
+                : '  Retry with wait=true (optionally waitMs=<ms>) to queue until the holder finishes with nav_mark done / abort.',
+              '  Do NOT edit overlapping files while the holder is live — that is exactly how two sessions drift into each other.'
+            ].join('\n')
+          }
+          return [
+            `✓ ${result.action.id} → in_progress (scope locked for session ${sid ? sessionLabel(sid) : 'unknown'})`,
+            `  Scope: features=[${(result.action.scope?.features || []).join(', ')}] modules=[${(result.action.scope?.modules || []).join(', ')}] files=[${(result.action.scope?.files || []).join(', ')}]`,
+            `  Disjoint from every other live action${waited ? ` (queued ${Math.round(waited / 1000)}s)` : ''} — other sessions keep working in parallel.`,
+            '  Ready: change the files, then nav_mark action=done to close out (and release the scope).'
+          ].join('\n')
         }
-        saveActions(root, ledger)
-        const lines = [`✓ ${a.id} → ${a.status}: ${a.task}`]
+
         if (args.action === 'done') {
-          lines.push('Delta close-out（合并进索引后本次变更才算同步完成）:')
+          let deltaLines = []
+          var scopeDrift = null
+          const res = await mutateActions(root, { sessionId: sid, ttlMs: ttl }, (ledger) => {
+            const a = (ledger.actions || []).find(x => x.id === args.id)
+            if (!a) return { kind: 'no-action' }
+            if (a.owner?.sessionId && sid && a.owner.sessionId !== sid) return { kind: 'foreign', action: a }
+            if (a.status !== 'in_progress') return { kind: 'bad-state', action: a }
+            // Did anything move under us? Compare the begin-time snapshot against disk now.
+            if (a.scopeState) {
+              try { scopeDrift = verifyScopeFingerprint(root, index, a.scopeState, a.scope) } catch { scopeDrift = null }
+            }
+            a.status = 'done'
+            a.completedAt = new Date().toISOString()
+            a.lease = null
+            if (scopeDrift && !scopeDrift.ok) a.drift = { at: a.completedAt, changed: scopeDrift.changed, removed: scopeDrift.removed, added: scopeDrift.added }
+            // Delta close-out (OpenSpec archive semantics): surface index deltas the
+            // agent must merge before this change counts as synced.
+            const f2f = index.indexes?.fileToFeature || {}
+            const f2files = index.indexes?.featureToFiles || {}
+            const missingFeatures = (a.scope?.features || []).filter(c => !f2files[c])
+            const unregisteredFiles = (a.scope?.files || []).filter(f => !f2f[normalizePath(f)])
+            if (missingFeatures.length) deltaLines.push(`  - 未登记功能（需 nav_add_feature）: ${missingFeatures.join(', ')}`)
+            if (unregisteredFiles.length) deltaLines.push(`  - 索引外文件（需登记到所属功能，nav_update --field files）: ${unregisteredFiles.join(', ')}`)
+            // Releasing a scope is what unblocks the sessions queued behind it.
+            const waiters = (ledger.actions || []).filter(o => o.status === 'planned' && o.id !== a.id && checkScopeConflicts(ledger, o, { index }).length === 0)
+            return { kind: 'done', action: a, waiters: waiters.map(w => w.id) }
+          })
+          if (res.kind === 'no-action') return `ERROR: no action "${args.id}". Use nav_plan to create one.`
+          if (res.kind === 'foreign') return `ERROR: ${res.action.id} is held by ${actorLabel(res.action)} — only the holding session can close it. Ask that session to nav_mark done / abort, or let its lease expire (self-heals).`
+          if (res.kind === 'bad-state') return `ERROR: ${res.action.id} is "${res.action.status}", only "in_progress" actions can be done.`
+          const lines = [`✓ ${res.action.id} → done: ${res.action.task}`, 'Delta close-out（合并进索引后本次变更才算同步完成）:']
           if (deltaLines.length) {
-            lines.push(...deltaLines)
-            lines.push('  修完后跑 nav_sync_docs 对齐 PROJECT.md 功能地图。')
+            lines.push(...deltaLines, '  修完后跑 nav_sync_docs 对齐 PROJECT.md 功能地图。')
           } else {
             lines.push('  ✓ scope 与索引一致，无缺口。跑 nav_sync_docs 对齐 PROJECT.md 功能地图。')
           }
+          if (scopeDrift && !scopeDrift.ok) {
+            lines.push('  ⚠ Scope drift since begin (files moved under this action — possibly another session):')
+            if (scopeDrift.changed.length) lines.push('    modified: ' + scopeDrift.changed.join(', '))
+            if (scopeDrift.removed.length) lines.push('    vanished: ' + scopeDrift.removed.join(', '))
+            if (scopeDrift.added.length) lines.push('    appeared: ' + scopeDrift.added.join(', '))
+            lines.push('    Review those files before trusting this close-out (recorded on the action as `drift`).')
+          } else if (scopeDrift) {
+            lines.push('  ✓ Scope fingerprint verified: none of the scoped files changed during this action.')
+          }
+          if (res.waiters.length) lines.push(`  Scope released — ${res.waiters.length} queued action(s) can now begin: ${res.waiters.join(', ')}`)
+          return lines.join('\n')
         }
-        return lines.join('\n')
+
+        if (args.action === 'abort') {
+          const res = await mutateActions(root, { sessionId: sid, ttlMs: ttl }, (ledger) => {
+            const a = (ledger.actions || []).find(x => x.id === args.id)
+            if (!a) return { kind: 'no-action' }
+            if (a.owner?.sessionId && sid && a.owner.sessionId !== sid) return { kind: 'foreign', action: a }
+            if (a.status !== 'planned' && a.status !== 'in_progress') return { kind: 'bad-state', action: a }
+            a.status = 'aborted'
+            a.completedAt = new Date().toISOString()
+            a.lease = null
+            return { kind: 'aborted', action: a }
+          })
+          if (res.kind === 'no-action') return `ERROR: no action "${args.id}". Use nav_plan to create one.`
+          if (res.kind === 'foreign') return `ERROR: ${res.action.id} is held by ${actorLabel(res.action)} — only the holding session can abort it.`
+          if (res.kind === 'bad-state') return `ERROR: ${res.action.id} is already "${res.action.status}".`
+          return `✓ ${res.action.id} → aborted: ${res.action.task}`
+        }
+
+        return 'ERROR: action must be one of: begin, done, abort.'
       } catch (e) { return err(e) }
     }
   })), 'project-nav: mark')
@@ -546,25 +780,58 @@ export function apply(ctx, config) {
     }
   })), 'project-nav: sync-docs')
 
-  // ---- 11. nav_status — health + open actions (the drift signal) ----
+  // ---- 11. nav_status — health + open actions + cross-session concurrency ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_status',
-    description: 'Health snapshot: index totals/coverage, mainline vector, and the OPEN action list — unfinished actions are the project drift signal. Call this before starting any task.',
+    description: 'Health snapshot: index totals/coverage, mainline vector, cross-session concurrency (who holds which scope), and the OPEN action list — unfinished actions are the project drift signal. Call this before starting any task.',
     parameters: {},
     output: OUTPUT,
-    async execute() {
+    async execute(_args, exec) {
+      const sid = sidOf(exec)
+      const ttl = ttlOf(config)
       try {
         const index = loadIndex(root)
         const m = index.metadata || {}
         const vector = loadVector(root)
-        const ledger = loadActions(root)
+        const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
         const registry = loadDocs(root)
         const open = (ledger.actions || []).filter(a => a.status === 'planned' || a.status === 'in_progress')
+        const live = open.filter(a => a.status === 'in_progress')
+        const queued = open.filter(a => a.status === 'planned')
         const recent = (ledger.actions || []).slice(-5)
         // B1: real disk-drift detection — previously staleEntries/unmappedFiles were dead fields,
         // so files deleted/renamed on disk were invisible. Now actually probe the filesystem.
         let stale = []
         try { stale = findStaleFiles(index, root) } catch { /* drift probe must never break status */ }
+        const age = iso => {
+          const t = Date.parse(iso || '')
+          if (Number.isNaN(t)) return '?'
+          const min = Math.round((Date.now() - t) / 60000)
+          return min < 1 ? 'just started' : (min < 60 ? `${min}min` : `${Math.floor(min / 60)}h${min % 60}min`)
+        }
+        const scopeOf = a => [
+          (a.scope?.features || []).length ? `features=${a.scope.features.join(',')}` : '',
+          (a.scope?.modules || []).length ? `modules=${a.scope.modules.join(',')}` : '',
+          (a.scope?.files || []).length ? `files=${a.scope.files.join(',')}` : ''
+        ].filter(Boolean).join(' ')
+        // Live scope drift: has anything under a running action changed since its begin snapshot?
+        const driftNote = a => {
+          if (!a.scopeState) return ''
+          try {
+            const d = verifyScopeFingerprint(root, index, a.scopeState)
+            if (d.ok) return ''
+            const bits = []
+            if (d.changed.length) bits.push('modified: ' + d.changed.join(','))
+            if (d.removed.length) bits.push('vanished: ' + d.removed.join(','))
+            if (d.added.length) bits.push('appeared: ' + d.added.join(','))
+            return '\n    DRIFT since begin -> ' + bits.join(' | ')
+          } catch { return '' }
+        }
+        const concurrency = [
+          `Concurrency: ${live.length} live action(s) holding scope locks`,
+          ...live.map(a => `  ${actorLabel(a)}\n    running ${age(a.lease?.renewedAt || a.startedAt)}${sid && a.owner?.sessionId === sid ? ' (yours)' : ''} · scope: ${scopeOf(a) || '(empty)'}\n    lease until ${a.lease?.renewedAt ? new Date(Date.parse(a.lease.renewedAt) + (a.lease.ttlMs || ttl)).toISOString() : '(none — will expire on next read)'}` + driftNote(a)),
+          ...(queued.length ? [`  queued (planned, holding nothing yet): ${queued.map(a => `${a.id}${a.owner?.label ? ` by ${a.owner.label}` : ''}`).join('; ')}`] : [])
+        ]
         const lines = [
           'Project Nav Status',
           `Root: ${root}`,
@@ -578,8 +845,11 @@ export function apply(ctx, config) {
           vector.notDoing ? `  Not Doing: ${vector.notDoing}` : '',
           vector.exitCondition ? `  Exit: ${vector.exitCondition}` : '',
           '',
+          'Concurrency (multi-session):',
+          ...concurrency,
+          '',
           open.length
-            ? `OPEN Actions (${open.length}) — drift signal, finish or abort:\n${open.map(a => `  ${a.id} [${a.status}] ${a.task}`).join('\n')}`
+            ? `OPEN Actions (${open.length}) — drift signal, finish or abort:\n${open.map(a => `  ${a.id} [${a.status}] ${a.task}${a.owner?.label ? ` — ${a.owner.label}` : ''}`).join('\n')}`
             : 'Open Actions: none',
           stale.length
             ? `STALE Files (${stale.length}) — in index but missing on disk, update or re-register:\n${stale.map(s => `  ${s}`).join('\n')}`

@@ -2,13 +2,92 @@
 // Used by host/index.js (tool registrations). No bare-package imports here —
 // only node: builtins, so this file resolves from any loading context.
 
-import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync, renameSync, openSync, closeSync, unlinkSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
 const INDEX_FILENAME = '.internal/nav-index.json';
 const VECTOR_FILENAME = '.internal/vector.json';
 const ACTIONS_FILENAME = '.internal/nav-actions.json';
 const DOCS_FILENAME = '.internal/nav-docs.json';
+
+// ---- cross-process ledger lock ----
+// The governed workspace is shared by all DSH sessions (one daemon, many
+// sessions), so the ledger read-modify-write below is critical state: two
+// sessions planning at once would compute the same ACT-id and the later rename
+// would silently drop the earlier action. The lock is an exclusive-create file
+// (O_EXCL) — the one primitive that works across processes on Windows — plus an
+// in-process queue for same-process callers.
+
+const LOCK_STALE_MS = 15000;
+const LOCK_TIMEOUT_MS = 10000;
+const LOCK_WAIT_MS = 50;
+const SESSION_LABEL_LEN = 8;
+
+/** Per-process serialization: all cordis tools run in one process, so queue them first. */
+let ledgerQueue = Promise.resolve();
+function enqueue(task) {
+  const run = ledgerQueue.then(task, task);
+  ledgerQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+// Synchronous sleep: the ledger critical sections are deliberately sync
+// (a read-modify-write must not interleave with another await in-process).
+const sleepSync = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+export function lockPathFor(rootPath) {
+  return resolve(rootPath, ACTIONS_FILENAME + '.lock');
+}
+
+function readLockFile(p) {
+  try {
+    const j = JSON.parse(readFileSync(p, 'utf-8'));
+    return j && typeof j === 'object' ? j : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run one ledger critical section under an exclusive lock. A held lock re-enters
+ * (token check) instead of deadlocking; a lock whose owner died is broken by the
+ * lock file's own age, so a crashed session never blocks the workspace forever.
+ */
+export async function withLedgerLock(rootPath, fn) {
+  return enqueue(() => {
+    const lockPath = lockPathFor(rootPath);
+    mkdirSync(dirname(lockPath), { recursive: true });
+    const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const payload = JSON.stringify({ token, pid: process.pid, at: new Date().toISOString() });
+    const started = Date.now();
+    let held = false;
+    while (!held) {
+      try {
+        const fd = openSync(lockPath, 'wx');
+        writeFileSync(fd, payload, 'utf-8');
+        closeSync(fd);
+        held = true;
+      } catch (e) {
+        if (e && e.code === 'EEXIST') {
+          const holder = readLockFile(lockPath);
+          if (holder && holder.token === token) return fn();   // re-entrant same holder
+          let aged = false;
+          try { aged = Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS; } catch { aged = true; }
+          if (aged) { try { unlinkSync(lockPath); } catch { /* another waiter won the break */ } continue; }
+          if (Date.now() - started > LOCK_TIMEOUT_MS) {
+            throw new Error(`[project-nav] ledger lock busy for ${LOCK_TIMEOUT_MS}ms (${lockPath}, held by pid ${holder?.pid ?? '?'} since ${holder?.at ?? '?'}). Another session is writing the action ledger; retry in a moment.`);
+          }
+          sleepSync(LOCK_WAIT_MS);
+          continue;
+        }
+        throw e;
+      }
+    }
+    try { return fn(); } finally { try { rmSync(lockPath, { force: true }); } catch { /* lock file already gone */ } }
+  });
+}
 
 // ---- path helpers ----
 
@@ -111,10 +190,92 @@ export function saveVector(rootPath, vector) {
   atomicWriteJson(resolve(rootPath, VECTOR_FILENAME), vector);
 }
 
-// ---- action ledger (anti-drift transaction log) ----
+// ---- action ledger (anti-drift transaction log; multi-session leases) ----
 
 export function createEmptyActions() {
-  return { version: '1.0', actions: [] };
+  return { version: '1.1', actions: [] };
+}
+
+/** Default lease TTL: long enough for a real task, short enough to self-heal. */
+export const DEFAULT_LEASE_TTL_MS = 30 * 60 * 1000;
+
+/** Compact session identity of the caller (the agent's SessionId). */
+export function selfOwner(sessionId, extra = {}) {
+  return { sessionId: sessionId ? String(sessionId) : '', label: sessionLabel(sessionId), ...extra };
+}
+
+export function sessionLabel(sessionId) {
+  const s = String(sessionId || '');
+  return s ? s.slice(0, SESSION_LABEL_LEN) : 'unknown';
+}
+
+/** Is this action a live, unexpired lock on its scope? */
+export function isLeaseExpired(action, now = Date.now()) {
+  if (!action || action.status !== 'in_progress') return false;
+  const renewed = action.lease?.renewedAt || action.startedAt;
+  if (!renewed) return true;
+  const t = Date.parse(renewed);
+  if (Number.isNaN(t)) return true;
+  return (now - t) > (action.lease?.ttlMs || DEFAULT_LEASE_TTL_MS);
+}
+
+/**
+ * Non-mutating view of the ledger: a lease that lapsed (crashed/closed session)
+ * is reported as `expired`, and the acting session's own in-progress leases are
+ * renewed. Renewal on read is the heartbeat — the agent never has to ping.
+ */
+export function reconcileActions(ledger, { sessionId = null, ttlMs = DEFAULT_LEASE_TTL_MS, now = Date.now() } = {}) {
+  ledger.version = ledger.version || '1.1';
+  ledger.actions = ledger.actions || [];
+  const iso = new Date(now).toISOString();
+  const sid = sessionId ? String(sessionId) : '';
+  const expired = [];
+  const renewed = [];
+  for (const a of ledger.actions) {
+    if (isLeaseExpired(a, now)) {
+      a.status = 'expired';
+      a.completedAt = iso;
+      a.expiredAt = iso;
+      expired.push(a);
+      continue;
+    }
+    if (a.status === 'in_progress' && sid && a.owner?.sessionId === sid) {
+      a.lease = { ...(a.lease || {}), renewedAt: iso, ttlMs: a.lease?.ttlMs || ttlMs };
+      renewed.push(a.id);
+    }
+  }
+  return { ledger, expired, renewed };
+}
+
+/**
+ * Load the ledger and reconcile it. `writeBack` persists expiries and renewals
+ * (renewals are throttled so the lock is not taken on every read).
+ */
+export async function loadActionsReconciled(rootPath, { sessionId = null, ttlMs = DEFAULT_LEASE_TTL_MS, writeBack = true, renewThrottleMs = 60000 } = {}) {
+  return withLedgerLock(rootPath, () => {
+    const ledger = loadActions(rootPath);
+    const snap = () => JSON.stringify(ledger.actions.map(a => [a.id, a.status, a.lease?.renewedAt || null]));
+    const before = snap();
+    const { expired, renewed } = reconcileActions(ledger, { sessionId, ttlMs });
+    const lastRenew = ledger.lastRenewAt ? Date.parse(ledger.lastRenewAt) : 0;
+    const dueRenew = renewed.length > 0 && (Date.now() - (Number.isNaN(lastRenew) ? 0 : lastRenew) > renewThrottleMs);
+    if (writeBack && (expired.length > 0 || dueRenew) && snap() !== before) {
+      if (dueRenew) ledger.lastRenewAt = new Date().toISOString();
+      saveActions(rootPath, ledger);
+    }
+    return { ledger, expired: expired.map(a => a.id), renewed };
+  });
+}
+
+/** Mutation entry point: read-reconcile-mutate-save, all inside the ledger lock. */
+export async function mutateActions(rootPath, { sessionId = null, ttlMs = DEFAULT_LEASE_TTL_MS } = {}, mutator) {
+  return withLedgerLock(rootPath, async () => {
+    const ledger = loadActions(rootPath);
+    const { expired } = reconcileActions(ledger, { sessionId, ttlMs });
+    const result = await mutator(ledger, { expiredIds: expired.map(a => a.id) });
+    saveActions(rootPath, ledger);
+    return result;
+  });
 }
 
 export function loadActions(rootPath) {
@@ -133,6 +294,285 @@ export function nextActionId(ledger) {
     if (m) max = Math.max(max, parseInt(m[1], 10));
   }
   return `ACT-${String(max + 1).padStart(3, '0')}`;
+}
+
+// ---- scope concurrency (the multi-session core) ----
+// A workspace is shared by several sessions working at once. Only actions whose
+// SCOPES OVERLAP have to serialize; disjoint scopes run in parallel. Three
+// layers are compared, and all three are needed — the derived-file layer is the
+// one that catches "different features, same file".
+
+/** Basenames of known project directories (0.2.x indexes carry projectPaths). */
+export function projectDirNames(index) {
+  const out = new Set();
+  for (const p of Object.values(index?.projectPaths || {})) {
+    const parts = normalizePath(p).split('/').filter(Boolean);
+    if (parts.length) out.add(parts[parts.length - 1].toLowerCase());
+  }
+  return out;
+}
+
+/**
+ * Canonical comparable form of a scope file path: workspace-relative, forward
+ * slashes, lower case, with a leading `<projectDir>/` collapsed — so
+ * "project-nav/host/index.js" and "host/index.js" compare EQUAL.
+ */
+export function canonPath(p, dirNames = null) {
+  let s = normalizePath(p).trim().replace(/^\.\//, '').replace(/\/+$/, '').toLowerCase();
+  if (!s) return '';
+  const parts = s.split('/').filter(Boolean);
+  if (parts.length > 1 && dirNames && dirNames.has(parts[0])) s = parts.slice(1).join('/');
+  return s;
+}
+
+/** Modules the index associates with any of these features/modules. */
+export function scopeOwnModules(index, scope = {}) {
+  const m2f = index?.indexes?.moduleToFeatures || {};
+  const f2f = index?.indexes?.fileToFeature || {};
+  const out = new Set(scope.modules || []);
+  // features name modules directly…
+  const feats = new Set(scope.features || []);
+  // …and FILES name features (which name modules): an action scoped by file
+  // still occupies the module that file belongs to.
+  const dirs = projectDirNames(index);
+  for (const file of (scope.files || [])) {
+    const c = canonPath(file, dirs);
+    for (const [k, codes] of Object.entries(f2f)) {
+      if (canonPath(k, dirs) === c) for (const code of codes) feats.add(code);
+    }
+  }
+  for (const [mod, feats2] of Object.entries(m2f)) {
+    if ((feats2 || []).some(c => feats.has(c))) out.add(mod);
+  }
+  return out;
+}
+
+/** Every file the index associates with any of these features/modules. */
+export function scopeOwnFiles(index, scope = {}) {
+  const f2files = index?.indexes?.featureToFiles || {};
+  const m2f = index?.indexes?.moduleToFeatures || {};
+  const codes = new Set(scope.features || []);
+  for (const m of (scope.modules || [])) for (const c of (m2f[m] || [])) codes.add(c);
+  const out = new Set();
+  for (const c of codes) for (const f of (f2files[c] || [])) out.add(f);
+  return out;
+}
+
+/**
+ * Do these two scopes overlap? Returns { kind, what } or null when they are
+ * disjoint. `derived-file` = the two features/modules resolve to a shared
+ * indexed file, a REAL conflict even though the declared scopes differ.
+ */
+export function scopeConflict(aScope = {}, bScope = {}, { index = null } = {}) {
+  const norm = v => String(v).toLowerCase();
+  const hit = (xs, ys) => {
+    const set = new Set((ys || []).map(norm));
+    return (xs || []).find(x => set.has(norm(x))) || null;
+  };
+  const dirs = index ? projectDirNames(index) : null;
+  const sub = (xs, ys) => {
+    for (const x0 of (xs || [])) {
+      const x = canonPath(x0, dirs);
+      if (!x) continue;
+      for (const y0 of (ys || [])) {
+        const y = canonPath(y0, dirs);
+        if (!y) continue;
+        if (x === y) return `${x0} = ${y0}`;
+        if (x.startsWith(y + '/') || y.startsWith(x + '/')) return `${x0} overlaps ${y0}`;
+      }
+    }
+    return null;
+  };
+  const feat = hit(aScope.features, bScope.features);
+  if (feat) return { kind: 'feature', what: feat };
+  const mod = hit(aScope.modules, bScope.modules);
+  if (mod) return { kind: 'module', what: mod };
+  // Feature codes carry no path, so two DIFFERENT features can still be two
+  // changes in the same module. Without this layer, "different features ⇒ no
+  // conflict" is simply wrong on a module-granular index.
+  if (index) {
+    const aMods = [...scopeOwnModules(index, aScope)];
+    const bMods = [...scopeOwnModules(index, bScope)];
+    const viaMod = hit(aMods, bMods);
+    if (viaMod) return { kind: 'module', what: `${viaMod} (via feature)` };
+  }
+  const file = sub(aScope.files, bScope.files);
+  if (file) return { kind: 'file', what: file };
+  if (index) {
+    const aFiles = [...scopeOwnFiles(index, aScope)];
+    const bFiles = [...scopeOwnFiles(index, bScope)];
+    const derived = sub(aFiles, bFiles);
+    if (derived) return { kind: 'derived-file', what: derived };
+  }
+  return null;
+}
+
+/**
+ * Conflict check against the LIVE locks only (in_progress). Planned actions are
+ * intentions, not holds — treating them as blockers would serialize sessions
+ * that never actually start.
+ */
+export function checkScopeConflicts(ledger, action, { index = null, now = Date.now(), includePlanned = false } = {}) {
+  const stat = includePlanned ? ['planned', 'in_progress'] : ['in_progress'];
+  const conflicts = [];
+  for (const other of ledger.actions || []) {
+    if (other.id === action.id) continue;
+    if (!stat.includes(other.status)) continue;
+    if (isLeaseExpired(other, now)) continue;
+    const c = scopeConflict(action.scope || {}, other.scope || {}, { index });
+    if (c) conflicts.push({ action: other, kind: c.kind, what: c.what, own: !!action.owner?.sessionId && other.owner?.sessionId === action.owner.sessionId });
+  }
+  return conflicts;
+}
+
+/** The live action already held by this session (one in_progress per session). */
+export function sessionBusyWith(ledger, sessionId, { now = Date.now() } = {}) {
+  const sid = String(sessionId || '');
+  return (ledger.actions || []).find(a => a.status === 'in_progress' && a.owner?.sessionId === sid && !isLeaseExpired(a, now)) || null;
+}
+
+/**
+ * Queue position: how many actions must finish before this one could start.
+ * Counted over conflicting actions that hold a lease (in_progress) plus planned
+ * blockers queued ahead of it.
+ */
+export function queuePosition(ledger, action, { index = null, now = Date.now() } = {}) {
+  const conflicts = checkScopeConflicts(ledger, action, { index, now, includePlanned: true });
+  const ahead = conflicts.map(c => c.action).filter(o => o.status === 'in_progress' || (o.createdAt || '') < (action.createdAt || ''));
+  return { ahead: ahead.length, ids: ahead.map(a => a.id) };
+}
+
+/** One-line view of a live action holder. */
+export function actorLabel(action) {
+  const sid = action?.owner?.sessionId;
+  const who = sid ? `session ${action.owner.label || sessionLabel(sid)}` : 'legacy session (pre-0.3.0 ledger entry)';
+  return `${action.id} [${action.status}] "${action.task}" by ${who}${action.owner?.cwd ? ` @ ${action.owner.cwd}` : ''}`;
+}
+
+/** Multi-line view of a conflict set, for gate messages. */
+export function describeConflicts(conflicts) {
+  return conflicts.map(c => {
+    const bits = [
+      c.action.scope?.features?.length ? `features=${c.action.scope.features.join(',')}` : '',
+      c.action.scope?.modules?.length ? `modules=${c.action.scope.modules.join(',')}` : '',
+      c.action.scope?.files?.length ? `files=${c.action.scope.files.join(',')}` : ''
+    ].filter(Boolean).join(' ');
+    return `  - ${actorLabel(c.action)} — overlap ${c.kind}: ${c.what}${bits ? `\n    scope: ${bits}` : ''}`;
+  });
+}
+
+// ---- scope fingerprints (anti-drift: did somebody else touch my files?) ----
+// A lease stops two sessions from STARTING on the same scope. A fingerprint catches
+// what a lease cannot: files that changed or vanished WHILE the action was running
+// (another session, an editor, a cleanup, a force-push). Taken at begin, re-read at
+// done — reported, never silently swallowed, and never a hard block on finished work.
+
+/** Expand a sub-scope to concrete files: indexed features/modules + literal paths. */
+export function scopeFiles(index, scope = {}, rootPath = '.') {
+  const out = new Set();
+  const f2files = index?.indexes?.featureToFiles || {};
+  const m2f = index?.indexes?.moduleToFeatures || {};
+  const codes = new Set(scope.features || []);
+  for (const m of (scope.modules || [])) for (const c of (m2f[m] || [])) codes.add(c);
+  for (const c of codes) for (const f of (f2files[c] || [])) out.add(normalizePath(f));
+  const dirs = projectDirNames(index);
+  for (const raw of (scope.files || [])) {
+    const f = normalizePath(raw);
+    if (f.includes('*') || f.includes('?')) {
+      const star = f.search(/[*?]/);
+      const slash = f.lastIndexOf('/', star);
+      const base = slash >= 0 ? f.slice(0, slash) : '';
+      const rest = f.slice(slash + 1);
+      const rx = globToRegExp(rest);
+      let entries = [];
+      try { entries = readdirSync(resolve(rootPath, base), { recursive: true }); } catch { entries = []; }
+      for (const e of entries) {
+        const rel = normalizePath(typeof e === 'string' ? e : e.name);
+        if (rx.test(rel.split('/').pop())) out.add(normalizePath(base ? base + '/' + rel : rel));
+      }
+    } else out.add(f);
+  }
+  const filtered = [...out].filter(Boolean);
+  if (!index) return filtered;
+  // drop the project/module NAMES nav_plan accepts as scope entries — they are not files
+  return filtered.filter(f => {
+    const parts = f.split('/');
+    if (parts.length > 1 && dirs.has(parts[0].toLowerCase())) return false;
+    for (const proj of Object.keys(index.projectToModules || {})) if (f === proj) return false;
+    return true;
+  });
+}
+
+/** Minimal glob to RegExp for scope patterns (only * ? ** are meaningful here). */
+function globToRegExp(glob) {
+  const SPECIAL = '.*+?^()[]|' + String.fromCharCode(36) + '{}' + String.fromCharCode(92);
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*') {
+      if (glob[i + 1] === '*') { re += '.*'; i++; } else re += '[^/]*';
+    } else if (c === '?') re += '.';
+    else if (SPECIAL.includes(c)) re += String.fromCharCode(92) + c;
+    else re += c;
+  }
+  return new RegExp('^' + re + '~END~'.replace('~END~', String.fromCharCode(36)));
+}
+
+/** Disk location of a scope file: absolute, workspace-relative, or project-relative. */
+export function resolveScopeFile(rootPath, file, index = null) {
+  for (const cand of [file, resolve(rootPath, file)]) {
+    try { if (existsSync(cand)) return cand; } catch { /* unreadable — try next */ }
+  }
+  for (const rel of Object.values(index?.projectPaths || {})) {
+    const cand = resolve(rootPath, rel, file);
+    try { if (existsSync(cand)) return cand; } catch { /* try next */ }
+  }
+  return null;
+}
+
+function fileStamp(abs) {
+  try {
+    const st = statSync(abs);
+    if (!st.isFile()) return null;
+    const stamp = { size: st.size, mtime: Math.round(st.mtimeMs) };
+    if (st.size <= 262144) stamp.sha1 = createHash('sha1').update(readFileSync(abs)).digest('hex').slice(0, 12);
+    return stamp;
+  } catch {
+    return null;
+  }
+}
+
+/** Snapshot the files a scope owns: { file: {size, mtime, sha1} | 'missing' } */
+export function snapshotScopeFiles(rootPath, index, scope) {
+  const snap = {};
+  // The declared literal paths ARE part of the scope even when the index does not
+  // know them yet (new files, private paths); features/modules come from the index.
+  const targets = new Set(scopeFiles(index, scope, rootPath));
+  for (const f of (scope?.files || [])) if (!f.includes('*') && !f.includes('?')) targets.add(normalizePath(f));
+  for (const f of targets) {
+    const abs = resolveScopeFile(rootPath, f, index);
+    snap[f] = abs ? (fileStamp(abs) || 'unreadable') : 'missing';
+  }
+  return snap;
+}
+
+/** Diff a snapshot against disk now: changed (content/time) / removed / added. */
+export function verifyScopeFingerprint(rootPath, index, scopeState, scope = null) {
+  const before = scopeState?.files || {};
+  const effective = scopeState?.scope || scope || {};
+  // An empty scope means "nothing to compare", NOT "everything vanished".
+  const hasScope = (effective.files || []).length > 0 || (effective.features || []).length > 0 || (effective.modules || []).length > 0;
+  const now = hasScope ? snapshotScopeFiles(rootPath, index, effective) : { ...before };
+  const changed = []; const removed = []; const added = [];
+  for (const [f, b] of Object.entries(before)) {
+    const a = now[f];
+    if (a === undefined || a === 'missing') { removed.push(f); continue; }
+    if (b === 'missing' || b === 'unreadable' || typeof b !== 'object') continue;
+    if (typeof a !== 'object') { changed.push(f); continue; }
+    if (b.size !== a.size || b.mtime !== a.mtime || b.sha1 !== a.sha1) changed.push(f);
+  }
+  for (const f of Object.keys(now)) if (!(f in before)) added.push(f);
+  return { changed, removed, added, ok: changed.length === 0 && removed.length === 0 };
 }
 
 // ---- reference docs registry (project reference foundation) ----

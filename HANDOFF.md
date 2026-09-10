@@ -909,4 +909,85 @@ buildTree 5 项目 0 孤儿；stale 仅 2 条已知 pmg 死链；vector 五消�
 - **验证**：pnpm test 12/12 绿；pnpm pack 产物 0.2.10 tgz（旧 0.2.9 tgz 删除）；fresh clone → install → import 冒烟通过。
 - **作者本机后续动作**：重装 0.2.10 时必须在 profile patch 层补 `config.root: 'D:/FF'`（旧默认值已移除），否则回退 cwd 治理到错误目录——README「配置 root」有示例。
 
-_本文件应随项目推进持续更新。最后更新：2026-09-10 05:10_
+_本文件应随项目推进持续更新。最后更新：2026-09-10 10:05_
+---
+
+## 30. v0.4.0 多会话并发 + scope 文件指纹（lk 需求 → 实现；锚点 PN-F06）
+
+> **版本号提示**：§25 已把 **v0.3.0** 预留给「架构先行协议」（前置方案，尚未实现）。本节的实现版本因此定为 **v0.4.0**，避开撞号。
+
+### 缘起（lk 提出的优化点）
+
+> "一个项目可以同时多个会话同时工作……如果其他会话发现有标记就需要等待另一个完成再继续，这样排队模式，只要他们改动影响的不是同样的文件模块功能就不会冲突，这样就可以同时干活。"
+
+方向成立，但要修正一处：当时是 **v0.2.6 立的「单 in_progress 强制」全局锁**（`nav_plan` 见任何 in_progress 直接 ERROR），它不是"标记"而是**全局锁**——不相交的两个会话也会互相堵死。所以本次不是"加排队"，而是**把全局单锁换成按 scope 的细粒度租约锁 + 只在冲突时定向排队**。
+
+### 30.1 v0.3.0 并发核心（scope 锁）
+
+- **身份**：`ToolRunContext.agent.id`（agent 的 SessionId）即会话身份，无需环境变量猜测；拿不到 sessionId 时自动回退旧的全局单锁行为（legacy 兼容）。
+- **账本跨进程文件锁**（`shared/withLedgerLock`）：O_EXCL 独占创建 + 陈旧破锁（15s）+ 进程内 Promise 队列 + 可重入 token。**这是必需项**：原实现是「原子 rename 的无锁读改写」，两个会话同时 `nav_plan` 会算出同一个 ACT-ID 并互相覆盖。已用测试真实复现（6 个并发 plan → 全部 ACT-001、只入库 1 条）后修复。
+- **租约**：`nav_mark begin` 授予 `lease{acquiredAt,renewedAt,ttlMs}`，默认 TTL 30 分钟（`config.leaseTtlMs` 可调）；任何本会话调用自动续约（读取时续约 = 心跳，agent 无需 ping）；崩溃会话的租约到期自动转 `expired`，绝不死锁工作区。
+- **冲突判定三层**（`shared/scopeConflict`）：
+  1. 功能交集；
+  2. 模块交集——**含「不同功能同模块」**（按索引反推模块归属）；
+  3. 文件交集——canonical 路径（`host/index.js` ≡ `project-nav/host/index.js`）、目录前缀；
+  4. **派生文件交集**——两个不同功能被索引映射到同一文件，仍是真冲突。
+- **排队**：`nav_mark begin` 无冲突即授锁放行；有冲突返回 `⛔ BLOCKED + 队列位次 + 谁锁着哪片 scope`，可选 `wait=true, waitMs=...` 阻塞等待；`done` 释放 scope 时点名播报解除阻塞的排队者。计划态（planned）不算阻塞，避免"空占位"互相堵死。
+- **每会话一个 in_progress**；只能关闭自己持有的动作（跨会话 done/abort 被拒）。
+- **`nav_query` 会话感知**：`⚠ OCCUPIED`（含"目标文件属于对方 feature"的索引反查）/ `PARTIALLY OCCUPIED`（模块级）/ 其他会话无关动作只报上下文不阻塞。
+- **`nav_status`** 增 `Concurrency (multi-session)` 视图：谁锁着哪片 scope、跑了多久、租约何时到期、谁在排队。
+
+### 30.2 v0.4.0 scope 文件指纹（防"别人偷偷改/删"）
+
+租约只防"同时开工"，防不住**开工期间文件被改/被删**（另一会话、编辑器、清理脚本、`--force` 写入）。故：
+
+- `nav_mark begin` 记录 scope 内每个文件的 `{size, mtime, sha1(≤256KB)}` 快照（`a.scopeState`，作用域 = 索引推出的文件 ∪ 字面量路径；
+- `nav_mark done` 比对磁盘现状，输出 `⚠ Scope drift since begin`（modified / vanished / appeared 三类），并把结果落到 `a.drift` 供事后复盘；干净收口则明确回 `✓ Scope fingerprint verified`；
+- `nav_status` 对**运行中**的动作实时显示 `DRIFT since begin -> ...`；
+- 空 scope 语义修正：**空 scope = 无可比对，不等于"全部消失"**（首版曾因 `scopeState` 未带 scope 而误报 vanished，已修）。
+
+### 30.3 验证
+
+- `test/concurrency.test.mjs`（新增，15 用例）：不相交并行 / 同模块冲突 / 派生文件冲突 / `wait=true` 排队至释放 / 租约过期自愈 / 每会话单动作 / 跨会话不可抢占关闭 / 并发立项零丢失零重号 / 占用可见 / **同文件两种路径写法判冲突** / **不相交目录真并行** / 指纹 changed / 指纹 vanished / 指纹 clean / legacy 回退。
+- `test/core.test.mjs` 12 用例保持全绿；`package.json` 的 `test` 改为显式跑两个文件（Node 22 的 `node --test <dir>` 不可用，且原来 `node --test` 会假绿）。
+- 仓库内 `node --test test/core.test.mjs test/concurrency.test.mjs` = **27/27**。
+- 真实工作区 `D:/FF` 双会话冒烟：并行放行 ✅、冲突 `queue position 1` ✅、`done` 后排队者自动放行 ✅、文件级查询 OCCUPIED ✅（冒烟后账本原样还原，零残留）。
+
+### 30.4 三个诚实限制（设计即接受）
+
+1. **这是协作锁，不是强制锁**：绕过 `nav_plan` 直接改文件的会话，nav 拦不住。它防"无意识撞车"，不防"故意违规"。要抓违规只能靠指纹对账（v0.4.0 已提供事后可见性）。
+2. **git 是 scope 之外的元冲突**：两个会话 scope 不相交但同时在同一个仓 `commit/rebase/stash` 一样出事。要不要给 git 写操作加锁，需单独决策（未做）。
+3. **scope 写得多粗，并行度就多低**：登记 `src/` 等于独占整个目录；文件级才是正确粒度。
+
+### 30.5 本次会话事故记录（必读）
+
+**事故 A：`D:\FF\project-nav` 整个目录在会话进行中消失。**
+- 证据：`D:\FF` 目录 mtime = `2026-09-10T01:05:32Z`（早于会话开始）；会话开始时该目录可读、`nav_plan` 已成功登记动作；随后同一路径读取报 not found，而 `D:\FF` 本身仍可读。
+- 影响：v0.2.10 源码一度**只剩已装 profile 副本**（源码目录没了、tgz 也不在 D 盘）。
+- 处置：旧 v0.1.0 内容备份到 `~/.dsh/backups/project-nav-old-v010-2026-09-10T0116`；从 profile 副本恢复出源码树并就地升级。事后该目录由另一会话从 GitHub 克隆重建（带 git 历史，停在 v0.2.10），本次工作因此并入该仓库。
+- **教训**：源码目录与已装副本是两处真身，仓库才是唯一可回溯的真身——改完必须尽快进 git。
+
+**事故 B：本会话 shell 与文件工具全面失效。**
+- 现象：`pwsh` spawn ENOENT、`glob`/`grep` 启动失败、`read`/`write`/`edit` 对存在的文件报 not found；插件清单里 `tool-fs`/`tool-fs-search`/`tool-pwsh`/`tool-bash` 均为 `[no-fiber]`。
+- 绕过：用 `dev_stage` 挂进程内 Node 通道完成读/写/跑测试/取证；用 `openSync`/`rmSync` 做原子写替代 edit 工具。
+- **教训**：当"文件工具不可用"成为常态，项目需要一条不依赖 shell 的最小读写通道；同时说明插件对 `node:fs` 的依赖在沙箱环境下是被审查项（见 30.6）。
+
+**事故 C：源码目录内容被外部改回（本会话发生两次）。**
+- 现象：`C:\Users\lk\.dsh\plugins\project-nav\shared\index.js` 一度从 v0.3.0（36353B）退回原始（22069B），改动全部丢失；host/index.js 同期保持 v0.3.0。
+- 处置：从 profile 副本恢复（哈希一致）后重做指纹改动；随后立即并入 git 仓库并提交。
+- **教训**：跨会话共享目录里"未入库的工作"极易被覆盖。这正是本插件的存在意义——但它需要 git 兜底。
+
+### 30.6 与「沙箱兼容改造」（另一会话）的冲突点
+
+仓库里另有 sessions 产出的 devref（`docs/devref/shoucang/2026-09-10-*.md`）指出：`shared/index.js` 用 `node:fs` 沙箱不兼容，应改为 `ctx.get('fs')`。**本节的账本文件锁与指纹快照正是重度使用 `node:fs` 的部分**（`openSync` / `rmSync` / `statSync` / `readFileSync` / `readdirSync`、`node:crypto` 哈希）。
+
+- 两者**不冲突于目标，冲突于载体**：沙箱兼容改造应优先，因为它决定"插件能不能在受限沙箱里跑"。
+- 建议顺序：先落地沙箱兼容（fs 能力注入），再把 `shared/index.js` 的 fs 调用改为从注入能力取；届时 `withLedgerLock` 若无独占创建能力，需退化为"进程内锁 + 陈旧检测"并降级告警（**锁退化必须显式告警，不能静默**）。
+- 已完成的部分与该改造无关，可先行保留。
+
+### 30.7 下一步（未做）
+
+- [ ] 沙箱兼容改造（fs 能力注入）——见 30.6，优先级最高。
+- [ ] git 写操作串行化（scope 之外的元冲突）。
+- [ ] 指纹粒度细化（同文件不同函数的并行；当前文件级保守串行）。
+- [ ] `docs/` 与 `package-lock.json` 的入库策略（当前未跟踪）。
