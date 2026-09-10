@@ -260,9 +260,18 @@ export function apply(ctx, config) {
         if (!zone) return
         const policy = ctx.get?.('sandboxPolicy')
         if (!policy || typeof policy.overrideOf !== 'function') return
-        // Someone already chose a mode for this session (the user's /permission, or an earlier
-        // bind): never override an explicit choice, and never append the same event twice.
-        if (policy.overrideOf(session) !== undefined) return
+        // A session is already stamped with a mode before this hook runs — the permission-preset
+        // initializer fills it at `session/created` — so "is there an override?" is NOT the
+        // question, and asking it made the boundary silently inert (the v0.8.1 defect: every
+        // session was skipped, forever). The real question is what the mode IS:
+        //   workspace-write → already at the boundary (idempotent, including a resumed bind)
+        //   read-only       → stricter than what we would set, so adopting our value would
+        //                     LOOSEN the session; leave that choice alone
+        //   anything else   → assert the boundary (undefined, or the initializer's own stamp)
+        // An explicit switch inside a session still wins for that session: it appends a later
+        // event. `autoBindWorkspace: false` is the deployment-level escape.
+        const current = policy.overrideOf(session)
+        if (current === 'workspace-write' || current === 'read-only') return
         session.append('sandbox/mode', { mode: 'workspace-write' })
         ctx.logger?.info?.(`[project-nav] workspace boundary: session ${sessionLabel(payload?.agent?.id)} bound to workspace-write (${zone})`)
       } catch (e) {

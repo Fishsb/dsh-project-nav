@@ -102,7 +102,7 @@ async function booted() {
   return { root, ...boot(root) }
 }
 
-test('workspace boundary: binds governed sessions once, and never touches the rest', async () => {
+test('workspace boundary: asserts the boundary over the initializer stamp, never loosens, never touches the rest', async () => {
   const root = makeRoot()
   const appended = []
   const policy = { overrideOf: () => undefined }
@@ -111,21 +111,31 @@ test('workspace boundary: binds governed sessions once, and never touches the re
   assert.ok(start, 'the boundary listener is registered at session start')
 
   const session = (cwd, id) => ({ header: { cwd }, append: (type, data) => appended.push({ id, type, data }) })
+  const bound = () => appended.filter(a => a.type === 'sandbox/mode')
 
-  // governed workspace → bound to workspace-write
+  // governed workspace, no mode yet → bound to workspace-write
   start({ agent: { id: 'session-a', session: session(join(root, 'project-nav'), 'session-a') } })
-  assert.deepEqual(appended.map(a => a.type), ['sandbox/mode'])
-  assert.equal(appended[0].data.mode, 'workspace-write')
+  assert.equal(bound().length, 1)
+  assert.equal(bound()[0].data.mode, 'workspace-write')
 
-  // the same session again (resume) already carries a mode → never appended twice
+  // already at the boundary (resume of a bound session) → never appended twice
   policy.overrideOf = () => 'workspace-write'
   start({ agent: { id: 'session-a', session: session(join(root, 'project-nav'), 'session-a') } })
-  assert.equal(appended.length, 1)
+  assert.equal(bound().length, 1)
 
-  // a user's explicit choice is respected, not overridden
+  // A mode is stamped onto a session BEFORE this hook runs (the permission-preset initializer
+  // fills it at session/created), and that stamp is NOT the user's choice — the boundary must win
+  // over it. Regression guard: treating any override as "an explicit choice" made every governed
+  // session skip binding, so the boundary was silently inert (the v0.8.1 defect).
   policy.overrideOf = () => 'danger-full-access'
   start({ agent: { id: 'session-b', session: session(join(root, 'project-nav'), 'session-b') } })
-  assert.equal(appended.length, 1)
+  assert.equal(bound().length, 2, 'the initializer stamp does not shield a governed session')
+  assert.equal(bound()[1].data.mode, 'workspace-write')
+
+  // read-only is stricter than what we would set → adopting ours would LOOSEN it; leave it alone
+  policy.overrideOf = () => 'read-only'
+  start({ agent: { id: 'session-b2', session: session(join(root, 'project-nav'), 'session-b2') } })
+  assert.equal(bound().length, 2, 'a stricter mode is never loosened')
 
   // a directory inside the root that is not a registered project → untouched
   policy.overrideOf = () => undefined
@@ -134,7 +144,7 @@ test('workspace boundary: binds governed sessions once, and never touches the re
   start({ agent: { id: 'session-d', session: session('C:\\elsewhere', 'session-d') } })
   // no cwd at all → untouched, and must not throw
   start({ agent: { id: 'session-e', session: { header: {}, append: () => assert.fail('must not append') } } })
-  assert.equal(appended.length, 1)
+  assert.equal(bound().length, 2)
 
   // autoBindWorkspace=false leaves even a governed session alone
   const off = boot(root, { autoBindWorkspace: false }, policy)

@@ -2,7 +2,8 @@
 
 > 整理日期：2026-09-11（本地）
 > 架构依据：**ADR-014**（现行，收敛 ADR-012/ADR-013）
-> 状态：**已实施并安装**（v0.8.1 · 提交「feat(v0.8.1): 工作区边界」· 84 项测试 83 通过，唯一失败项为既有的 arch-cache 时间敏感用例，见 §11）——**等待一次重启生效**。生效前提：§3 的宿主要件（沙箱后端）需先修好，否则新会话会失去 shell。
+> 状态：**已实施并安装 v0.8.2**（84/84 测试通过）——**未生效，等待重启**。
+> ⚠️ **在修好沙箱后端（§3）之前不要重启**：重启会让新会话被绑定到 `workspace-write`，而本机 shell 后端 fail-closed，**新会话将失去 shell**。顺序必须是：先改 `dsh-web` 服务账户 → 再重启 → 一次生效。
 
 ---
 
@@ -64,15 +65,17 @@ agent/session-start(payload)
   ├─ zone 为空 → 返回（未治理工作区：零操作）
   ├─ pol = ctx.get('sandboxPolicy')
   ├─ pol 不存在 → 返回
-  ├─ pol.overrideOf(session) !== undefined → 返回   ← 幂等 + 不夺权
+  ├─ current = pol.overrideOf(session)
+  ├─ current ∈ {workspace-write, read-only} → 返回   ← 已在边界 / 更严不动
   └─ session.append('sandbox/mode', { mode: 'workspace-write' })
        + ctx.logger.info(...)  一行
 ```
 
-三条纪律的来源：
-- **幂等**：`overrideOf` 返回该会话最后一次 `sandbox/mode`，已有值就跳过 → 重复触发（含会话恢复）不会叠加事件。
-- **不夺权**：同一条判断同时覆盖"用户已手动 `/permission` 选择过"的情形 → **用户显式选择永远优先**，插件只填默认值。
+三条纪律（**v0.8.2 修正后的版本**）：
+- **边界断言，而不是"填空"**：会话在**本钩子运行之前就被盖了一个模式戳**——`dsh-permission-presets` 在 `session/created` 时执行 `pinInitialPermission` → `setSandboxMode(session, spec.sandbox)`。所以判据**不能是"有没有覆盖"**（v0.8.1 就是这么写的，导致每个会话都被跳过、边界永远惰性），必须看**值是什么**：`workspace-write` → 已在边界（幂等，含恢复）；`read-only` → 比我们要设的更严，采用我们的值等于**放松**它，所以不动；其余（`undefined` 或初始化器的默认戳）→ 断言边界。
+- **会话内的显式切换仍然有效**：`/permission danger-full-access` 在该会话里 append 更晚的事件，**后写者胜**。插件只在会话建立时表态，不中途干预。
 - **失败安全**：整段 `try/catch`；**任何异常一律不绑定**（宁可不设边界，也绝不阻断会话建立或污染日志）。
+- **部署级出口**：`Config.autoBindWorkspace = false`。
 
 ## 6. 覆盖判定规则（`governedWorkspaceOf`）
 
@@ -139,3 +142,13 @@ cwd 在 root 之外                      → ''（不治理）
 已排除的解释：不是时区固定差异（`TZ=UTC` 与 `TZ=Asia/Shanghai` 下失败的断言位置不同：UTC 下 `local === utc`，根本进不到 `localForm` 分支）。触发条件尚未钉住。
 
 **为什么必须单独记账**：该用例守的是架构档指纹的"瞬时比较"语义（HANDOFF §38.6 记录过它曾经真的坏过——UTC / 本地墙上时间 / 秒截断三种渲染必须算同一瞬时）。一个时好时坏的用例既是**不可信的信号**（本插件 doctrine 的头号敌人），也会让人对它守的那条不变式失去警觉。建议单独开一个动作定位并消除其时间相关性，不要夹带进本次边界层改动。
+
+## 12. v0.8.2：v0.8.1 的边界从未生效（实机发现）
+
+**现象**：重启装入 v0.8.1 后，新会话（子代理）报告 `Current DSH file policy: danger-full-access`，且其 cwd 正是被治理的 `D:\FF\project-nav`——**该绑却没绑**。用探针在 `agent/session-start` 上实测（观察 project-nav 监听器之后的状态）：事件确实触发（`source=startup`、cwd 正确、`session.append` 可用），但 `overrideOf(session)` **已经是 `danger-full-access`**；而且早在 `agent/created` 时就已经是了。
+
+**根因（源码级）**：`dsh-permission-presets` 注册了 `ctx.on("session/created", session => this.pinInitialPermission(session))`；对全新会话它执行 `setSandboxMode(session, spec.sandbox)`，把初始预设的沙箱模式**写进会话日志**。`session/created` 早于 `agent/session-start`，所以 v0.8.1 的判据 `overrideOf(session) !== undefined → 返回`（本意是"不夺权/幂等"）**永远为真 → 每个被治理会话都被跳过，边界永远是惰性的**。
+
+**为什么判据不能用 `defaultMode` 比较**：实测 `sandboxPolicy.defaultMode = workspace-write`，而初始化器盖的戳是 `danger-full-access`（来自预设推导，部署配置里没有 `defaultPreset`）。两者不等，所以"等于部署默认就绑定"这条规则同样不成立。**唯一可用的判据是值本身**（见 §5）。
+
+**教训**：这条 bug 与 HANDOFF §37.6 记录的三次"假信号"是**同一枚硬币的反面**——那三次是**误报**，这次是**静默漏报**：报错时人还能看见，什么都不做时连日志都没有（`ctx.logger` 的输出根本没进 nssm 日志）。**"不夺权"这种听起来正确的礼貌规则，如果判据选错了输入，就会变成"永远不做"。** 检测手段只能是对**真实部署**做端到端探针——单元测试当时全绿，因为它测的是我写下的那条错判据。
