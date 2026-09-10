@@ -29,6 +29,9 @@ D:\lk\tools\dsh-web.cmd        # 现唯一启动方式；无自启 —— 重启
 **回归到边界（2026-09-11 02:40 收口：已上线 + 验收 PASS）**：前置门已开 → profile 已写 `autoBindWorkspace: true` + `boundaryWorkspaces: 'project-nav'`，边界**已生效**：全新会话与恢复会话的策略行均为 `workspace-write … workspace: "D:\FF\project-nav"`；区内写成功、区外写被拒（含 `~/.dsh/profiles/web/cordis.patch.yml`）；受限 shell 正常执行；未治理工作区（`D:\FF\shoucang`、`D:\FF\dsh-managing-memory`）全部 `not-governed`、零影响。
 **上线过程中还拦下一个真缺陷**：v0.8.4 的"一次性探针 + 首次结论永久缓存 + 早退无日志"会把一次**启动竞态**固化成"永久惰性且零痕迹"（配置、挂载、白名单、宿主后端全对，却一个会话都不绑）。已由 **v0.8.5** 修复：shell 升为硬依赖、只缓存成功（失败可重探并节流）、每次判定与会话决策留痕于 `D:\FF\.internal\boundary-diag.json`。诊断链与修法见 `plan-workspace-boundary-binding.md` §14 与 **ADR-017**。
 
+**部署与推送：边界生效后必须换场地（2026-09-11 实测）** —— 把新版本装进 profile（写 `~/.dsh/profiles/web` 的锁文件/依赖/副本）与 `git push` 都触及会话工作区之外，**在被治理会话里必然失败**：`~/.dsh` 写入 EPERM；推送走 schannel 报 `SEC_E_NO_CREDENTIALS`，换 openssl 后 TLS 通但凭据助手与传输子进程要 piped-stdio 的 msys 子进程（`couldn't create signal pipe, Win32 error 5`）。**一键脚本**：`docs/apply-pending-deploy.ps1`（在未被治理的终端/会话里运行；装 tgz + 推提交 + 逐字节核验 + 幂等判断；`-NoInstall` / `-NoPush` 可分开）。
+> 另注：受限会话里的**诊断口径**也会失真 —— `Get-NetTCPConnection` 对任何端口静默返回空（曾致"宿主已死"的误判），`tasklist` 直接 Access denied；判活请改用 TCP 连接法或直接打端点（详见 plan §10 第 6 条）。
+
 **已知缺口（nssm 卸载的后果，不属边界本身）**：
 
 1. **自启：已按「手动启动（不自启、不保活）」收口（2026-09-11）** —— nssm 卸载后 `dsh-web`(3080) 与旧桥(9915) 都失去自启。我曾按用户对「自启形态」提问的回答（"默认就行"）用 `docs/install-logon-autostart.ps1` 建了两个交互式登录任务（`dsh-web-user` / `dsh-bge-embed-user`：`LogonType=Interactive` + `RunLevel=Limited` + user=lk）。
