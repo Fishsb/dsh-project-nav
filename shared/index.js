@@ -586,7 +586,6 @@ export function verifyScopeFingerprint(rootPath, index, scopeState, scope = null
 //   ③ 决策闸  架构层改动留 ADR（锚点 + 触发原因 + 决策 + 影响面），可回溯可复盘
 
 const ARCH_FILENAME = '.internal/nav-arch.json';
-const PATCHES_FILENAME = '.internal/nav-patches.json';
 
 /** 同一锚点累计补丁达到该阈值 → 升格要求架构决策（第一性原理的触发线）。 */
 export const REPEAT_PATCH_THRESHOLD = 3;
@@ -595,24 +594,12 @@ export function createEmptyArch() {
   return { version: '1.0', decisions: [] };
 }
 
-export function createEmptyPatches() {
-  return { version: '1.0', patches: [] };
-}
-
 export function loadArch(rootPath) {
   return readJson(resolve(rootPath, ARCH_FILENAME), createEmptyArch, { failLoud: true, label: 'architecture ledger' });
 }
 
 export function saveArch(rootPath, arch) {
   atomicWriteJson(resolve(rootPath, ARCH_FILENAME), arch);
-}
-
-export function loadPatches(rootPath) {
-  return readJson(resolve(rootPath, PATCHES_FILENAME), createEmptyPatches, { failLoud: true, label: 'patch log' });
-}
-
-export function savePatches(rootPath, patches) {
-  atomicWriteJson(resolve(rootPath, PATCHES_FILENAME), patches);
 }
 
 /** Next architecture decision id: ADR-001, ADR-002, ... */
@@ -649,30 +636,20 @@ export function lastDecisionFor(arch, anchor) {
   return hits.slice().sort((x, y) => String(x.createdAt || '').localeCompare(String(y.createdAt || '')))[hits.length - 1];
 }
 
-export function patchesFor(patches, anchor) {
-  const a = normalizePath(String(anchor || ''));
-  return (patches?.patches || []).filter(p => normalizePath(String(p.anchor || '')) === a);
-}
-
 /**
  * 计数闸：同一锚点自「最近一次架构决策」以来累计的补丁数。
- * 达到阈值 → 要求先出架构决策（第一性原理的硬触发），而不是继续打补丁。
+ * 补丁不单独建账本——**已完结且带锚点的动作就是补丁**（done 动作的投影），
+ * 直接从动作账本推导，少一份要维护会漂移的数据。
  */
-export function repeatPressure(arch, patches, anchor, { threshold = REPEAT_PATCH_THRESHOLD } = {}) {
+export function repeatPressure(arch, actions, anchor, { threshold = REPEAT_PATCH_THRESHOLD } = {}) {
+  const a = normalizePath(String(anchor || ''));
   const since = lastDecisionFor(arch, anchor);
   const sinceAt = since?.createdAt || null;
-  const list = patchesFor(patches, anchor).filter(p => !sinceAt || String(p.at || '') > String(sinceAt));
-  return { anchor, count: list.length, threshold, exceeded: list.length >= threshold, sinceDecision: since ? since.id : null, patches: list.map(p => p.id) };
+  const list = (actions || []).filter(x => x.status === 'done'
+    && normalizePath(String(x.anchor || '')) === a
+    && (!sinceAt || String(x.completedAt || '') > String(sinceAt)));
+  return { anchor: a, count: list.length, threshold, exceeded: list.length >= threshold, sinceDecision: since ? since.id : null, patches: list.map(p => p.id) };
 }
-
-/** 把已完结动作记进补丁账本（同一 ACT 幂等）。 */
-export function recordPatch(patches, { actionId, anchor, at, files = [], note = '' }) {
-  patches.patches = patches.patches || [];
-  if (patches.patches.some(p => p.id === actionId)) return patches;
-  patches.patches.push({ id: actionId, anchor: normalizePath(String(anchor || '')), at: at || new Date().toISOString(), files, note });
-  return patches;
-}
-
 // ---- reference docs registry (project reference foundation) ----
 
 export function createEmptyDocs() {
@@ -893,7 +870,7 @@ export function renderTreeText(index, { target = '', openActions = null } = {}) 
   if (orphanFeatures.length) {
     lines.push(`▼ ⚠️ orphan features（未挂模块，地图盲区）(${orphanFeatures.length})`);
     for (const f of orphanFeatures) {
-      lines.push(`      ${f.code} ${f.fname ? `- ${f.fname}` : ''}  ← 用 nav_add_module 挂到模块`);
+      lines.push(`      ${f.code} ${f.fname ? `- ${f.fname}` : ''}  ← nav_update target=<模块> features=<功能码> project=<项目> 挂到模块`);
       for (const file of f.files) lines.push(`          - ${file}`);
     }
   }
@@ -939,7 +916,7 @@ export function findStaleFiles(index, rootPath) {
  * Render the auto-aligned PROJECT.md section (between nav:auto markers) from the index.
  * Markdown bullets handle long userView/systemView text better than tables.
  */
-export function renderProjectDocSection(index, { vector = null } = {}) {
+export function renderProjectDocSection(index, { vector = null, arch = null } = {}) {
   const { projects, orphanFeatures } = buildTree(index);
   const m2f = index.indexes?.moduleToFeatures || {};
   const lines = ['<!-- nav:auto:start -->', '## 功能地图（自动对齐，勿手改）', '', '> 本节由 nav_sync_docs 从 .internal/nav-index.json 生成。编辑请走 nav_add_feature / nav_update / nav_add_module，然后重新同步。', ''];
@@ -971,6 +948,15 @@ export function renderProjectDocSection(index, { vector = null } = {}) {
     if (vector.next) lines.push(`- **Next**: ${vector.next}`);
     if (vector.notDoing) lines.push(`- **Not Doing**: ${vector.notDoing}`);
     if (vector.exitCondition) lines.push(`- **Exit**: ${vector.exitCondition}`);
+    lines.push('');
+  }
+  if (arch && (arch.decisions || []).length) {
+    lines.push('### 架构决策（ADR，自动对齐）', '');
+    for (const d of arch.decisions) {
+      lines.push('- **' + d.id + '** `' + d.anchor + '` — ' + d.decision);
+      if (d.reason) lines.push('  - 触发原因：' + d.reason);
+      if (d.impact) lines.push('  - 影响面：' + d.impact);
+    }
     lines.push('');
   }
   lines.push('<!-- nav:auto:end -->');

@@ -17,7 +17,7 @@ import {
   renderTreeText, renderMapHtml, renderProjectDocSection,
   findStaleFiles, scopeTargetsOfOpenActions, withLedgerLock,
   snapshotScopeFiles, verifyScopeFingerprint,
-  loadArch, saveArch, loadPatches, savePatches, nextDecisionId, checkAnchor, repeatPressure, recordPatch, REPEAT_PATCH_THRESHOLD, lastDecisionFor
+  loadArch, saveArch, nextDecisionId, checkAnchor, repeatPressure, REPEAT_PATCH_THRESHOLD, lastDecisionFor
 } from '../shared/index.js'
 
 // ---- Plugin metadata (Cordis contract) ----
@@ -232,7 +232,7 @@ export function apply(ctx, config) {
           if (partials.length > 0) {
             return `No exact match for "${args.target}". Did you mean:\n${partials.map(m => `  - ${m}`).join('\n')}`
           }
-          return `No mapping found for "${args.target}". Register it via nav_add_feature (and nav_add_module if needed).`
+          return `No mapping found for "${args.target}". Register it via nav_update (upsert: a feature with files=, a module with features=/project=).`
         }
         const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
         const notices = [scopeGate(ledger, args.target, sid, index), mainlineGate(loadVector(root), result)].filter(Boolean)
@@ -294,8 +294,14 @@ export function apply(ctx, config) {
         }
         const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
         const index = loadIndex(root)
-        // ---- 架构先行协议：锚点闸 + 计数闸 ----
-        const anchor = normalizePath(String(args.anchor || '').trim())
+        // ---- 架构先行协议：锚点闸 + 计数闸（scope 无歧义时自动取锚——强限制只留给真正需要架构思考的地方） ----
+        let anchor = normalizePath(String(args.anchor || '').trim())
+        let autoAnchor = ''
+        if (!anchor) {
+          if (scope.features.length === 1) { anchor = scope.features[0]; autoAnchor = '自动取自 scope 的唯一功能 ' + anchor }
+          else if (!scope.features.length && scope.modules.length === 1) { anchor = scope.modules[0]; autoAnchor = '自动取自 scope 的唯一模块 ' + anchor }
+          else if (!scope.features.length && !scope.modules.length && scope.files.length === 1) { anchor = scope.files[0]; autoAnchor = '自动取自 scope 的唯一文件 ' + anchor }
+        }
         if (!anchor) {
           return [
             'ERROR: nav_plan requires anchor=<架构节点> —— 所有开发动作必须从架构出发。',
@@ -306,11 +312,10 @@ export function apply(ctx, config) {
         }
         const anchorChk = checkAnchor(index, root, anchor)
         if (!anchorChk.ok) {
-          return `ERROR: anchor "${anchor}" 不是真实架构节点（${anchorChk.hint}）。先 nav_query 确认，或 nav_add_feature / nav_add_module / nav_update --field files 补登记。`
+          return `ERROR: anchor "${anchor}" 不是真实架构节点（${anchorChk.hint}）。先 nav_query 确认，或用 nav_update 直接补登记（upsert：新功能给 files=，新模块给 features=/project=）。`
         }
         const archLedger = loadArch(root)
-        const patchLog = loadPatches(root)
-        const pressure = repeatPressure(archLedger, patchLog, anchor)
+        const pressure = repeatPressure(archLedger, ledger.actions, anchor)
         const archNote = []
         if (!String(args.arch || '').trim()) {
           archNote.push('⚠ 架构反思缺失（arch= 未填）：动手前请用一句话回答「本任务是否需要调整架构」——需要则先出架构决策（nav_adr），不需要则说明架构为何仍然成立。')
@@ -376,7 +381,7 @@ export function apply(ctx, config) {
         }).slice(0, 5)
         return [
           `✓ Action ${action.id} registered (planned): ${action.task}`,
-          `  Anchor: ${anchor} (${anchorChk.kind})${action.archNote ? ` · arch: ${action.archNote}` : ''}`,
+          `  Anchor: ${anchor} (${anchorChk.kind})${autoAnchor ? ` · ${autoAnchor}` : ''}${action.archNote ? ` · arch: ${action.archNote}` : ''}`,
           ...(archNote.length ? ['', ...archNote] : []),
           `  Scope: features=[${scope.features.join(', ')}] modules=[${scope.modules.join(', ')}] files=[${scope.files.join(', ')}]`,
           ...(unknownNote ? [unknownNote] : []),
@@ -499,7 +504,7 @@ export function apply(ctx, config) {
             const f2files = index.indexes?.featureToFiles || {}
             const missingFeatures = (a.scope?.features || []).filter(c => !f2files[c])
             const unregisteredFiles = (a.scope?.files || []).filter(f => !f2f[normalizePath(f)])
-            if (missingFeatures.length) deltaLines.push(`  - 未登记功能（需 nav_add_feature）: ${missingFeatures.join(', ')}`)
+            if (missingFeatures.length) deltaLines.push(`  - 未登记功能（需 nav_update 创建）: ${missingFeatures.join(', ')}`)
             if (unregisteredFiles.length) deltaLines.push(`  - 索引外文件（需登记到所属功能，nav_update --field files）: ${unregisteredFiles.join(', ')}`)
             // Releasing a scope is what unblocks the sessions queued behind it.
             // 架构先行协议：完结动作按锚点记入补丁账本 + 计数闸复查（结果随返回值带出，不依赖跨作用域副作用）
@@ -507,10 +512,7 @@ export function apply(ctx, config) {
             let pressureNote = ''
             if (a.anchor) {
               try {
-                const pl = loadPatches(root)
-                recordPatch(pl, { actionId: a.id, anchor: a.anchor, at: a.completedAt, files: a.scope?.files || [], note: a.task })
-                savePatches(root, pl)
-                const pr = repeatPressure(loadArch(root), pl, a.anchor)
+                const pr = repeatPressure(loadArch(root), ledger.actions, a.anchor)
                 if (pr.exceeded) {
                   pressureNote = '  [计数闸] ' + a.anchor + ' 已有 ' + pr.count + ' 次补丁（阈值 ' + pr.threshold + '），最近架构决策 ' + (pr.sinceDecision || '无') + '：这是「同一死胡同反复打补丁」的信号——下次改动前先 nav_adr 出架构决策。'
                 } else if (pr.count >= pr.threshold - 1) {
@@ -570,11 +572,17 @@ export function apply(ctx, config) {
   // ---- 4. nav_update — sync descriptions / file lists ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_update',
-    description: 'Update a field on a feature or module entry in the index. Special field "files" (features only) replaces the feature file list and rebuilds file↔feature mappings.',
+    description: 'Create-or-update any index entry (upsert): features, modules, and their fields — the single registration tool. Existing target = update the field; absent target + creation fields = create. Keeps the model-facing registration surface at one tool.',
     parameters: {
       target: { type: 'string', required: true, description: 'Feature code or module name' },
-      field: { type: 'string', required: true, description: 'Field to update: name, userView, systemView, files (feature only), status, or any custom field' },
-      value: { type: 'string', required: true, description: 'New value (for "files": comma-separated paths)' }
+      field: { type: 'string', description: 'UPDATE only: field to set on an existing entry — name, userView, systemView, files (feature only), status, or any custom field' },
+      value: { type: 'string', description: 'UPDATE only: new value (for "files": comma-separated paths)' },
+      name: { type: 'string', description: 'CREATE only: human-readable name' },
+      userView: { type: 'string', description: 'CREATE feature: user perspective description' },
+      systemView: { type: 'string', description: 'CREATE feature: system perspective description' },
+      files: { type: 'string', description: 'CREATE feature: comma-separated file paths' },
+      features: { type: 'string', description: 'CREATE module: comma-separated feature codes belonging to it (empty = module shell); also replaces an existing module list' },
+      project: { type: 'string', description: 'CREATE module: project name to attach it to' }
     },
     output: OUTPUT,
     async execute(args) {
@@ -582,7 +590,6 @@ export function apply(ctx, config) {
         const index = loadIndex(root)
         if (index.indexes?.featureToFiles?.[args.target]) {
           if (args.field === 'files') {
-            // Replace file list and rebuild both directions of the mapping.
             const newList = splitList(args.value).map(normalizePath)
             for (const old of index.indexes.featureToFiles[args.target]) {
               const arr = index.indexes.fileToFeature[old]
@@ -596,6 +603,7 @@ export function apply(ctx, config) {
             saveIndex(root, index)
             return `✓ Feature ${args.target} files replaced: ${newList.length} file(s), mappings rebuilt.`
           }
+          if (!args.field || args.value === undefined) return 'ERROR: updating an existing entry requires field + value.'
           if (!index.descriptions) index.descriptions = {}
           index.descriptions[args.target] = index.descriptions[args.target] || {}
           index.descriptions[args.target][args.field] = args.value
@@ -604,6 +612,12 @@ export function apply(ctx, config) {
           return `✓ Updated feature ${args.target}: ${args.field} = "${args.value}"`
         }
         if (index.indexes?.moduleToFeatures?.[args.target]) {
+          if (args.features !== undefined) {
+            index.indexes.moduleToFeatures[args.target] = splitList(args.features)
+            saveIndex(root, index)
+            return `✓ Module ${args.target} feature list replaced (${index.indexes.moduleToFeatures[args.target].length} feature(s)).`
+          }
+          if (!args.field || args.value === undefined) return 'ERROR: updating an existing entry requires field + value (or features= for modules).'
           if (!index.moduleMeta) index.moduleMeta = {}
           index.moduleMeta[args.target] = index.moduleMeta[args.target] || {}
           index.moduleMeta[args.target][args.field] = args.value
@@ -611,143 +625,82 @@ export function apply(ctx, config) {
           saveIndex(root, index)
           return `✓ Updated module ${args.target}: ${args.field} = "${args.value}"`
         }
-        return `No feature or module named "${args.target}" found. Use nav_add_feature / nav_add_module to register new entries.`
-      } catch (e) { return err(e) }
-    }
-  })), 'project-nav: update')
-
-  // ---- 5. nav_add_feature ----
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_add_feature',
-    description: 'Register a new feature with code, name, user/system views, and file list. Refuses duplicate codes.',
-    parameters: {
-      code: { type: 'string', required: true, description: 'Feature code (e.g., PE-F07)' },
-      name: { type: 'string', required: true, description: 'Human-readable name' },
-      userView: { type: 'string', description: 'User perspective description' },
-      systemView: { type: 'string', description: 'System perspective description' },
-      files: { type: 'string', description: 'Comma-separated file paths' }
-    },
-    output: OUTPUT,
-    async execute(args) {
-      try {
-        const index = loadIndex(root)
-        if (index.indexes.featureToFiles[args.code]) {
-          return `Feature ${args.code} already exists. Use nav_update to modify it.`
+        const wantsModule = args.features !== undefined || args.project !== undefined
+        if (wantsModule) {
+          const feats = splitList(args.features)
+          let attachNote = ''
+          if (args.project) {
+            const prevOwner = Object.entries(index.indexes.projectToModules || {})
+              .find(([proj, mods]) => Array.isArray(mods) && mods.includes(args.target) && proj !== args.project)
+            if (prevOwner) attachNote = `\n  ⚠ Module "${args.target}" was already attached to project "${prevOwner[0]}" — it now appears on BOTH projects' maps.`
+            if (!index.indexes.projectToModules[args.project]) index.indexes.projectToModules[args.project] = []
+            if (!index.indexes.projectToModules[args.project].includes(args.target)) index.indexes.projectToModules[args.project].push(args.target)
+          }
+          index.indexes.moduleToFeatures[args.target] = feats
+          if (!index.moduleMeta) index.moduleMeta = {}
+          index.moduleMeta[args.target] = { ...(index.moduleMeta[args.target] || {}), name: args.name || '' }
+          saveIndex(root, index)
+          return `✓ Module ${args.target} created: ${feats.length} feature(s)` + (args.project ? `, attached to project ${args.project}` : '') + attachNote
         }
         const fileList = splitList(args.files).map(normalizePath)
-        index.indexes.featureToFiles[args.code] = fileList
-        for (const file of fileList) {
-          if (!index.indexes.fileToFeature[file]) index.indexes.fileToFeature[file] = []
-          if (!index.indexes.fileToFeature[file].includes(args.code)) {
-            index.indexes.fileToFeature[file].push(args.code)
-          }
+        index.indexes.featureToFiles[args.target] = fileList
+        for (const f of fileList) {
+          if (!index.indexes.fileToFeature[f]) index.indexes.fileToFeature[f] = []
+          if (!index.indexes.fileToFeature[f].includes(args.target)) index.indexes.fileToFeature[f].push(args.target)
         }
-        index.descriptions[args.code] = {
-          name: args.name,
+        if (!index.descriptions) index.descriptions = {}
+        index.descriptions[args.target] = {
+          name: args.name || '',
           userView: args.userView || '',
           systemView: args.systemView || '',
           createdAt: now_()
         }
         saveIndex(root, index)
-        return `✓ Registered feature ${args.code} "${args.name}" with ${fileList.length} file(s)\n  ⚠ Feature not attached to any module — it will show under "orphan features". Attach via nav_add_module (features=<code>) to place it on the map.`
+        return `✓ Feature ${args.target} created with ${fileList.length} file(s)\n  ⚠ Not attached to any module yet — nav_update again with target=<module>, features=<codes>, project=<name> to place it on the map.`
       } catch (e) { return err(e) }
     }
-  })), 'project-nav: add-feature')
+  })), 'project-nav: update')
 
-  // ---- 6. nav_add_module — complete the write path ----
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_add_module',
-    description: 'Register (or update) a module: list its features, optionally attach it to a project. Completes the module/project write path so coverage metadata is real.',
-    parameters: {
-      module: { type: 'string', required: true, description: 'Module name (e.g., voice)' },
-      features: { type: 'string', description: 'Comma-separated feature codes belonging to this module (empty = create module shell)' },
-      project: { type: 'string', description: 'Project name to attach this module to' }
-    },
-    output: OUTPUT,
-    async execute(args) {
-      try {
-        const index = loadIndex(root)
-        const feats = splitList(args.features)
-        // B2: detect existing attachment before mutating, so re-attachment is transparent, not silent
-        let attachNote = ''
-        if (args.project) {
-          const prevOwner = Object.entries(index.indexes.projectToModules || {})
-            .find(([proj, mods]) => Array.isArray(mods) && mods.includes(args.module) && proj !== args.project)
-          if (prevOwner) {
-            attachNote = `\n  ⚠ Module "${args.module}" was already attached to project "${prevOwner[0]}" — it now appears on BOTH projects' maps. If this is a move, re-run nav_add_module with project="${prevOwner[0]}" to detach or update the map.`
-          }
-        }
-        index.indexes.moduleToFeatures[args.module] = feats
-        if (args.project) {
-          if (!index.indexes.projectToModules[args.project]) index.indexes.projectToModules[args.project] = []
-          if (!index.indexes.projectToModules[args.project].includes(args.module)) {
-            index.indexes.projectToModules[args.project].push(args.module)
-          }
-        }
-        saveIndex(root, index)
-        return `✓ Module ${args.module}: ${feats.length} feature(s)` + (args.project ? `, attached to project ${args.project}` : '') + attachNote
-      } catch (e) { return err(e) }
-    }
-  })), 'project-nav: add-module')
+  // ---- 5. (registration tools merged into nav_update — the single upsert entry point) ----
 
-  // ---- 7. nav_add_doc — register a reference doc into the project reference foundation ----
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_add_doc',
-    description: 'Register a reference document (local path, directory, or URL) into the project reference registry. The "when" field is the routing rule: which kinds of tasks must consult this doc. Consulted at plan-confirmation time.',
-    parameters: {
-      title: { type: 'string', required: true, description: 'Document title (e.g., "DSH 官方插件开发文档")' },
-      path: { type: 'string', required: true, description: 'File path, directory, or URL of the doc' },
-      when: { type: 'string', required: true, description: 'Task routing rule: keywords/phrases describing which tasks need this doc (e.g., "插件打包, 装载机制, dsh-tools API")' },
-      project: { type: 'string', description: 'Project code the doc belongs to (e.g., PN-P01)' },
-      tags: { type: 'string', description: 'Comma-separated tags for matching' }
-    },
-    output: OUTPUT,
-    async execute(args) {
-      try {
-        const registry = loadDocs(root)
-        if (registry.docs.some(d => d.path === args.path)) {
-          return `Doc already registered: ${registry.docs.find(d => d.path === args.path).id} (${args.path}). Use nav_docs to list.`
-        }
-        // B3: fail-closed on local dead links — a reference doc that can't be opened is worse than no doc,
-        // because plan-confirmation routing will send the agent to a nonexistent file. URLs are not checked.
-        const isUrl = /^https?:\/\//i.test(args.path)
-        if (!isUrl && !existsSync(args.path)) {
-          return `✗ Path does not exist on disk: ${args.path}\n  Doc NOT registered (dead links are rejected).\n  Fix: check the path for typos, create the file first, or pass an http(s) URL.`
-        }
-        const doc = {
-          id: nextDocId(registry),
-          title: args.title,
-          path: args.path,
-          when: args.when,
-          project: args.project || '',
-          tags: splitList(args.tags),
-          addedAt: new Date().toISOString()
-        }
-        registry.docs.push(doc)
-        saveDocs(root, registry)
-        return `✓ Registered ${doc.id} "${doc.title}"\n  → ${doc.path}\n  when: ${doc.when}`
-      } catch (e) { return err(e) }
-    }
-  })), 'project-nav: add-doc')
-
-  // ---- 8. nav_docs — list / find reference docs (the reference foundation) ----
+  // ---- 8. nav_docs — reference docs: query AND register in one tool (辅助收敛） ----
+  // ---- 8. nav_docs — reference docs: query AND register in one tool ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_docs',
-    description: 'List or find reference documents. No args = full registry. With task = rank docs whose "when" routing rule matches the task. Read/fetch the returned paths yourself as needed.',
+    description: 'Reference docs in one tool: give title+path+when to REGISTER a document (when = routing rule: which kinds of tasks must consult it); otherwise list the registry, or pass task to rank docs for that task. Read/fetch returned paths yourself.',
     parameters: {
-      task: { type: 'string', description: 'Task description to rank relevant docs for' },
-      project: { type: 'string', description: 'Filter by project code' },
-      tag: { type: 'string', description: 'Filter by tag' }
+      title: { type: 'string', description: 'REGISTER: document title' },
+      path: { type: 'string', description: 'REGISTER: file path, directory, or URL of the doc' },
+      when: { type: 'string', description: 'REGISTER: task routing rule keywords/phrases' },
+      project: { type: 'string', description: 'REGISTER: project the doc belongs to / QUERY: filter by project code' },
+      tags: { type: 'string', description: 'REGISTER: comma-separated tags' },
+      task: { type: 'string', description: 'QUERY: task description to rank relevant docs for' },
+      tag: { type: 'string', description: 'QUERY: filter by tag' }
     },
     output: OUTPUT,
     async execute(args) {
       try {
+        if (args.path || args.title || args.when) {
+          if (!args.path || !args.title || !args.when) return 'ERROR: registering requires title + path + when (when is the task routing rule).'
+          const registry = loadDocs(root)
+          if (registry.docs.some(d => d.path === args.path)) {
+            return `Doc already registered: ${registry.docs.find(d => d.path === args.path).id} (${args.path}).`
+          }
+          const isUrl = /^https?:\/\//i.test(args.path)
+          if (!isUrl && !existsSync(args.path)) {
+            return `✗ Path does not exist on disk: ${args.path}\n  Doc NOT registered (dead links are rejected).`
+          }
+          const doc = { id: nextDocId(registry), title: args.title, path: args.path, when: args.when, project: args.project || '', tags: splitList(args.tags), addedAt: new Date().toISOString() }
+          registry.docs.push(doc)
+          saveDocs(root, registry)
+          return `✓ Registered ${doc.id} "${doc.title}"\n  → ${doc.path}\n  when: ${doc.when}`
+        }
         const registry = loadDocs(root)
         let docs = registry.docs || []
         if (args.project) docs = docs.filter(d => d.project === args.project)
         if (args.tag) docs = docs.filter(d => (d.tags || []).includes(args.tag))
         if (docs.length === 0) {
-          return 'No reference docs registered. Use nav_add_doc to register them (docs may live anywhere: any absolute path, directory or URL works — e.g. a refs/<project>/ folder under your workspace).'
+          return 'No reference docs registered. Register one with nav_docs title=... path=... when=... (docs may live anywhere: absolute path, directory or URL).'
         }
         if (args.task) {
           const ranked = suggestDocs(registry, { taskText: args.task, projects: args.project ? [args.project] : [], modules: [] })
@@ -810,7 +763,7 @@ export function apply(ctx, config) {
         const docPath = resolve(args.path || root, args.path ? '' : 'PROJECT.md')
         const index = loadIndex(root)
         const vector = loadVector(root)
-        const section = renderProjectDocSection(index, { vector })
+        const section = renderProjectDocSection(index, { vector, arch: loadArch(root) })
         let content = ''
         if (existsSync(docPath)) content = readFileSync(docPath, 'utf-8')
         const START = '<!-- nav:auto:start -->'
@@ -906,7 +859,7 @@ export function apply(ctx, config) {
           stale.length
             ? `STALE Files (${stale.length}) — in index but missing on disk, update or re-register:\n${stale.map(s => `  ${s}`).join('\n')}`
             : 'Stale files: none (index matches disk)',
-          `Reference docs: ${(registry.docs || []).length} registered (nav_docs to list, nav_add_doc to register)`,
+          `Reference docs: ${(registry.docs || []).length} registered (nav_docs to list or register)`,
           '',
           recent.length ? `Recent actions:\n${recent.map(a => `  ${a.id} [${a.status}] ${a.task}`).join('\n')}` : ''
         ].filter(Boolean)
@@ -966,11 +919,11 @@ export function apply(ctx, config) {
         if (!chk.ok) {
           return [
             `ERROR: anchor "${args.anchor}" is not an architecture node (${chk.hint}).`,
-            '  Register the feature/module first (nav_add_feature / nav_add_module), or anchor to an arch doc under .internal/arch/ — an unanchored ADR is not traceable.'
+            '  Register the node first with nav_update (upsert), or anchor to an arch doc under .internal/arch/ — an unanchored ADR is not traceable.'
           ].join('\n')
         }
         const arch = loadArch(root)
-        const pressure = repeatPressure(arch, loadPatches(root), args.anchor)
+        const pressure = repeatPressure(arch, (loadActions(root).actions || []), args.anchor)
         const d = {
           id: nextDecisionId(arch),
           anchor: normalizePath(String(args.anchor)),

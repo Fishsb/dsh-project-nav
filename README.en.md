@@ -4,7 +4,7 @@
 
 **Anti-drift project governance plugin for DeepSeek Harness (DSH)**
 
-[![version](https://img.shields.io/badge/version-0.5.0-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.6.0-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -23,11 +23,21 @@ Long-running AI coding projects drift: files pile up without feature mapping, pl
 
 **project-nav** closes that loop inside DSH: the agent maintains a workspace-level governance layer — every change passes the architecture gate and scope gate first, then gets closed out, aligned, and never left dangling.
 
+## 🧭 Design principle: architecture is the core, everything else is auxiliary (v0.6.0 convergence)
+
+- **Core (non-negotiable)** — index (architecture truth) + **anchor gate** (think about the architecture before acting) + **ADR** (decisions leave a trace) + **repeat-patch gate** (the same anchor patched repeatedly → forced back to the architecture).
+- **Auxiliary (good enough is enough)** — concurrency leases & queueing, scope fingerprints, doc derivation, reference-doc routing, map rendering. They serve the core and never add a second hurdle.
+- **Complexity budget — the only trimming criterion is whether the model must read, remember, or follow more**:
+  - derivable → **no second ledger** (a patch IS a `done` action carrying an anchor; `nav-patches.json` is gone);
+  - mergeable → **no extra tool** (feature/module registration and field updates merged into `nav_update` upsert; reference-doc register and query merged into `nav_docs`);
+  - inferable → **no forced parameter** (a single-target scope auto-anchors; only ambiguous scopes must pass `anchor=`).
+- **Why** — this plugin is code a model has to read. Too complex → a weak model cannot read or follow it; a strong model needs fewer hard constraints.
+
 ## ✨ Features
 
 - 🗺️ **Bidirectional governance map** — project→module→feature→file four-way cross index, single source of truth, one map for everything
 - 🏛️ **Architecture doc layer (ecosystem, NOT in this package)** — L1 overview + L2 feature chains (through-style flow, line-number evidence) with fingerprint-expired auto-regeneration are provided by the companion arch-view skill; this repo ships the index + governance loop only
-- 🏛️ **Architecture-first protocol** — a task must anchor to an architecture node before it enters the ledger; no anchor = architecture gap → revise architecture first; ≥3 patches on the same node force a full review
+- 🏛️ **Architecture-first protocol (v0.5.0+)** — a task must anchor to an architecture node before it enters the ledger: a single-target scope auto-anchors, an ambiguous multi-target scope must pass `anchor=`; ≥3 patches on one anchor since the last architecture decision trip the **repeat-patch gate**; `nav_adr` records the decision and resets the counter
 - 🎯 **Governance-first action ledger** — `nav_plan` → `begin` → change → `done` (with `abort`); open actions = drift signal, marked red on the map; **one in-progress action per session**
 - 🔍 **Scope fingerprints (v0.4.0)** — `begin` records size/mtime/sha1 for every file in scope; `done` reports `⚠ Scope drift` (modified / vanished / appeared) and `nav_status` shows live drift for running actions. Leases stop two sessions from starting together; fingerprints catch files moved underneath a running action.
 - 🧵 **Multi-session concurrency (v0.3.0)** — the lock is per **scope**, not per workspace: sessions with disjoint scopes really do run in parallel, and only overlapping scopes queue (same feature / same module / same file / the same file reached through the index). `nav_mark begin wait=true` blocks until the holder finishes, a crashed session's lease expires and self-heals, and the ledger holds a cross-process file lock so concurrent planners never lose an action
@@ -37,19 +47,19 @@ Long-running AI coding projects drift: files pile up without feature mapping, pl
 - 🌳 **Progressive mindmap** — self-contained offline HTML, no CDN, double-click to open
 - 🩺 **Disk drift probe** — files registered but missing on disk (STALE) surfaced at a glance, dual path-shape compatible
 
-## 🔧 The 12 tools
+## 🔧 The 10 tools (single responsibility)
 
 | Tool | Purpose |
 |------|---------|
 | `nav_query` | Look up structure/modules/features before changes (scope gate + mainline warning + **cross-session occupancy notice**) |
-| `nav_plan` | Governance-first gate: register action (scope pre-check + anti-goal hard rejection) |
-| `nav_mark` | Action lifecycle: begin / done / abort (begin carries the scope-conflict gate, lease, and queueing) |
-| `nav_update` | Incremental feature ↔ file mapping updates |
-| `nav_add_feature` / `nav_add_module` | Register feature / module (orphan hints, dual-mount warnings) |
-| `nav_add_doc` / `nav_docs` | Register / query reference docs (dead links rejected) |
+| `nav_plan` | Governance-first gate: register action (**anchor gate** + scope pre-check + anti-goal rejection + **repeat-patch gate**) |
+| `nav_mark` | Action lifecycle: begin / done / abort (begin: scope-conflict gate + lease + queueing; done: scope drift + patch pressure) |
+| `nav_adr` | **Architecture decision record** (anchor + reason + decision + impact); recording it resets that anchor's patch counter |
+| `nav_update` | **The single registration entry point (upsert)**: update an existing entry, or create a feature/module (feature: `files=`; module: `features=`/`project=`) |
+| `nav_docs` | Reference docs: pass `title`+`path`+`when` to register (`when` is the routing rule); otherwise list or rank by `task` |
 | `nav_map` | Governance map: `text` (agent orientation) / `html` (human mindmap) |
-| `nav_sync_docs` | Auto-align PROJECT.md (marked sections derived) |
-| `nav_status` | Health snapshot: coverage + open actions + STALE files + **cross-session concurrency view (who holds which scope)** |
+| `nav_sync_docs` | Auto-align PROJECT.md (derived sections: feature map + mainline vector + **architecture decisions**) |
+| `nav_status` | Health snapshot: coverage + open actions + STALE files + **cross-session concurrency view** |
 | `nav_set_vector` | Set the mainline vector |
 
 ## 🔄 Governance loop

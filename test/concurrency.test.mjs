@@ -280,11 +280,20 @@ test('legacy entries (no owner) keep the old global single-lock behaviour', asyn
   assert.match(plan, /ACT-002|live action/, 'a legacy holder still blocks planning: ' + plan)
 })
 
-test('architecture-first: nav_plan refuses an action with no anchor', async () => {
+test('architecture-first: ambiguous scope still refuses to plan without an anchor', async () => {
   const { tools } = await booted()
-  const out = await call(tools, 'nav_plan', { task: 'no anchor', features: 'PN-F01' }, 'session-A')
+  const out = await call(tools, 'nav_plan', { task: 'no anchor', features: 'PN-F01,DM-F01' }, 'session-A')
   assert.match(out, /requires anchor/, out)
   assert.doesNotMatch(out, /ACT-\d+/)
+})
+
+test('architecture-first: a single-target scope is auto-anchored (less friction, same gate)', async () => {
+  const { root, tools } = await booted()
+  const out = await call(tools, 'nav_plan', { task: 'auto anchored', features: 'PN-F01' }, 'session-A')
+  assert.match(out, /自动取自 scope 的唯一功能 PN-F01/, out)
+  const led = shared.loadActions(root)
+  assert.equal(led.actions[0].anchor, 'PN-F01')
+  assert.equal(led.actions[0].anchorKind, 'feature')
 })
 
 test('architecture-first: nav_plan refuses an anchor that is not an architecture node', async () => {
@@ -321,21 +330,23 @@ test('architecture-first: three patches on one anchor trigger the repeat-patch g
     const done = await call(tools, 'nav_mark', { id, action: 'done' }, 'session-A')
     if (i === 3) assert.match(done, /3 次补丁/, done)   // threshold message wording
   }
-  const logged = shared.loadPatches(root)
-  assert.equal(logged.patches.length, 3, 'each done writes one patch entry')
+  const logged = shared.loadActions(root).actions.filter(a => a.status === 'done' && a.anchor === 'PN-F01')
+  assert.equal(logged.length, 3, 'done actions carrying an anchor ARE the patch log — no separate ledger to drift')
   const next = await call(tools, 'nav_plan', { task: 'patch 4', features: 'PN-F01', anchor: 'PN-F01' }, 'session-A')
   assert.match(next, /计数闸触发/, next)
   assert.match(next, /nav_adr/, next)
 })
 
-test('architecture-first: patch log is idempotent per action id', async () => {
+test('architecture-first: a closed action cannot be closed twice (patch counted once)', async () => {
   const { root, tools } = await booted()
   await call(tools, 'nav_plan', { task: 'once', features: 'PN-F01', anchor: 'PN-F01' }, 'session-A')
   await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
-  await call(tools, 'nav_mark', { id: 'ACT-001', action: 'done' }, 'session-A')
-  await call(tools, 'nav_mark', { id: 'ACT-001', action: 'done' }, 'session-A')   // second close must not double-count
-  const logged = shared.loadPatches(root)
-  assert.equal(logged.patches.length, 1)
+  const first = await call(tools, 'nav_mark', { id: 'ACT-001', action: 'done' }, 'session-A')
+  assert.match(first, /done/)
+  const second = await call(tools, 'nav_mark', { id: 'ACT-001', action: 'done' }, 'session-A')   // must not double-count
+  assert.match(second, /ERROR/, second)
+  const doneCount = shared.loadActions(root).actions.filter(a => a.status === 'done' && a.anchor === 'PN-F01').length
+  assert.equal(doneCount, 1)
 })
 
 test('architecture-first: nav_adr records a decision and resets the anchor counter', async () => {
@@ -356,4 +367,46 @@ test('architecture-first: nav_adr records a decision and resets the anchor count
   const after = await call(tools, 'nav_plan', { task: 'after adr', features: 'PN-F01', anchor: 'PN-F01' }, 'session-B')
   assert.doesNotMatch(after, /计数闸触发/, 'a decision must reset the anchor pressure')
 })
+test('consolidated: nav_update creates AND updates features and modules (one registration tool)', async () => {
+  const { root, tools } = await booted()
+  const f = await call(tools, 'nav_update', { target: 'XX-F09', name: 'new feature', userView: 'u', systemView: 's', files: 'src/new.js' }, 'session-A')
+  assert.match(f, /created/, f)
+  const m = await call(tools, 'nav_update', { target: 'XX-M01', features: 'XX-F09', project: 'DEMO', name: 'mod' }, 'session-A')
+  assert.match(m, /created/, m)
+  const idx = shared.loadIndex(root)
+  assert.deepEqual(idx.indexes.featureToFiles['XX-F09'], ['src/new.js'])
+  assert.deepEqual(idx.indexes.moduleToFeatures['XX-M01'], ['XX-F09'])
+  assert.ok(idx.indexes.projectToModules.DEMO.includes('XX-M01'), 'module attached to project')
+  const upd = await call(tools, 'nav_update', { target: 'XX-F09', field: 'status', value: 'stable' }, 'session-A')
+  assert.match(upd, /Updated feature XX-F09/, upd)
+  assert.equal(shared.loadIndex(root).descriptions['XX-F09'].status, 'stable')
+  const bad = await call(tools, 'nav_update', { target: 'XX-F09' }, 'session-A')
+  assert.match(bad, /requires field \+ value/, bad)
+})
+
+test('consolidated: nav_docs registers and queries in one tool', async () => {
+  const { tools } = await booted()
+  const target = join(process.cwd(), 'package.json')
+  const reg = await call(tools, 'nav_docs', { title: 'handbook', path: target, when: '并发, 指纹, 闸门' }, 'session-A')
+  assert.match(reg, /Registered DOC-001/, reg)
+  const dup = await call(tools, 'nav_docs', { title: 'x', path: target, when: 'y' }, 'session-A')
+  assert.match(dup, /already registered/, dup)
+  const ranked = await call(tools, 'nav_docs', { task: '我要改并发与指纹' }, 'session-A')
+  assert.match(ranked, /DOC-001/, ranked)
+  const dead = await call(tools, 'nav_docs', { title: 't', path: join(process.cwd(), 'no-such-file.md'), when: 'w' }, 'session-A')
+  assert.match(dead, /does not exist/, dead)
+  const partial = await call(tools, 'nav_docs', { title: 't' }, 'session-A')
+  assert.match(partial, /requires title \+ path \+ when/, partial)
+})
+
+test('consolidated: nav_sync_docs derives an ADR section from the architecture ledger', async () => {
+  const { root, tools } = await booted()
+  await call(tools, 'nav_adr', { anchor: 'PN-F01', reason: 'r', decision: '抽层', impact: 'PN-M01' }, 'session-A')
+  const out = await call(tools, 'nav_sync_docs', {}, 'session-A')
+  assert.match(out, /auto-section aligned/, out)
+  const md = readFileSync(join(root, 'PROJECT.md'), 'utf-8')
+  assert.match(md, /架构决策（ADR，自动对齐）/, md)
+  assert.match(md, /ADR-001/)
+})
+
 process.on('exit', () => { try { rmSync(join(tmpdir(), 'nav-conc-'), { recursive: true, force: true }) } catch {} })
