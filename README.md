@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.7.2-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.7.3-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -37,7 +37,7 @@ AI coding 的长期项目会漂移：文件越堆越多却没有功能映射、�
 
 - 🗺️ **双向治理地图**：项目→模块→功能→文件 四维交叉索引，单一数据真身，一张图看清全部结构
 - 🏛️ **架构文档层（生态配合，不在本包内）**：L1 项目总览 + L2 特征主链（贯通式流程、行号级证据）、指纹过期自动重生成，由配套的 arch-view 技能提供——本仓库只交付索引与治理闭环
-- 🏛️ **架构先行协议（v0.5.0 起）**：任务必须锚定架构节点才入账——单目标 scope 自动取锚，多目标必须显式 `anchor=`；同锚点自最近架构决策以来 ≥3 次补丁 → **计数闸**强制回架构层；`nav_adr` 记录架构决策并重置计数
+- 🏛️ **架构先行协议（v0.5.0 起）**：任务必须锚定架构节点才入账——单目标 scope 自动取锚，多目标必须显式 `anchor=`；同锚点自最近架构决策以来 ≥3 次**补丁** → **计数闸**强制回架构层；`nav_adr` 记录架构决策并重置计数。**「补丁」只认真的动过东西**（v0.7.3）：done 时指纹证明 scope 内文件一个都没变的验证/记账动作不计入——否则会逼出没有架构内容的 ADR，ADR 通胀后核心决策账本就成噪音
 - 🎯 **治理事务环**：`nav_plan` → `begin` → 改动 → `done`（abort 兜底），未完成动作 = 漂移信号，地图标红；**每会话同时只允许一个 in_progress**
 - 🧵 **多会话并发（v0.3.0）**：锁的粒度是 **scope 而不是工作区**——不相交的会话真并行干活，只有 scope 相交（同功能 / 同模块 / 同文件 / 索引派生出的同一文件）才排队；`nav_mark begin wait=true` 可阻塞等待，崩溃会话的租约自动过期自愈，账本带跨进程文件锁（并发立项不再丢动作）
 - 🔍 **scope 文件指纹（v0.4.0）**：`begin` 记录 scope 内每个文件的 size/mtime/sha1，`done` 比对并报 `⚠ Scope drift`（被改/被删/新出现三类），运行中动作由 `nav_status` 实时显示漂移——租约防「同时开工」，指纹防「开工期间被别人动过」

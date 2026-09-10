@@ -592,4 +592,46 @@ test('scope files: a genuinely new file is still surfaced as unregistered', asyn
   assert.match(done, /索引外文件/, 'close-out must still ask to register a genuinely new file')
 })
 
+// ---- the repeat-patch gate counts PATCHES, not bookkeeping (v0.7.3) ----
+// Live evidence: a pure verification action (whose own close-out said "none of the scoped
+// files changed") still incremented its anchor's patch counter, pushing it toward the gate.
+// Counting that would force an architecture decision for work that never happened.
+
+test('repeat-patch gate: an action that changed nothing is not counted as a patch', async () => {
+  const { root, tools } = await booted()
+  writeFileSync(join(root, 'work.mjs'), 'v1')
+  const plan = await call(tools, 'nav_plan', { task: 'look only', anchor: 'PN-F01', files: 'work.mjs' }, 'session-A')
+  const id = plan.match(/ACT-\d+/)[0]
+  await call(tools, 'nav_mark', { id, action: 'begin' }, 'session-A')
+  await call(tools, 'nav_mark', { id, action: 'done' }, 'session-A')
+  const ledger = shared.loadActions(root)
+  assert.equal(ledger.actions.find(a => a.id === id).noChange, true, 'byte-identical scope must be recorded as no-change')
+  const pr = shared.repeatPressure(shared.loadArch(root), ledger.actions, 'PN-F01')
+  assert.equal(pr.count, 0, 'a no-change action must not count toward the gate')
+  assert.deepEqual(pr.skipped, [id], 'and it must be reported as skipped, not silently dropped')
+})
+
+test('repeat-patch gate: an action that did change a scoped file still counts', async () => {
+  const { root, tools } = await booted()
+  writeFileSync(join(root, 'work.mjs'), 'v1')
+  const plan = await call(tools, 'nav_plan', { task: 'real patch', anchor: 'PN-F01', files: 'work.mjs' }, 'session-A')
+  const id = plan.match(/ACT-\d+/)[0]
+  await call(tools, 'nav_mark', { id, action: 'begin' }, 'session-A')
+  writeFileSync(join(root, 'work.mjs'), 'v2 — actually patched')
+  await call(tools, 'nav_mark', { id, action: 'done' }, 'session-A')
+  const ledger = shared.loadActions(root)
+  assert.notEqual(ledger.actions.find(a => a.id === id).noChange, true, 'a real change must not be marked no-change')
+  assert.equal(shared.repeatPressure(shared.loadArch(root), ledger.actions, 'PN-F01').count, 1, 'a real patch must count')
+})
+
+test('repeat-patch gate: with no fingerprint evidence the action still counts (conservative)', async () => {
+  const { root } = await booted()
+  writeFileSync(join(root, '.internal', 'nav-actions.json'), JSON.stringify({
+    version: '1.1',
+    actions: [{ id: 'ACT-900', status: 'done', anchor: 'PN-F01', task: 'legacy action', completedAt: new Date().toISOString() }]
+  }))
+  const ledger = shared.loadActions(root)
+  assert.equal(shared.repeatPressure(shared.loadArch(root), ledger.actions, 'PN-F01').count, 1, 'no evidence must never weaken the gate')
+})
+
 process.on('exit', () => { try { rmSync(join(tmpdir(), 'nav-conc-'), { recursive: true, force: true }) } catch {} })

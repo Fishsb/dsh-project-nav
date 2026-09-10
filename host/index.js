@@ -514,6 +514,15 @@ export function apply(ctx, config) {
             a.completedAt = new Date().toISOString()
             a.lease = null
             if (scopeDrift && !scopeDrift.ok) a.drift = { at: a.completedAt, changed: scopeDrift.changed, removed: scopeDrift.removed, added: scopeDrift.added }
+            // Positive evidence that this action patched NOTHING: the fingerprint proved the scope
+            // is byte-identical. The repeat-patch gate counts *patches*, so a bookkeeping action
+            // (a verification pass) must not push its anchor toward the threshold — false pressure
+            // ends in hollow ADRs, and a diluted decision ledger is the same "alarm fatigue" failure
+            // as a permanent false STALE. No scopeState = no proof, so it keeps counting.
+            if (scopeDrift && a.scopeState
+              && scopeDrift.changed.length === 0 && scopeDrift.removed.length === 0 && scopeDrift.added.length === 0) {
+              a.noChange = true
+            }
             // Delta close-out (OpenSpec archive semantics): surface index deltas the
             // agent must merge before this change counts as synced.
             const f2files = index.indexes?.featureToFiles || {}

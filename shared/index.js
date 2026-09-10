@@ -811,18 +811,26 @@ export function lastDecisionFor(arch, anchor) {
 }
 
 /**
- * 计数闸：同一锚点自「最近一次架构决策」以来累计的补丁数。
- * 补丁不单独建账本——**已完结且带锚点的动作就是补丁**（done 动作的投影），
+ * 计数闸：同一锚点自「最近一次架构决策」以来累计的**补丁**数。
+ * 补丁不单独建账本——**已完结、带锚点、且真的动过东西的动作**就是补丁（done 动作的投影），
  * 直接从动作账本推导，少一份要维护会漂移的数据。
+ *
+ * 「动过东西」只认**正面证据**：done 时指纹证明 scope 内 changed/removed/added 三者全空
+ * （动作上记 `noChange`），则该动作是验证/记账而非补丁，不计入。没有证据（如空 scope 无
+ * scopeState）一律照旧计入——宁可保守多计，也不弱化闸门。
+ * 为什么较真：计数闸的用途是发现「同一死胡同反复打补丁」；把没动过东西的动作算进去，
+ * 会逼出没有架构内容的 ADR，ADR 通胀后核心决策账本就成了噪音。
  */
 export function repeatPressure(arch, actions, anchor, { threshold = REPEAT_PATCH_THRESHOLD } = {}) {
   const a = normalizePath(String(anchor || ''));
   const since = lastDecisionFor(arch, anchor);
   const sinceAt = since?.createdAt || null;
-  const list = (actions || []).filter(x => x.status === 'done'
+  const done = (actions || []).filter(x => x.status === 'done'
     && normalizePath(String(x.anchor || '')) === a
     && (!sinceAt || String(x.completedAt || '') > String(sinceAt)));
-  return { anchor: a, count: list.length, threshold, exceeded: list.length >= threshold, sinceDecision: since ? since.id : null, patches: list.map(p => p.id) };
+  const list = done.filter(x => x.noChange !== true);
+  const skipped = done.filter(x => x.noChange === true).map(x => x.id);
+  return { anchor: a, count: list.length, threshold, exceeded: list.length >= threshold, sinceDecision: since ? since.id : null, patches: list.map(p => p.id), skipped };
 }
 // ---- reference docs registry (project reference foundation) ----
 
