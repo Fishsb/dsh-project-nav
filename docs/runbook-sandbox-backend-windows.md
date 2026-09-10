@@ -28,7 +28,16 @@ D:\lk\tools\dsh-web.cmd        # 现唯一启动方式；无自启 —— 重启
 
 **回归到边界**：前置门已开 → profile `cordis.patch.yml` 已写 `autoBindWorkspace: true` + `boundaryWorkspaces: 'project-nav'`（YAML 解析 + 插件 Config schema 双校验通过）。**重启 dsh-web** 后按本文 §四与 `plan-workspace-boundary-binding.md` §8 验收。
 
-**已知缺口（不在本文件修复范围）**：nssm 卸载后**没有自启** —— 重启电脑后 GUI 不会自动回来。原先 `switch-dsh-web-to-user.ps1` 的 onlogon 计划任务思路仍成立（且同样满足 logon SID 要求），但该脚本以"停用 nssm 服务"为前提、服务已不存在 → 需按新形态重写或另走一条自启路径。
+**已知缺口（nssm 卸载的后果，不属边界本身）**：
+
+1. **`dsh-web` 无自启** —— 重启电脑后 GUI 不会自动回来，现靠手动 `D:\lk\tools\dsh-web.cmd`。
+2. **连带损伤：`dsh-bge-embed`（`127.0.0.1:9915`，守藏记忆的本地 bge-m3 向量后端）随 nssm 一起消失** —— 该服务原为 `nssm AUTO_START`，卸载后 9915 无监听，记忆 **dense 召回静默退化为纯词法**（`scheduler.ts` 里 `embedBaseUrl` 仍指 9915）。**已恢复并实证**：新建启动件 `D:\lk\tools\bge-embed.cmd`（与 `dsh-web.cmd` 同一约定，ASCII-only；无 nssm、无自启），
+   ```
+   D:\AI\venv-bge\Scripts\python.exe D:\lk\deepseek\tools\bge-m3-openai-server-gpu.py D:\AI\models\bge-m3 1024 9915
+   ```
+   实测：`/health` → `provider=DmlExecutionProvider`（GPU）、`dims=1024`；批量 3 条 361ms；语义自检 `cos(排障要先取真因, debug 时先定位根因)=0.62` > `cos(…, 今天天气不错)=0.39`（**近义高于无关，鉴别力在**）。
+   > 踩坑留痕：第一版自检用 PowerShell 管道取向量，`$r.data | % { $_.embedding }` 会把 1024 维数组**展平成标量流**，算出的余弦恒为 ±1.0（假数据）。**这类"看起来是模型的错"的结果，先怀疑测量代码**；换 node 直取 `data[i].embedding` 才可信。
+3. 原先 `switch-dsh-web-to-user.ps1` 的 onlogon 计划任务思路仍成立（且同样满足 logon SID 要求），但该脚本以"停用 nssm 服务"为前提、服务已不存在 → 需按新形态重写，或另走一条自启路径（**待用户拍板**）。
 
 ---
 
