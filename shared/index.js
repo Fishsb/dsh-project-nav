@@ -3,6 +3,7 @@
 // only node: builtins, so this file resolves from any loading context.
 
 import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync, renameSync, openSync, closeSync, unlinkSync, rmSync } from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { readdirSync } from 'node:fs';
 import { dirname, resolve, relative } from 'node:path';
@@ -62,7 +63,18 @@ function readLockFile(p) {
  * is a single chain, so a nested acquire would deadlock. All mutation entry points
  * below obey this by touching exactly one file per section.
  */
+/**
+ * Nested-acquire guard. The in-process queue is a SINGLE chain, so a locked section that
+ * acquires another lock waits for itself: the daemon hangs for ever (not merely until the
+ * timeout). Tracked through async context, so a concurrent caller that is merely waiting its
+ * turn is NOT misreported as nesting — only a lock taken inside another lock trips it.
+ */
+const lockContext = new AsyncLocalStorage();
+
 export async function withFileLock(rootPath, name, fn) {
+  if (lockContext.getStore()) {
+    throw new Error(`[project-nav] nested lock acquire: "${name}" was requested inside another locked section. A locked section must touch exactly one file (the queue is a single chain, so nesting deadlocks instead of failing).`);
+  }
   return enqueue(async () => {
     const lockPath = lockPathFor(rootPath, name);
     mkdirSync(dirname(lockPath), { recursive: true });
@@ -79,10 +91,25 @@ export async function withFileLock(rootPath, name, fn) {
       } catch (e) {
         if (e && e.code === 'EEXIST') {
           const holder = readLockFile(lockPath);
-          if (holder && holder.token === token) return await fn();   // re-entrant same holder
           let aged = false;
           try { aged = Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS; } catch { aged = true; }
-          if (aged) { try { unlinkSync(lockPath); } catch { /* another waiter won the break */ } continue; }
+          if (aged) {
+            // Break by RENAME, then verify identity. A stat-then-unlink races: the aged holder
+            // could release and a third process create a fresh lock between those two calls, so
+            // the unlink would delete THAT lock and two writers would sit inside the section.
+            // Moving the exact file we are about to drop and comparing its token closes the
+            // window; if we moved somebody else's fresh lock, it is put back and we back off.
+            const graveyard = `${lockPath}.stale-${token}`;
+            let moved = null;
+            try { renameSync(lockPath, graveyard); moved = readLockFile(graveyard); } catch { /* another waiter won the break */ }
+            if (moved && holder && moved.token !== holder.token) {
+              try { renameSync(graveyard, lockPath); } catch { /* the fresh holder re-created it */ }
+              await sleep(LOCK_WAIT_MS);
+              continue;
+            }
+            try { unlinkSync(graveyard); } catch { /* already gone */ }
+            continue;
+          }
           if (Date.now() - started > LOCK_TIMEOUT_MS) {
             throw new Error(`[project-nav] lock busy for ${LOCK_TIMEOUT_MS}ms on ${name} (${lockPath}, held by pid ${holder?.pid ?? '?'} since ${holder?.at ?? '?'}). Another session is writing the same file; retry in a moment.`);
           }
@@ -92,7 +119,9 @@ export async function withFileLock(rootPath, name, fn) {
         throw e;
       }
     }
-    try { return await fn(); } finally { try { rmSync(lockPath, { force: true }); } catch { /* lock file already gone */ } }
+    try {
+      return await lockContext.run(true, () => fn());
+    } finally { try { rmSync(lockPath, { force: true }); } catch { /* lock file already gone */ } }
   });
 }
 
@@ -176,13 +205,10 @@ export function createEmptyIndex() {
       fileToFeature: {},
       featureToFiles: {},
       moduleToFeatures: {},
-      projectToModules: {},
-      functionToModule: {}
+      projectToModules: {}
     },
     descriptions: {},
     moduleMeta: {},
-    unmappedFiles: [],
-    staleEntries: [],
     metadata: { totalFiles: 0, totalFeatures: 0, totalModules: 0, totalProjects: 0, coverage: 'empty' }
   };
 }
@@ -314,6 +340,9 @@ export function recomputeMetadata(index) {
   m.totalModules = Object.keys(index.indexes?.moduleToFeatures || {}).length;
   m.totalProjects = Object.keys(index.indexes?.projectToModules || {}).length;
   m.coverage = m.totalFeatures === 0 ? 'empty' : (m.totalModules > 0 && m.totalProjects > 0 ? 'partial' : 'features-only');
+  // Stamp the recomputation time too: it used to keep whatever the previous writer's value was
+  // (the live index carried a 2026-09-08 stamp while its tables moved on), which reads as drift.
+  m.generated = new Date().toISOString();
   return m;
 }
 
@@ -349,7 +378,12 @@ export function selfOwner(sessionId, extra = {}) {
 
 export function sessionLabel(sessionId) {
   const s = String(sessionId || '');
-  return s ? s.slice(0, SESSION_LABEL_LEN) : 'unknown';
+  if (!s) return 'unknown';
+  // DSH session ids all start with the literal "session-" (session-5634c6bb-…), so slicing the
+  // first 8 characters labelled EVERY session the same ("session-") and the concurrency
+  // messages could not tell two holders apart. Slice the distinctive part instead.
+  const core = s.startsWith('session-') ? s.slice('session-'.length) : s;
+  return core.slice(0, SESSION_LABEL_LEN) || s.slice(0, SESSION_LABEL_LEN);
 }
 
 /** Is this action a live, unexpired lock on its scope? */
@@ -637,13 +671,21 @@ export function scopeFiles(index, scope = {}, rootPath = '.') {
   }
   const filtered = [...out].filter(Boolean);
   if (!index) return filtered;
-  // drop the project/module NAMES nav_plan accepts as scope entries — they are not files
-  return filtered.filter(f => {
-    const parts = f.split('/');
-    if (parts.length > 1 && dirs.has(parts[0].toLowerCase())) return false;
-    for (const proj of Object.keys(index.projectToModules || {})) if (f === proj) return false;
-    return true;
-  });
+  // Drop the project/module NAMES that nav_plan also accepts as scope entries — they are not
+  // files. The match must be EXACT (project name / project directory basename / module name):
+  // the previous shape compared the first path SEGMENT against the project directories, which
+  // also deleted genuine index keys. An index may spell a file workspace-relative
+  // ("project-nav/host/index.js"), and those legitimately start with the project directory, so
+  // the fingerprint silently came out empty. v0.7.4 measured 12 of 18 features (every feature
+  // of project-nav and shoucang) with zero fingerprintable paths: drift went unreported and the
+  // patch counter lost its noChange evidence. The v0.4.0 contract says the scope is
+  // 「索引推出文件 ∪ 字面量路径 ∪ glob 展开」 — this restores the first leg.
+  const bare = new Set([
+    ...Object.keys(index.indexes?.projectToModules || {}),
+    ...Object.keys(index.indexes?.moduleToFeatures || {}),
+    ...dirs
+  ].map(n => String(n).toLowerCase()));
+  return filtered.filter(f => !bare.has(f.toLowerCase()));
 }
 
 /** Minimal glob to RegExp for scope patterns (only * ? ** are meaningful here). */
@@ -739,7 +781,15 @@ export function verifyScopeFingerprint(rootPath, index, scopeState, scope = null
   const changed = []; const removed = []; const added = [];
   for (const [f, b] of Object.entries(before)) {
     const a = now[f];
-    if (a === undefined || a === 'missing') { removed.push(f); continue; }
+    if (a === undefined || a === 'missing') {
+      // "vanished" needs evidence that the file existed at begin. A literal scope entry that was
+      // ALREADY missing then (a file the task was going to create) must not be reported as gone
+      // just because the task chose not to create it — the same spirit as the empty-scope rule
+      // ("nothing to compare" ≠ "everything vanished"). A drift alarm only stays useful while it
+      // is trustworthy.
+      if (typeof b === 'object' && b !== null) removed.push(f);
+      continue;
+    }
     if (b === 'missing' || b === 'unreadable' || typeof b !== 'object') continue;
     if (typeof a !== 'object') { changed.push(f); continue; }
     if (b.size !== a.size || b.mtime !== a.mtime || b.sha1 !== a.sha1) changed.push(f);
@@ -1073,22 +1123,39 @@ export function findStaleFiles(index, rootPath) {
   const m2f = index.indexes?.moduleToFeatures || {};
   const f2files = index.indexes?.featureToFiles || {};
   const paths = index.projectPaths || {};
-  const fileToProject = {};
+  // feature → owning project (first declaration wins), derived from project → module → feature.
+  const featureProject = {};
   for (const [proj, mods] of Object.entries(p2m)) {
     for (const mod of mods) {
       for (const code of (m2f[mod] || [])) {
-        for (const f of (f2files[code] || [])) {
-          if (!fileToProject[f]) fileToProject[f] = proj;
-        }
+        if (!featureProject[code]) featureProject[code] = proj;
       }
     }
   }
+  // Probe EVERY feature in featureToFiles. Walking project→module→feature skipped orphan
+  // features entirely (a registered capability no module lists), so a file deleted from an
+  // orphan stayed invisible forever. One entry per file: a file shared by several features is
+  // reported once, not once per owner.
+  const fileInfo = new Map();
+  for (const [code, files] of Object.entries(f2files)) {
+    for (const f of (files || [])) {
+      const cur = fileInfo.get(f);
+      if (!cur) fileInfo.set(f, { proj: featureProject[code] || null, codes: [code] });
+      else {
+        cur.codes.push(code);
+        if (!cur.proj && featureProject[code]) cur.proj = featureProject[code];
+      }
+    }
+  }
+  // An orphan has no project to resolve against, so every declared project root is a candidate
+  // (conservative: never report STALE for a file that resolves under ANY known root).
+  const allRoots = [rootPath, ...Object.values(paths).map(p => resolve(rootPath, p))];
   const stale = [];
-  for (const [file, proj] of Object.entries(fileToProject)) {
-    const base = paths[proj] ? resolve(rootPath, paths[proj]) : rootPath;
+  for (const [file, info] of fileInfo) {
+    const bases = info.proj && paths[info.proj] ? [resolve(rootPath, paths[info.proj]), rootPath] : allRoots;
     try {
-      if (!existsSync(resolve(base, file)) && !existsSync(resolve(rootPath, file))) {
-        stale.push(`${file} [${proj}]`);
+      if (!bases.some(base => existsSync(resolve(base, file)))) {
+        stale.push(info.proj ? `${file} [${info.proj}]` : `${file} [orphan feature ${info.codes.join('/')}]`);
       }
     } catch { /* unreadable path — skip */ }
   }
@@ -1102,7 +1169,7 @@ export function findStaleFiles(index, rootPath) {
 export function renderProjectDocSection(index, { vector = null, arch = null } = {}) {
   const { projects, orphanFeatures } = buildTree(index);
   const m2f = index.indexes?.moduleToFeatures || {};
-  const lines = ['<!-- nav:auto:start -->', '## 功能地图（自动对齐，勿手改）', '', '> 本节由 nav_sync_docs 从 .internal/nav-index.json 生成。编辑请走 nav_add_feature / nav_update / nav_add_module，然后重新同步。', ''];
+  const lines = ['<!-- nav:auto:start -->', '## 功能地图（自动对齐，勿手改）', '', '> 本节由 nav_sync_docs 从 .internal/nav-index.json 生成。登记与修改一律走 nav_update（upsert：新功能给 files=，新模块给 features=/project=，退役给 retire=true），然后重新同步。', ''];
   for (const p of projects) {
     const nf = p.modules.reduce((n, m) => n + m.features.length, 0);
     lines.push(`### ${p.name}（${p.modules.length} 模块 / ${nf} 功能）`, '');
@@ -1155,8 +1222,17 @@ function esc(s) {
  * Progressive disclosure: <details open> at project/module level, files collapsed.
  * Status coloring: red = inside an open action scope; vector summary in header.
  */
-export function renderMapHtml(index, { title = 'Project Nav Map', vector = null, openActions = null } = {}) {
-  const { projects, orphanFeatures } = buildTree(index);
+export function renderMapHtml(index, { title = 'Project Nav Map', vector = null, openActions = null, target = '' } = {}) {
+  const built = buildTree(index);
+  // Same narrowing rule as renderTreeText, so `target` means ONE thing across both renderers
+  // (it used to be ignored here: a "zoom into PN-P01" map still contained every other project).
+  const t = String(target || '').trim().toLowerCase();
+  const projects = t
+    ? built.projects.filter(p => p.name.toLowerCase().includes(t) || p.modules.some(m => m.name.toLowerCase().includes(t)))
+    : built.projects;
+  const orphanFeatures = t
+    ? built.orphanFeatures.filter(f => String(f.code).toLowerCase().includes(t) || String(f.fname || '').toLowerCase().includes(t))
+    : built.orphanFeatures;
   const S = openActions || { feats: new Set(), mods: new Set(), files: new Set(), ids: [] };
   const v = vector || {};
   const featHtml = (f) => {
@@ -1171,7 +1247,7 @@ export function renderMapHtml(index, { title = 'Project Nav Map', vector = null,
       return `<li class="file"${fo}>${esc(file)}${ff}</li>`;
     }).join('');
     if (!f.files.length) {
-      const gap = desc ? '' : ' <span class="dim">— 无文件清单/无描述，待登记（nav_update --field files）</span>';
+      const gap = desc ? '' : ' <span class="dim">— 无文件清单/无描述，待登记（nav_update field="files" value="..."）</span>';
       return `<li${style}><details><summary>${esc(f.code)} ${esc(f.fname)}${flag} <span class="dim">(no files)</span></summary>${descHtml}${gap}</details></li>`;
     }
     return `<li${style}><details><summary>${esc(f.code)} ${esc(f.fname)}${flag} <span class="dim">(${f.files.length} files)</span></summary>${descHtml}<ul>${files}</ul></details></li>`;
@@ -1222,6 +1298,7 @@ ${S.ids.length ? `<div class="open-actions">🔴 Open actions（红=在未完结
 <ul style="list-style:none;padding-left:0">
 ${projects.map(projHtml).join('\n')}
 ${orphanHtml}
+${(!projects.length && !orphanFeatures.length) ? '<p class="dim">No project or module matching this target.</p>' : ''}
 </ul>
 <div class="legend">生成自 .internal/nav-index.json（agent 自治理索引）· 🔴 = open action 范围内 · 灰字为辅助说明</div>
 </body></html>`;

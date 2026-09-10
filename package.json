@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/project-nav",
-  "version": "0.7.3",
-  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, and a governance-first action ledger. v0.4.0: multi-session concurrency (per-scope leases + queueing) and scope file fingerprints. v0.5.0: architecture-first protocol (anchor gate, repeat-patch gate, nav_adr decision ledger). v0.6.0: convergence — architecture stays the core and everything else is auxiliary (10 tools, 5 data files). v0.7.0: every read-modify-write of shared state runs under a per-target file lock (index / docs / vector / ADR ledger / PROJECT.md), a lock whose owner died is broken by age, and the acquire loop waits asynchronously instead of blocking the event loop. v0.7.1: retirement semantics (nav_update retire=true) so a deleted feature/module/project can actually leave the index and cascade. v0.7.2: one resolver for scope files (indexedOwnersOf). v0.7.3: the repeat-patch gate counts patches — an action whose fingerprint proves it changed nothing is no longer counted, so bookkeeping passes stop manufacturing hollow ADRs.",
+  "version": "0.7.4",
+  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, and a governance-first action ledger. v0.4.0: multi-session concurrency (per-scope leases + queueing) and scope file fingerprints. v0.5.0: architecture-first protocol (anchor gate, repeat-patch gate, nav_adr decision ledger). v0.6.0: convergence — architecture stays the core and everything else is auxiliary (10 tools, 5 data files). v0.7.0: every read-modify-write of shared state runs under a per-target file lock (index / docs / vector / ADR ledger / PROJECT.md), a lock whose owner died is broken by age, and the acquire loop waits asynchronously instead of blocking the event loop. v0.7.1: retirement semantics (nav_update retire=true) so a deleted feature/module/project can actually leave the index and cascade. v0.7.2: one resolver for scope files (indexedOwnersOf). v0.7.3: the repeat-patch gate counts patches — an action whose fingerprint proves it changed nothing is no longer counted, so bookkeeping passes stop manufacturing hollow ADRs. v0.7.4: two contract holes closed — the scope resolver no longer deletes project-prefixed index keys (fingerprinting had been silently off for 12 of 18 features, so drift went unreported), and a lapsed lease is no longer a dead end (the owner can re-begin, close out late or abort); plus read-side reconciliation (map/retire see the same truth as status), module re-homing, and a lock that breaks by rename + identity check instead of a racy unlink.",
   "type": "module",
   "main": "./host/index.js",
   "exports": {
@@ -22,7 +22,7 @@
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "0.1.2-rc.1"
+    "@deepseek-ai/dsh-tools": ">=0.1.2-rc.1 <0.2.0"
   },
   "keywords": [
     "dsh",

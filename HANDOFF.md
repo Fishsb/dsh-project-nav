@@ -1393,4 +1393,118 @@ ACT-006 是**纯验证动作**——它的指纹明确证明「scope 内文件�
 
 防漂移插件的全部价值在于**它的信号可以被信任**。三次修复不是三个独立 bug，而是同一条原则的三次落实：**只在有证据时才报警，且只在有证据时才计数**。后续新增任何闸门/提示时，先问一句「这个信号的误报率是多少」。
 
-_本文件应随项目推进持续更新。最后更新：2026-09-10 20:05_
+## 38. v0.7.4 体检与收尾：先让信号可信，再让声明对齐（lk 2026-09-10 指令「逐项检查整个项目的架构逻辑生命闭环 + 其他检查出来的问题一次全部修复」）
+
+本轮分两个动作：**ACT-008**（P0+P1 六项）与 **ACT-009**（P2/P3 收尾），两条 ADR：**ADR-005**（scope 契约 + 生命周期出口）、**ADR-006**（锁协议 + 面收敛）。
+
+### 38.1 体检方法：实测，不靠推断
+
+1. **全量回归**：`node --test test/core.test.mjs test/concurrency.test.mjs` → 54/54（体检时点）。
+2. **声明↔实体比对**：`Get-FileHash` 逐文件比对 `host/index.js` / `shared/index.js` / `package.json` / `host/cordis.patch.yml` —— 已安装产物与工作树 **4/4 SHA256 相同**，故「审的就是跑的」。
+3. **真实工作区扫描**：用真实索引逐功能跑 `scopeFiles({features:[码]})` 统计指纹覆盖 → **12/18 功能、3/5 模块恒为空**。
+4. **端到端探针**：把真实 `host/index.js` 编到临时目录、用 in-memory shim 顶掉两个裸包，在**生产同形索引**（fileToFeature 键带项目前缀 + projectPaths）上跑 `nav_plan → begin → 改文件 → done` 全链。
+
+绿区（体检基线，修复后未被破坏）：测试全绿；发布物与源码一致；`.internal/locks/` 0 残留；`findStaleFiles` 空；`PROJECT.md` nav:auto 区与现场重渲染**逐字节相同**；9/9 参考文档路径存在；工具面恰好 10 个。
+
+### 38.2 两个 P0：一处静默失效，一处生命周期死结
+
+| # | 现象（实测） | 根因 | 修法 |
+|---|---|---|---|
+| P0-1 | **12/18 功能 + 3/5 模块的 scope 指纹恒为空**（含 project-nav 全部 PN-F0x）。功能码声明 scope → `begin` 记 `scopeState: null` → 运行中改文件、`done` 端**完全不报 drift**；同一场景改用具名文件 scope 就正确报 `⚠ Scope drift` | `scopeFiles` 末尾按「首段 = 项目目录名就丢弃」过滤，本意是剔除 `nav_plan` 也接受的**项目/模块名**，却把**索引键本身的形态**（workspace 相对 `project-nav/host/index.js`）一起删了 | 改为按登记名（项目名 / 项目目录基名 / 模块名，**大小写无关**）精确剔除；索引推出文件一律保留 |
+| P0-2 | 租约过期后动作**三面皆堵**：`done`→`only "in_progress" can be done`、`abort`→`already "expired"`、`begin`→`only "planned" can begin`。长任务（>TTL，默认 30 分钟）一旦中途没碰 nav 工具，成果**永远无法入账**，且没有任何 renew 工具 | `reconcileActions` 把过期动作写成 `expired`，而 `nav_mark` 三个分支只认 `planned`/`in_progress`/`done` → `expired` 成了没有任何入口的终点态 | `nav_mark` 给 `expired` 补三个出口（**仅 owner**）：`begin` 重取租约 + 重拍指纹、`done` 迟收口（记 `lateCompletion: true`，提示证据仅供参考）、`abort` |
+
+**P0-1 的连带后果**：ADR-004 刚校准的计数闸依赖 `noChange` 正证据（「指纹证明一个都没动」），而指纹恒空 ⇒ 该证据永不产生 ⇒ 假补丁计数回归 ⇒ 又逼出空心 ADR。两个 P0 是同一根线：**核心信号要么失效、要么无法收口**。
+
+**P0-1 为何没被测试拦住**：既有 drift 用例全部用**字面文件** scope，而字面路径会被 `snapshotScopeFiles` 补回来；「功能码 scope × 项目前缀键」这个交叉组合零覆盖。修完即补该组合的用例（含「无变化 ⇒ 记 `noChange` ⇒ 计数闸不计入」的正面证据链）。
+
+### 38.3 P1：一致性缺口（4 项）
+
+| # | 问题 | 证据 | 修法 |
+|---|---|---|---|
+| P1-1 | `findStaleFiles` 对 **orphan 功能**的文件是盲区（只沿 project→module→feature 走） | 造一个不在任何模块下的功能 + 磁盘缺失文件 → 返回 `[]` | 遍历 `featureToFiles` 全集；orphan 无项目可解析 → 所有声明根都是候选（保守不误报）；**每个文件只报一次** |
+| P1-2 | `nav_map` 读**未对账**账本 → 2 小时前崩溃的动作仍标红，而 `nav_status` 同时报 `0 live / Open Actions: none` | 同一账本两个视图互相矛盾 | 渲染前**内存对账**（读侧不写盘） |
+| P1-3 | `nav_update retire` 前置检查同样读未对账账本 → 死会话**假阻塞**退役，随便调一个别的工具后才解锁 | 过期动作仍报 `still referenced by open action` | 同 P1-2 |
+| P1-4 | 退役级联提示「re-home 各模块」**不可执行**：模块→项目挂载是「只写一次」，`nav_update target=M project=B` 直接报错；`features=... project=B` 则**静默忽略** `project=` | 两次尝试后 `projectToModules` 里根本没有 B | 已存在模块支持 `project=` 迁移（自动摘旧挂载）、`project=""` 摘除；并把用法写进 retire 输出 |
+
+### 38.4 P2/P3：契约、声明与锁（12 项）
+
+| # | 问题 | 修法 |
+|---|---|---|
+| P2-1 | `nav_plan` 的 busy/conflict 警告**重复输出两遍**（同一行 `warns.push` 写了两遍） | 去重 |
+| P2-2 | **自动派生区**（PROJECT.md nav:auto）叫用户走 `nav_add_feature / nav_add_module` —— 这两个工具 v0.6.0 已删，而同一文档的 ADR-001 正记录了这次删除 | 文案改为 `nav_update`（upsert）+ `retire=true` |
+| P2-3 | 工具提示用 `nav_update --field files`（CLI 风格，真实参数是 `field=`/`value=`） | 两处改为真实写法 |
+| P2-4 | `nav_map` 的 `level` 是**死参数**（level=module ≡ level=project ≡ 默认）；html 带 `target` 仍渲染全量地图 | 删 `level`（符合「能推断的不强制参数」），`target` 在 text/html 一致生效 |
+| P2-5 | `nav_status`（健康快照）**看不到架构层** —— ADR/计数闸是它自称的核心 | 增加 `Architecture:` 行：决策数 + 最近决策 + **临近/触发计数闸的锚点** |
+| P2-6 | `nav_docs` / `nav_sync_docs` 的相对路径按 **process.cwd** 解析（root 可被 `config.root` 指到别处） | 改按被治理 root 解析 |
+| P2-7 | 声明漂移：README 与索引说 **27** 项测试（实际 54→74）；peer 精确锁 `0.1.2-rc.1` 而实际装 **0.1.5-rc.1**；host 注释编号残留 8/11/13（工具只剩 10 个）；README 数据文件清单漏 `nav-arch` | 版本 bump **0.7.4**；README 徽章/依赖/用例数/数据清单同步；peer 改生态写法 `>=0.1.2-rc.1 <0.2.0`（同 `dsh-free-search` / `dsh-shoucang-memory`）；注释重新编号 1–10 |
+| P2-8 | **架构档指纹过期**：L1 1/6 过期、L2 nav_query **2/2 过期**（shoucang 两档 7/8、5/6 过期） | 按 arch-view 契约重取指纹；L2 逐条复核 8 个行号锚点（**全部仍命中**，本条链 v0.7.4 未动） |
+| P3-1 | 破锁 TOCTOU：`statSync` 判老 → `unlinkSync` 之间，原持有者可能释放且第三方新建锁 → 删掉**新锁** = 双写 | 改为 **rename + token 身份校验**；若误拿到别人的新锁则原样放回并退避 |
+| P3-2 | `withFileLock` 的「重入分支」是死代码（token 每次新生成），嵌套取锁会因**单链队列永久死锁**，而「禁止嵌套」只写在注释里 | 加 AsyncLocalStorage 嵌套守卫：**fail-fast 报错**（并发等待者不误判）；同时删除死分支 |
+| P3-3 | 死数据：`indexes.functionToModule`（无人读）、`unmappedFiles` / `staleEntries`（v0.7.0 起已由实时探测取代）、`metadata.generated` 不随写入重打 | `createEmptyIndex` 去掉死表；`recomputeMetadata` 补 `generated` 打戳；**live 索引先备份再清理**（`nav-index.json.bak-pre-v074-deadfield-cleanup`） |
+| 新 | `sessionLabel` **退化为常量**：DSH id 形如 `session-5634c6bb-…`，取前 8 字符 → 每个会话都叫 `session-`，并发提示无法区分持有者 | 先剥 `session-` 前缀再取 8 字符（`5634c6bb`）；门禁比较用完整 id，故只影响可读性 |
+| 新 | `scopeFiles` 的「裸项目名剔除」守卫**一直是死代码**：读 `index.projectToModules`（顶层），真实数据在 `index.indexes.projectToModules` | 修正层级（并由本轮新增的契约用例当场抓出） |
+
+### 38.5 修复后验证（可复现）
+
+| 检查 | 结果 |
+|---|---|
+| 回归测试 | **74/74 通过**（体检时点 54 → 本轮 74；core 19 + concurrency 55。ADR-006 记录时点为 73——其后又补了一条 `nav_adr` 文案用例，故以 74 为准），新增：功能码指纹、noChange 证据、expired 三出口、map/retire 对账、模块 re-home、root 相对路径、嵌套锁 fail-fast、破锁无残骸、nav_status 架构行、scopeFiles 裸名契约、nav_adr「首次决策」文案 |
+| 真实工作区指纹覆盖 | 失明 **12/18 功能 + 3/5 模块 → 0**；模块 scope：shoucang 0→13、PN-M02 0→4、PN-M03 0→6 |
+| 假 STALE 不增 | `findStaleFiles` 仍为 `[]`（orphan 探测未造出误报） |
+| 裸名剔除仍生效 | `PN-P01` / `PN-M02` / `project-nav` / `shoucang` 作为 `files=` 一律剔除（都不算文件）；项目前缀真实索引键保留 |
+| 数据手术 | 清理前已备份；清理后 18 功能 / 37 文件 / 5 模块 / 4 项目不变，索引只剩 4 张表 |
+| 锁卫生 | `.internal/locks/` 0 文件；破锁用例断言无 `.stale-*` 残骸 |
+
+### 38.6 主题回顾：v0.7.4 是第四次落实同一原则
+
+| 版本 | 假信号 / 断点 | 后果 |
+|---|---|---|
+| v0.7.1 | pmg 删除后永久假 STALE | 学会忽略「索引里有的文件磁盘上没了」 |
+| v0.7.2 | 已登记文件被报「索引外文件」 | 收口提示不可信；照做还会写坏索引 |
+| v0.7.3 | 验证动作被算成「补丁」 | 逼出空心 ADR，决策账本贬值 |
+| **v0.7.4** | **指纹恒空（静默不报）+ expired 无法收口（静默卡死）** | 漂移完全不可见；长任务成果永久无法入账 —— **不是报错，而是「什么都不报」** |
+
+v0.7.1~0.7.3 修的是**误报**，v0.7.4 修的是**漏报与不可收口**——同一枚硬币的另一面。教训写死在此：**闸门的价值 = 信号可信度 × 收口可达性**；任何「静默」路径（空指纹、无出口状态、被吞的异常）都是治理机制的头号敌人。
+
+### 38.7 部署与实机验收（v0.7.4，已完成）
+
+**部署方式（本轮实际路径）**：**没有**从会话内调 `dsh plugin add` —— 那可能触发 daemon 自我重载，把正在跑的会话打断。改用与该 profile 既有 4 次 `bak-declfix-*` 先例一致的外科对齐（等价、可回滚）：
+
+- 三件备份：`package.json.bak-v074-install-20260910-193450`、`pnpm-lock.yaml.bak-v074-install-20260910-193450`、`cordis.patch.yml.bak-v074-install-20260910-193606`
+- `package.json` 依赖 → 0.7.4 tgz；`pnpm-lock.yaml` 三处包键（importers / packages / **snapshots**）+ 按新 tgz 重算 `sha512` integrity + peer 区间 `>=0.1.2-rc.1 <0.2.0`
+- 覆盖 `node_modules/@dsh-external/project-nav`；`host`/`shared` **SHA256 与工作树一致**
+- 顺带修掉 profile patch 里过期的「project-nav v0.2.10」注释（改为不带版本号，去掉漂移源）
+
+**排查记录（四个坑，值得留档）**：
+
+1. **「重启了但没生效」= 装与重启是两条时间线**：首次重启（19:33:21）发生在安装（19:34:50）**之前**，而 ESM 模块只在进程启动时读一次 → 差 90 秒。教训写死在此：**先装完、再重启**；把两者并列成「两步」会让人只做后一步。
+2. **lockfile 有两段都带包键**：pnpm v9 的 `packages:` 与 `snapshots:` 各有一份包键，只改前者会留残留 —— 靠「改完再字节复核」抓出（`0.7.3` 出现次数必须为 0）。
+3. **旁路死副本会误导排查**：`~/.dsh/plugins/project-nav` 仍是 0.7.3。已用装载器自报入口证明它**未被加载**（`entry: .../profiles/web/node_modules/@dsh-external/project-nav/host/index.js`；desktop/headless 无此依赖；super-injector registry 无此条目）。它是早期 `dsh plugin` 安装方式的遗留，**建议改名归档**（未动，遵用户「隐藏而非删除」习惯）。
+4. **热重载通道不覆盖 profile bundle**：`dev_reload_package project-nav` → `缓存中无匹配且磁盘降级失败`，fiber 仍 `[active]` 旧代；项目自有发布流程也写明需重启。
+
+**实机验收（重启后，7/7 通过）**：
+
+| # | 验收项 | 实测 |
+|---|---|---|
+| 1 | 进程与产物 | 重启于 19:41:35 / 19:42:09；加载源 = v0.7.4 / 70377 字节 / SHA256 与工作树一致 |
+| 2 | `nav_status` 架构可见性 | 出现 `Architecture: 6 decision(s), last ADR-006 on .internal/arch/project-nav-overview.md — ⚠ near/over the repeat-patch gate: PN-F01 2/3, PN-M02 2/3` |
+| 3 | `nav_map` 参数面 | `level=module`（不给 target）不再报 `ERROR: level=... requires target`，直接出图 —— 死参数确已删除 |
+| 4 | 相对路径按 root | `nav_docs path=probe-not-exist.md` → `✗ ... (also tried D:\FF\probe-not-exist.md)` |
+| 5 | **P0-1 指纹病根** | ACT-010（scope = PN-F01 + PN-M02）`begin` 记下 `scopeState.files` **4 个文件**（shared 60985 / host 70377 / core.test 10678 / concurrency 49038，各带 size+sha1）—— 修复前此处**恒为 `null`** |
+| 6 | noChange 证据链 | ACT-010 `done` 报 `✓ Scope fingerprint verified`，账本 `noChange: true`、无 drift；`repeatPressure(PN-M02)` 仍 **2/3 未涨** —— 验收动作没被误算成补丁 |
+| 7 | `sessionLabel` | `begin` 输出 `scope locked for session 7824327a`（原为恒定 `session-`，无法区分会话） |
+
+**剩余项处理（2026-09-10T12:10Z · ACT-012 / ACT-013）**：
+
+1. **shoucang 架构档 → 已完成真重生成**（全 4 档指纹 0 过期：L1 11/11、L2 7/7）：
+   - **L1 不只是过期，依赖图已变**：`src/` 由 8 个文件增至 10 个（新增 `vec.ts` 读侧向量档 / `activity.ts` 条目活性聚合 / `treeops.ts` 深睡 treeOps 执行层），索引外文件 3→6。故按逐文件实测 `from './x.js'` 整图重建（12 节点 / 18 边，每条边带行号），未走"刷新指纹"的捷径。
+   - **L2 SC-S07 由子代理精读后重提炼**（旧档行号依据已全部错位：`distill.ts` 由 70814 增至 176469 字节 / **2595 行**，14 节点主链）。父代理**独立复核约 40 条锚点，全部命中**后才落档。旧档 4 处描述被实读纠正：落盘目标 `PRINCIPLES.md`→**`AGENT.md`**（`[原则]`/`[路径]` 同行门禁）、窗口起点改为**纯水位**（不再叠加当日 0 点下限）、无痕迹**不写审计**且与 done 一同滑窗推进、新增 `consolidateTree`/`activityAggregate`/`treeOps`/`delta.md`/子代理守卫五段链路。
+   - **复核副产品（测量纪律）**：子代理纠正了**我的**行数测量——`distill.ts` 实为 2595 行，我用 `Get-Content .Count` 得 2283（read 工具为准）。教训：**核对手下产物时，先怀疑自己的量具**。
+   - 指纹约定也在此轮校准：`arch-cache` 的 mtime 存**本地时间**（用 `index.ts` 对照旧档 19:09:14 vs UTC 11:09:14 证实，+8）；我首版误存 UTC，已修正（否则会被判过期）。
+2. **`~/.dsh/plugins/project-nav` → 已归档**为 `project-nav.stale-0.7.3-20260910`（改名隐藏、可一键回滚）。归档前三重确认无引用：装载器自报入口在 profile node_modules、profile dep 指向 0.7.4、配置文件 0 处引用。
+3. **跨项目缺陷：已发现 → 已修 → 已提交（shoucang 仓，2026-09-10T13:20Z）**：`shoucang/src/distill.ts` 的重复空 `.catch((e) => {})` 使异常路径水位回滚永不执行（同批痕迹不重试）。本轮完成：① 删空 catch 开块（-1 行）② `npm run build:host` 重建 `lib/distill.js`（编译产物同步为单 catch，非只改 src 留分叉）③ `npm run typecheck` 零错误 ④ CHANGELOG `[Unreleased] → Fixed` 按该仓约定补记（**不 bump 版本**——该仓用 Unreleased 累积、发布时才 bump）⑤ 提交 **`8bec0d4`**（4 files changed, +2/−3）。**身份处理值得留档**：该环境 local/global `user.name/email` **均为空**，直接 `git commit` 会 `fatal: unable to auto-detect email address`；本仓 164 个提交全为同一身份，故用**命令级** `git -c user.name="Fishsb" -c user.email="q85100510@gmail.com"` 照抄提交，**未写任何 git 配置**。
+   **推送被主动按住（重要）**：`push --dry-run` 探测通过（凭据/网络可用），但一次 push 会同时发布 **4 个提交**，其中 **3 个是用户自己尚未推送的在制品**（`5997a4d` UI section-edit 路由 / `488e869` 聚焦刷新 / `b6015d0` CHANGELOG）—— 代推他人未审在制品超出授权边界，等用户明确。
+   **尚未生效**：运行实例的安装副本仍是旧 `lib`；生效需「推送 → profile pin 更新到新 SHA → 重装 → 重启」，或走只覆盖 2 个文件的本地热修（已核实 `lib/distill.js` 的唯一差异就是本次修复）。详见 `shoucang-SC-S07-deepsleep.md`「已修复的代码缺陷」节。
+4. `dsh-external-project-nav-0.7.3.tgz` 暂留原名（profile 的 `package.json.bak-*` 仍指向它，便于一步回滚）；稳定后再按 `.superseded-<日期>` 归档。
+
+_本文件应随项目推进持续更新。最后更新：2026-09-10T13:20Z（shoucang 缺陷修复落库 8bec0d4；push 待用户明确）_

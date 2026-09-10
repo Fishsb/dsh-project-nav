@@ -10,7 +10,7 @@ import { resolve, dirname } from 'node:path'
 import {
   loadIndex, getIndexAge,
   loadVector,
-  loadActions, loadActionsReconciled, mutateActions,
+  loadActions, loadActionsReconciled, mutateActions, reconcileActions,
   mutateIndex, mutateVector, mutateDocs, mutateArch, withFileLock, retireEntry, indexEntryKind,
   nextActionId, selfOwner, DEFAULT_LEASE_TTL_MS,
   isLeaseExpired, canonPath, scopeOwnModules, sessionLabel, sessionBusyWith, checkScopeConflicts, queuePosition, actorLabel, describeConflicts,
@@ -388,7 +388,6 @@ export function apply(ctx, config) {
         const warns = []
         if (!vector.doing) warns.push('⚠ Mainline vector "doing" is empty — set it (nav_set_vector) so drift can be detected.')
         warns.push(...busyNote, ...conflictNote)
-        warns.push(...busyNote, ...conflictNote)
         // Reference-doc suggestions: consult BEFORE finalizing the plan (方案确认参考).
         const suggestions = suggestDocs(loadDocs(root), {
           taskText: `${args.task} ${args.plan || ''}`,
@@ -416,7 +415,7 @@ export function apply(ctx, config) {
   // ---- 3. nav_mark — action lifecycle: begin / done / abort ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_mark',
-    description: 'Mark an action lifecycle transition: begin (planned→in_progress, BEFORE changes), done (in_progress→done, AFTER changes), abort (give up). The open-action list is the drift signal — never leave actions unfinished.',
+    description: 'Mark an action lifecycle transition: begin (planned→in_progress, BEFORE changes), done (in_progress→done, AFTER changes), abort (give up). The open-action list is the drift signal — never leave actions unfinished. An action whose lease lapsed is "expired": its owner can still begin (re-acquire the lease + retake the fingerprint), done (late close-out) or abort it, so finished work is never stranded.',
     parameters: {
       id: { type: 'string', required: true, description: 'Action id from nav_plan (e.g., ACT-001)' },
       action: { type: 'string', required: true, description: 'One of: begin, done, abort' }
@@ -442,7 +441,12 @@ export function apply(ctx, config) {
                 return { kind: 'foreign', action: a }
               }
               if (a.status === 'in_progress') return { kind: 'reenter', action: a }
-              if (a.status !== 'planned') return { kind: 'bad-state', action: a }
+              // A lapsed lease turns the action into "expired" (reconcileActions). Before this,
+              // "expired" was a terminal state with NO entry: such an action could be neither
+              // begun, done nor aborted, so an agent that finished a long task could never record
+              // it. Its owner may re-acquire — the lease is retaken and the fingerprint re-snapshotted.
+              const reacquire = a.status === 'expired'
+              if (a.status !== 'planned' && !reacquire) return { kind: 'bad-state', action: a }
               const busy = sid ? sessionBusyWith(ledger, sid) : null
               if (busy) return { kind: 'session-busy', action: a, busy }
               const conflicts = checkScopeConflicts(ledger, a, { index })
@@ -458,7 +462,7 @@ export function apply(ctx, config) {
               const scopeNow = snapshotScopeFiles(root, index, a.scope || {})
               a.scopeState = Object.keys(scopeNow).length ? { takenAt: a.startedAt, scope: a.scope || {}, files: scopeNow } : null
               a.lease = { acquiredAt: a.startedAt, renewedAt: a.startedAt, ttlMs: ttl }
-              return { kind: 'begun', action: a }
+              return { kind: 'begun', action: a, reacquired: reacquire }
             })
             if (result.kind !== 'blocked' || !args.wait) break
             const budget = args.waitMs === undefined ? 120000 : Number(args.waitMs)
@@ -492,6 +496,7 @@ export function apply(ctx, config) {
           }
           return [
             `✓ ${result.action.id} → in_progress (scope locked for session ${sid ? sessionLabel(sid) : 'unknown'})`,
+            ...(result.reacquired ? ['  Re-acquired after a lapsed lease — the scope fingerprint was retaken just now.'] : []),
             `  Scope: features=[${(result.action.scope?.features || []).join(', ')}] modules=[${(result.action.scope?.modules || []).join(', ')}] files=[${(result.action.scope?.files || []).join(', ')}]`,
             `  Disjoint from every other live action${waited ? ` (queued ${Math.round(waited / 1000)}s)` : ''} — other sessions keep working in parallel.`,
             '  Ready: change the files, then nav_mark action=done to close out (and release the scope).'
@@ -505,13 +510,18 @@ export function apply(ctx, config) {
             const a = (ledger.actions || []).find(x => x.id === args.id)
             if (!a) return { kind: 'no-action' }
             if (a.owner?.sessionId && sid && a.owner.sessionId !== sid) return { kind: 'foreign', action: a }
-            if (a.status !== 'in_progress') return { kind: 'bad-state', action: a }
+            // "expired" is closable by its owner — a lapsed lease must not strand finished work
+            // (the state machine otherwise had no exit from "expired"). It is recorded as a late
+            // close-out so the ledger stays honest about the gap.
+            const late = a.status === 'expired'
+            if (a.status !== 'in_progress' && !late) return { kind: 'bad-state', action: a }
             // Did anything move under us? Compare the begin-time snapshot against disk now.
             if (a.scopeState) {
               try { scopeDrift = verifyScopeFingerprint(root, index, a.scopeState, a.scope) } catch { scopeDrift = null }
             }
             a.status = 'done'
             a.completedAt = new Date().toISOString()
+            if (late) a.lateCompletion = true
             a.lease = null
             if (scopeDrift && !scopeDrift.ok) a.drift = { at: a.completedAt, changed: scopeDrift.changed, removed: scopeDrift.removed, added: scopeDrift.added }
             // Positive evidence that this action patched NOTHING: the fingerprint proved the scope
@@ -520,7 +530,11 @@ export function apply(ctx, config) {
             // ends in hollow ADRs, and a diluted decision ledger is the same "alarm fatigue" failure
             // as a permanent false STALE. No scopeState = no proof, so it keeps counting.
             if (scopeDrift && a.scopeState
-              && scopeDrift.changed.length === 0 && scopeDrift.removed.length === 0 && scopeDrift.added.length === 0) {
+              && scopeDrift.changed.length === 0 && scopeDrift.removed.length === 0 && scopeDrift.added.length === 0
+              && Object.values(a.scopeState.files || {}).some(v => v && typeof v === 'object')) {
+              // …and at least ONE scoped file must have actually EXISTED at begin. A snapshot whose
+              // every entry is "missing" proves nothing about the work (stale or mistyped scope),
+              // so it stays "no evidence" and keeps counting — the gate prefers over-counting.
               a.noChange = true
             }
             // Delta close-out (OpenSpec archive semantics): surface index deltas the
@@ -531,7 +545,7 @@ export function apply(ctx, config) {
             // a literal map lookup here reported already-registered files as "outside the index".
             const unregisteredFiles = (a.scope?.files || []).filter(f => !indexedOwnersOf(root, f, index))
             if (missingFeatures.length) deltaLines.push(`  - 未登记功能（需 nav_update 创建）: ${missingFeatures.join(', ')}`)
-            if (unregisteredFiles.length) deltaLines.push(`  - 索引外文件（需登记到所属功能，nav_update --field files）: ${unregisteredFiles.join(', ')}`)
+            if (unregisteredFiles.length) deltaLines.push(`  - 索引外文件（需登记到所属功能，nav_update field="files" value="..."）: ${unregisteredFiles.join(', ')}`)
             // Releasing a scope is what unblocks the sessions queued behind it.
             // 架构先行协议：完结动作按锚点记入补丁账本 + 计数闸复查（结果随返回值带出，不依赖跨作用域副作用）
             const waiters = (ledger.actions || []).filter(o => o.status === 'planned' && o.id !== a.id && checkScopeConflicts(ledger, o, { index }).length === 0)
@@ -548,12 +562,13 @@ export function apply(ctx, config) {
             } else {
               pressureNote = '  ⚠ 本动作无锚点（未走锚点闸）——无法计入架构补丁账本。'
             }
-            return { kind: 'done', action: a, waiters: waiters.map(w => w.id), pressureNote }
+            return { kind: 'done', action: a, waiters: waiters.map(w => w.id), pressureNote, late }
           })
           if (res.kind === 'no-action') return `ERROR: no action "${args.id}". Use nav_plan to create one.`
           if (res.kind === 'foreign') return `ERROR: ${res.action.id} is held by ${actorLabel(res.action)} — only the holding session can close it. Ask that session to nav_mark done / abort, or let its lease expire (self-heals).`
           if (res.kind === 'bad-state') return `ERROR: ${res.action.id} is "${res.action.status}", only "in_progress" actions can be done.`
           const lines = [`✓ ${res.action.id} → done: ${res.action.task}`, 'Delta close-out（合并进索引后本次变更才算同步完成）:']
+          if (res.late) lines.push('  ⚠ Late close-out: this action\'s lease had already expired (another session may have taken the scope meanwhile) — the fingerprint below is informational only.')
           if (deltaLines.length) {
             lines.push(...deltaLines, '  修完后跑 nav_sync_docs 对齐 PROJECT.md 功能地图。')
           } else {
@@ -578,7 +593,7 @@ export function apply(ctx, config) {
             const a = (ledger.actions || []).find(x => x.id === args.id)
             if (!a) return { kind: 'no-action' }
             if (a.owner?.sessionId && sid && a.owner.sessionId !== sid) return { kind: 'foreign', action: a }
-            if (a.status !== 'planned' && a.status !== 'in_progress') return { kind: 'bad-state', action: a }
+            if (a.status !== 'planned' && a.status !== 'in_progress' && a.status !== 'expired') return { kind: 'bad-state', action: a }
             a.status = 'aborted'
             a.completedAt = new Date().toISOString()
             a.lease = null
@@ -608,7 +623,7 @@ export function apply(ctx, config) {
       systemView: { type: 'string', description: 'CREATE feature: system perspective description' },
       files: { type: 'string', description: 'CREATE feature: comma-separated file paths' },
       features: { type: 'string', description: 'CREATE module: comma-separated feature codes belonging to it (empty = module shell); also replaces an existing module list' },
-      project: { type: 'string', description: 'CREATE module: project name to attach it to' },
+      project: { type: 'string', description: 'Module: the project to attach it to — for an EXISTING module this re-homes it (the old attachment is removed), and project="" detaches it (unattached modules still appear on the map). CREATE feature/module: the project to attach it to.' },
       retire: { type: 'boolean', description: 'RETIRE (inverse of upsert): remove this entry from the index and cascade — feature drops its file mappings + module membership, module drops its project attachments (its features survive), project detaches its modules (they survive as unattached). Use when something is genuinely gone from the workspace, so it stops being reported as false STALE. Refused while an open action still references the target. If a module and a project share a name, one call retires one layer — repeat for the next (the reply names what was retired).' }
     },
     output: OUTPUT,
@@ -627,7 +642,11 @@ export function apply(ctx, config) {
           }
           // Integrity gate: an entry with work in flight must not vanish under it.
           const targetPath = normalizePath(String(args.target))
-          const openNow = (loadActions(root).actions || []).filter(a => a.status === 'planned' || a.status === 'in_progress')
+          // Reconcile first: a lapsed lease is not "work in flight". Reading the raw file let a
+          // dead session block retirement until some other tool happened to reconcile the ledger.
+          const ledgerNow = loadActions(root)
+          reconcileActions(ledgerNow, {})
+          const openNow = (ledgerNow.actions || []).filter(a => a.status === 'planned' || a.status === 'in_progress')
           const blocker = openNow.find(a => {
             const sc = a.scope || {}
             return (sc.features || []).includes(args.target)
@@ -655,7 +674,8 @@ export function apply(ctx, config) {
             return [
               `✓ Retired module ${args.target}`,
               `  project attachments removed: ${r.projects.length ? r.projects.join(', ') : '(none)'}`,
-              `  its ${r.features.length} feature(s) survive — re-attach any that belong elsewhere: ${r.features.length ? r.features.join(', ') : '(none)'}`
+              `  its ${r.features.length} feature(s) survive — they may belong to another module: ${r.features.length ? r.features.join(', ') : '(none)'}`,
+              '  (to move a surviving module under another project: nav_update target=<module> project=<project>; project="" detaches it)'
             ].join('\n')
           }
           return [
@@ -687,10 +707,32 @@ export function apply(ctx, config) {
           return `✓ Updated feature ${args.target}: ${args.field} = "${args.value}"`
         }
         if (index.indexes?.moduleToFeatures?.[args.target]) {
+          const notes = []
           if (args.features !== undefined) {
             index.indexes.moduleToFeatures[args.target] = splitList(args.features)
-            return `✓ Module ${args.target} feature list replaced (${index.indexes.moduleToFeatures[args.target].length} feature(s)).`
+            notes.push(`feature list replaced (${index.indexes.moduleToFeatures[args.target].length} feature(s))`)
           }
+          // Re-home / detach. Module→project attachment used to be write-once (only the create
+          // branch accepted project=), so retiring a project left its modules unattached with no
+          // way back onto the map — the retire close-out's advice "re-home each one" was
+          // unactionable. project= now MOVES the module, and project="" detaches it.
+          if (args.project !== undefined) {
+            const dest = String(args.project || '').trim()
+            if (!index.indexes.projectToModules) index.indexes.projectToModules = {}
+            const from = Object.keys(index.indexes.projectToModules)
+              .filter(p => (index.indexes.projectToModules[p] || []).includes(args.target))
+            for (const p of from) {
+              index.indexes.projectToModules[p] = index.indexes.projectToModules[p].filter(m => m !== args.target)
+            }
+            if (dest) {
+              if (!index.indexes.projectToModules[dest]) index.indexes.projectToModules[dest] = []
+              if (!index.indexes.projectToModules[dest].includes(args.target)) index.indexes.projectToModules[dest].push(args.target)
+              notes.push(from.length ? `re-homed from ${from.join(', ')} to ${dest}` : `attached to project ${dest}`)
+            } else {
+              notes.push(from.length ? `detached from project ${from.join(', ')} (now unattached)` : 'already unattached')
+            }
+          }
+          if (notes.length) return `✓ Module ${args.target}: ${notes.join('; ')}.`
           if (!args.field || args.value === undefined) return 'ERROR: updating an existing entry requires field + value (or features= for modules).'
           if (!index.moduleMeta) index.moduleMeta = {}
           index.moduleMeta[args.target] = index.moduleMeta[args.target] || {}
@@ -733,9 +775,10 @@ export function apply(ctx, config) {
     }
   })), 'project-nav: update')
 
-  // ---- 5.–7. (registration tools merged into nav_update — the single upsert entry point) ----
+  // ---- nav_add_feature / nav_add_module / nav_add_doc were merged into nav_update (upsert)
+  //      and nav_docs in v0.6.0 — the tool face is 10 tools, not 13. ----
 
-  // ---- 8. nav_docs — reference docs: query AND register in one tool ----
+  // ---- 5. nav_docs — reference docs: query AND register in one tool ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_docs',
     description: 'Reference docs in one tool: give title+path+when to REGISTER a document (when = routing rule: which kinds of tasks must consult it); otherwise list the registry, or pass task to rank docs for that task. Read/fetch returned paths yourself.',
@@ -754,13 +797,17 @@ export function apply(ctx, config) {
         if (args.path || args.title || args.when) {
           if (!args.path || !args.title || !args.when) return 'ERROR: registering requires title + path + when (when is the task routing rule).'
           const isUrl = /^https?:\/\//i.test(args.path)
-          if (!isUrl && !existsSync(args.path)) {
-            return `✗ Path does not exist on disk: ${args.path}\n  Doc NOT registered (dead links are rejected).`
+          // Resolve against the GOVERNED ROOT, not process.cwd(): config.root may point at a
+          // workspace other than the directory the daemon happens to run in, and a root-relative
+          // doc path then failed with a bogus "does not exist".
+          const docFile = isUrl ? args.path : (existsSync(args.path) ? args.path : resolve(root, args.path))
+          if (!isUrl && !existsSync(docFile)) {
+            return `✗ Path does not exist on disk: ${args.path}${docFile === args.path ? '' : ` (also tried ${docFile})`}\n  Doc NOT registered (dead links are rejected).`
           }
           return await mutateDocs(root, (registry) => {
-            const dup = (registry.docs || []).find(d => d.path === args.path)
-            if (dup) return `Doc already registered: ${dup.id} (${args.path}).`
-            const doc = { id: nextDocId(registry), title: args.title, path: args.path, when: args.when, project: args.project || '', tags: splitList(args.tags), addedAt: new Date().toISOString() }
+            const dup = (registry.docs || []).find(d => d.path === docFile || d.path === args.path)
+            if (dup) return `Doc already registered: ${dup.id} (${dup.path}).`
+            const doc = { id: nextDocId(registry), title: args.title, path: docFile, when: args.when, project: args.project || '', tags: splitList(args.tags), addedAt: new Date().toISOString() }
             registry.docs.push(doc)
             return `✓ Registered ${doc.id} "${doc.title}"\n  → ${doc.path}\n  when: ${doc.when}`
           })
@@ -784,32 +831,32 @@ export function apply(ctx, config) {
     }
   })), 'project-nav: docs')
 
-  // ---- 9. nav_map — governance map for humans & agents (text tree / HTML mindmap) ----
+  // ---- 6. nav_map — governance map for humans & agents (text tree / HTML mindmap) ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_map',
-    description: 'Render the governance map. format=text: indented project→module→feature→file tree (agent orientation). format=html: self-contained progressive-expansion mindmap file written to disk (human view; open actions marked red, vector in header). Read-only, generated from the index — never hand-edited.',
+    description: 'Render the governance map. format=text: indented project→module→feature→file tree (agent orientation). format=html: self-contained progressive-expansion mindmap file written to disk (human view; open actions marked red, vector in header). `target` narrows BOTH renderers to projects/modules whose name matches. Read-only, generated from the index — never hand-edited.',
     parameters: {
-      level: { type: 'string', description: 'workspace (default: all projects) | project | module' },
-      target: { type: 'string', description: 'Project code/name or module name to zoom into (required for project/module levels)' },
+      target: { type: 'string', description: 'Narrow the map to projects/modules whose name matches this substring (applies to text and html)' },
       format: { type: 'string', description: 'text (default) or html' }
     },
     output: OUTPUT,
-    async execute(args) {
+    async execute(args, exec) {
       try {
         const index = loadIndex(root)
-        const S = scopeTargetsOfOpenActions(loadActions(root))
-        const level = args.level || 'workspace'
+        // Reconcile in memory before rendering (no write from a read-only renderer): an action
+        // whose lease lapsed is NOT a live hold, so it must not paint its scope red while
+        // nav_status — which does reconcile — reports zero live actions. One truth, two views.
+        const ledgerForMap = loadActions(root)
+        reconcileActions(ledgerForMap, { sessionId: sidOf(exec), ttlMs: ttlOf(config) })
+        const S = scopeTargetsOfOpenActions(ledgerForMap)
         const target = args.target || ''
-        if ((level === 'project' || level === 'module') && !target) {
-          return 'ERROR: level=project/module requires target (project code/name or module name).'
-        }
         if (args.format === 'html') {
           const vector = loadVector(root)
           const safe = String(target || 'workspace').replace(/[^A-Za-z0-9_-]+/g, '_')
           const outPath = resolve(root, '.internal', `map-${safe}.html`)
           const html = renderMapHtml(index, {
             title: `Project Nav Map${target ? ` — ${target}` : ''}`,
-            vector, openActions: S
+            vector, openActions: S, target
           })
           mkdirSync(dirname(outPath), { recursive: true })
           writeFileSync(outPath, html, 'utf-8')
@@ -820,7 +867,7 @@ export function apply(ctx, config) {
     }
   })), 'project-nav: map')
 
-  // ---- 10. nav_sync_docs — auto-align PROJECT.md feature map from the index ----
+  // ---- 7. nav_sync_docs — auto-align PROJECT.md feature map from the index ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_sync_docs',
     description: 'Once-Only alignment: regenerate the auto section (between <!-- nav:auto:start/end --> markers) of PROJECT.md from the index. Hand-written narrative outside the markers is never touched. Run after any index change; the marker section must never be hand-edited.',
@@ -830,7 +877,11 @@ export function apply(ctx, config) {
     output: OUTPUT,
     async execute(args) {
       try {
-        const docPath = resolve(args.path || root, args.path ? '' : 'PROJECT.md')
+        // A relative path is resolved against the governed root, not process.cwd() (same rule as nav_docs).
+        const relTarget = args.path || ''
+        const docPath = relTarget
+          ? (existsSync(resolve(relTarget)) ? resolve(relTarget) : resolve(root, relTarget))
+          : resolve(root, 'PROJECT.md')
         const index = loadIndex(root)
         const vector = loadVector(root)
         const section = renderProjectDocSection(index, { vector, arch: loadArch(root) })
@@ -859,7 +910,7 @@ export function apply(ctx, config) {
     }
   })), 'project-nav: sync-docs')
 
-  // ---- 11. nav_status — health + open actions + cross-session concurrency ----
+  // ---- 8. nav_status — health + open actions + cross-session concurrency ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_status',
     description: 'Health snapshot: index totals/coverage, mainline vector, cross-session concurrency (who holds which scope), and the OPEN action list — unfinished actions are the project drift signal. Call this before starting any task.',
@@ -874,6 +925,14 @@ export function apply(ctx, config) {
         const vector = loadVector(root)
         const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
         const registry = loadDocs(root)
+        const arch = loadArch(root)
+        const decisions = arch.decisions || []
+        const lastDecision = decisions.length ? decisions[decisions.length - 1] : null
+        // The architecture layer is this plugin's core, so the health snapshot has to show it:
+        // how many decisions exist, and which anchors sit at/over the repeat-patch threshold.
+        const hotAnchors = [...new Set((ledger.actions || []).filter(a => a.status === 'done' && a.anchor).map(a => a.anchor))]
+          .map(anchor => ({ anchor, ...repeatPressure(arch, ledger.actions, anchor) }))
+          .filter(p => p.count > 0 && p.count >= p.threshold - 1)
         const open = (ledger.actions || []).filter(a => a.status === 'planned' || a.status === 'in_progress')
         const live = open.filter(a => a.status === 'in_progress')
         const queued = open.filter(a => a.status === 'planned')
@@ -933,6 +992,7 @@ export function apply(ctx, config) {
           stale.length
             ? `STALE Files (${stale.length}) — in index but missing on disk, update or re-register:\n${stale.map(s => `  ${s}`).join('\n')}`
             : 'Stale files: none (index matches disk)',
+          `Architecture: ${decisions.length} decision(s)${lastDecision ? `, last ${lastDecision.id} on ${lastDecision.anchor}` : ' (none recorded yet)'}${hotAnchors.length ? ` — ⚠ near/over the repeat-patch gate: ${hotAnchors.map(p => `${p.anchor} ${p.count}/${p.threshold}`).join(', ')}` : ''}`,
           `Reference docs: ${(registry.docs || []).length} registered (nav_docs to list or register)`,
           '',
           recent.length ? `Recent actions:\n${recent.map(a => `  ${a.id} [${a.status}] ${a.task}`).join('\n')}` : ''
@@ -942,7 +1002,7 @@ export function apply(ctx, config) {
     }
   })), 'project-nav: status')
 
-  // ---- 8. nav_set_vector — mainline vector (vector.json is the source of truth) ----
+  // ---- 9. nav_set_vector — mainline vector (vector.json is the source of truth) ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_set_vector',
     description: 'Set the mainline navigation vector (doing / next / notDoing / exitCondition). Omitted fields keep current values. Read fresh from disk by every tool call, so changes take effect immediately.',
@@ -971,7 +1031,7 @@ export function apply(ctx, config) {
       } catch (e) { return err(e) }
     }
   })), 'project-nav: set-vector')
-  // ---- 13. nav_adr — 架构层改动留痕（架构先行协议的第 3 个闸门） ----
+  // ---- 10. nav_adr — 架构层改动留痕（架构先行协议的第 3 个闸门） ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_adr',
     description: 'Architecture-first protocol: record an architecture decision for one anchor (feature / module / file / arch-doc). Required whenever a task changes the ARCHITECTURE (new module, scope move, interface change) and mandatory once the same anchor has accumulated three patches without one — otherwise local patches keep curing symptoms inside the same dead end. Recording a decision resets that anchor patch counter (the first-principles trigger).',
@@ -994,7 +1054,11 @@ export function apply(ctx, config) {
             '  Register the node first with nav_update (upsert), or anchor to an arch doc under .internal/arch/ — an unanchored ADR is not traceable.'
           ].join('\n')
         }
-        const pressure = repeatPressure(loadArch(root), (loadActions(root).actions || []), args.anchor)
+        const archBefore = loadArch(root)
+        const pressure = repeatPressure(archBefore, (loadActions(root).actions || []), args.anchor)
+        // "First decision" must mean FIRST DECISION, not "no patches had piled up":
+        // pressure.count === 0 with prior ADRs on this anchor used to print the former.
+        const prior = lastDecisionFor(archBefore, args.anchor)
         // Allocate the ADR id INSIDE the lock: two concurrent decisions must not
         // both read ADR-007 and both write ADR-007 (same class of bug as ACT ids).
         const d = await mutateArch(root, (arch) => {
@@ -1019,7 +1083,9 @@ export function apply(ctx, config) {
           ...(d.impact ? [`  impact:   ${d.impact}`] : []),
           pressure.count > 0
             ? `  Patch counter reset: ${pressure.count} patch(es) had accumulated on this anchor — those were local fixes; this is the architecture-level answer.`
-            : '  First decision on this anchor.'
+            : (prior
+              ? `  No patches had accumulated since ${prior.id} — recorded deliberately, not forced by the gate.`
+              : '  First decision on this anchor.')
         ].join('\n')
       } catch (e) { return err(e) }
     }

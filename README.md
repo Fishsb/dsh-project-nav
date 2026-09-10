@@ -4,9 +4,9 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.7.3-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.7.4-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
-[![dsh-tools](https://img.shields.io/badge/dsh--tools-0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
+[![dsh-tools](https://img.shields.io/badge/dsh--tools-%3E%3D0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
 
 **简体中文** | [English](./README.en.md)
@@ -40,7 +40,7 @@ AI coding 的长期项目会漂移：文件越堆越多却没有功能映射、�
 - 🏛️ **架构先行协议（v0.5.0 起）**：任务必须锚定架构节点才入账——单目标 scope 自动取锚，多目标必须显式 `anchor=`；同锚点自最近架构决策以来 ≥3 次**补丁** → **计数闸**强制回架构层；`nav_adr` 记录架构决策并重置计数。**「补丁」只认真的动过东西**（v0.7.3）：done 时指纹证明 scope 内文件一个都没变的验证/记账动作不计入——否则会逼出没有架构内容的 ADR，ADR 通胀后核心决策账本就成噪音
 - 🎯 **治理事务环**：`nav_plan` → `begin` → 改动 → `done`（abort 兜底），未完成动作 = 漂移信号，地图标红；**每会话同时只允许一个 in_progress**
 - 🧵 **多会话并发（v0.3.0）**：锁的粒度是 **scope 而不是工作区**——不相交的会话真并行干活，只有 scope 相交（同功能 / 同模块 / 同文件 / 索引派生出的同一文件）才排队；`nav_mark begin wait=true` 可阻塞等待，崩溃会话的租约自动过期自愈，账本带跨进程文件锁（并发立项不再丢动作）
-- 🔍 **scope 文件指纹（v0.4.0）**：`begin` 记录 scope 内每个文件的 size/mtime/sha1，`done` 比对并报 `⚠ Scope drift`（被改/被删/新出现三类），运行中动作由 `nav_status` 实时显示漂移——租约防「同时开工」，指纹防「开工期间被别人动过」
+- 🔍 **scope 文件指纹（v0.4.0）**：`begin` 记录 scope 内每个文件的 size/mtime/sha1，`done` 比对并报 `⚠ Scope drift`（被改/被删/新出现三类），运行中动作由 `nav_status` 实时显示漂移——租约防「同时开工」，指纹防「开工期间被别人动过」。**v0.7.4 修正**：按功能/模块声明 scope 时不再误删 workspace 相对的索引键（此前 12/18 个功能的指纹恒为空 = 静默失效），且「本来就不存在的文件」不再被误报 vanished
 - 🔒 **共享状态写入串行化（v0.7.0）**：索引 / 参考文档 / 向量 / 架构决策账本 / `PROJECT.md` 的每个读改写都在**按目标文件的互斥锁**下进行（锁目录 `.internal/locks/`）——两个会话同时写不再互相覆盖（这正是此前索引被反复回退的根因）；锁等待异步化（不再阻塞事件循环），持有者崩溃时按锁文件 mtime 破锁
 - 🗑️ **索引退役语义（v0.7.1）**：`nav_update retire=true` 是 upsert 的逆操作——被删除的功能/模块/项目可以从索引里**真正退役**（级联清理双向映射）。没有它，索引只能增不能删，任何删除都留下**永久假 STALE**，而假警报会让模型学会忽略漂移信号（本工作区实测：`nav_status` 从 7 条假警报回到 `Stale files: none`）
 - 🧭 **主线向量带牙齿**：doing / next / notDoing / exitCondition——方案撞上"不做什么"**直接拒绝立项**
@@ -55,13 +55,13 @@ AI coding 的长期项目会漂移：文件越堆越多却没有功能映射、�
 |------|------|
 | `nav_query` | 查结构/模块/功能，改动前理解范围（范围门禁 + 主线告警 + **跨会话占用提示**） |
 | `nav_plan` | 治理优先门禁：登记动作（**锚点闸** + 范围预校验 + 反目标硬拦截 + **计数闸**） |
-| `nav_mark` | 事务生命周期 begin / done / abort（begin 含 scope 冲突闸 + 租约 + 排队；done 报 scope 漂移与计数压力） |
+| `nav_mark` | 事务生命周期 begin / done / abort（begin 含 scope 冲突闸 + 租约 + 排队；done 报 scope 漂移与计数压力）。**租约过期不是死路**（v0.7.4）：其 owner 仍可 `begin` 重取锁并重拍指纹、`done` 迟收口（记 `lateCompletion`）或 `abort` |
 | `nav_adr` | **架构决策记录**（锚点 + 触发原因 + 决策 + 影响面）；登记即重置该锚点补丁计数 |
-| `nav_update` | **唯一登记口（upsert 与退役）**：更新已存在条目，或直接创建功能/模块（新功能给 `files=`，新模块给 `features=`/`project=`）；条目真正从工作区消失时用 `retire=true` 退役并级联（功能清双向文件映射 + 模块成员；模块摘除项目挂载但保留其功能；项目摘除模块但保留之），在飞动作仍引用该目标时拒绝 |
-| `nav_docs` | 参考文档：给 `title`+`path`+`when` 即登记（`when` 是路由规则），否则列库 / 按 `task` 排序推荐 |
-| `nav_map` | 治理地图：`text`（agent 导航）/ `html`（人看导图） |
+| `nav_update` | **唯一登记口（upsert 与退役）**：更新已存在条目，或直接创建功能/模块（新功能给 `files=`，新模块给 `features=`/`project=`）；条目真正从工作区消失时用 `retire=true` 退役并级联（功能清双向文件映射 + 模块成员；模块摘除项目挂载但保留其功能；项目摘除模块但保留之），在飞动作仍引用该目标时拒绝。**模块可迁移**（v0.7.4）：已有模块给 `project=` 即换挂载，`project=""` 摘除（退役项目后「re-home」不再是空话） |
+| `nav_docs` | 参考文档：给 `title`+`path`+`when` 即登记（`when` 是路由规则），否则列库 / 按 `task` 排序推荐。相对路径按**被治理 root** 解析（v0.7.4），不受进程 cwd 影响 |
+| `nav_map` | 治理地图：`text`（agent 导航）/ `html`（人看导图）；`target` 按名称收窄（v0.7.4 起 text 与 html 一致生效，原 `level` 死参数已移除） |
 | `nav_sync_docs` | 自动对齐 PROJECT.md（标记区派生：功能地图 + 主线向量 + **架构决策**） |
-| `nav_status` | 健康快照：覆盖度 + 未完成动作 + STALE 文件 + **跨会话并发视图** |
+| `nav_status` | 健康快照：覆盖度 + 未完成动作 + STALE 文件 + **跨会话并发视图** + **架构决策与计数闸压力**（v0.7.4 起架构层可见） |
 | `nav_set_vector` | 设置主线向量 |
 
 ## 🔄 治理循环
@@ -91,7 +91,7 @@ pnpm pack
 dsh plugin --profile web add "@dsh-external/project-nav@file:<tgz 路径>"
 ```
 
-依赖：`@deepseek-ai/dsh-tools`（peer，精确锁 `0.1.2-rc.1`）；Node ≥ 18。
+依赖：`@deepseek-ai/dsh-tools`（peer，`>=0.1.2-rc.1 <0.2.0`——与生态其他插件同写区间而非精确锁，本机验证于 0.1.5-rc.1）；Node ≥ 18。
 
 ## ⚙️ 配置 root（重要）
 
@@ -112,13 +112,13 @@ dsh plugin --profile web add "@dsh-external/project-nav@file:<tgz 路径>"
 
 ## 🗃️ 数据
 
-单一数据真身 `<root>/.internal/`（nav-index / vector / nav-actions / nav-docs），其余全部自动派生——**除 `root` 外零每项目配置**。索引与数据文件不进 git（`.gitignore`），数据手术一律先备份。`.internal/arch/*.md` 由配套 arch-view 技能维护，不在本包数据流内。
+单一数据真身 `<root>/.internal/`（nav-index / vector / nav-actions / nav-docs / nav-arch），其余全部自动派生——**除 `root` 外零每项目配置**。索引与数据文件不进 git（`.gitignore`），数据手术一律先备份。`.internal/arch/*.md` 由配套 arch-view 技能维护，不在本包数据流内。
 
 ## 🛠️ 开发
 
 ```bash
 pnpm install
-pnpm test      # node --test test/core.test.mjs test/concurrency.test.mjs（27 项真实回归，全部在临时目录跑，不碰真实工作区）
+pnpm test      # node --test test/core.test.mjs test/concurrency.test.mjs（74 项真实回归，全部在临时目录跑，不碰真实工作区）
 pnpm pack      # 构建发布包
 ```
 

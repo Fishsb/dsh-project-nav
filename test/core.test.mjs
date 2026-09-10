@@ -15,7 +15,7 @@ import {
   createEmptyDocs, saveDocs, loadDocs, nextDocId, suggestDocs,
   queryIndex, partialSearch,
   renderTreeText, renderMapHtml, renderProjectDocSection,
-  findStaleFiles, scopeTargetsOfOpenActions
+  findStaleFiles, scopeTargetsOfOpenActions, scopeFiles, sessionLabel
 } from '../shared/index.js'
 
 function tmpRoot(t) {
@@ -136,6 +136,42 @@ test('findStaleFiles flags only files missing on disk', (t) => {
   assert.deepEqual(stale, ['ghost.txt [alpha]'])
 })
 
+test('findStaleFiles probes orphan-feature files too (no module must not mean no check)', (t) => {
+  const root = tmpRoot(t)
+  writeFileSync(join(root, 'real.txt'), 'x')
+  const idx = seededIndex(root)
+  idx.indexes.featureToFiles['PE-F01'] = ['real.txt']
+  idx.indexes.fileToFeature = { 'real.txt': ['PE-F01'] }
+  idx.indexes.featureToFiles['PE-F02'] = ['ghost-orphan.txt']   // PE-F02 belongs to no module
+  assert.deepEqual(findStaleFiles(idx, root), ['ghost-orphan.txt [orphan feature PE-F02]'])
+})
+
+test('findStaleFiles reports a shared missing file once, not once per owner', (t) => {
+  const root = tmpRoot(t)
+  const idx = seededIndex(root)
+  idx.indexes.moduleToFeatures['editor'] = ['PE-F01', 'PE-F02']
+  idx.indexes.featureToFiles['PE-F01'] = ['shared-ghost.txt']
+  idx.indexes.featureToFiles['PE-F02'] = ['shared-ghost.txt']
+  idx.indexes.fileToFeature = { 'shared-ghost.txt': ['PE-F01', 'PE-F02'] }
+  assert.deepEqual(findStaleFiles(idx, root), ['shared-ghost.txt [alpha]'])
+})
+
+test('scopeFiles: project-prefixed index keys survive; bare project/module names are not files', (t) => {
+  const root = tmpRoot(t)
+  const idx = seededIndex(root)
+  idx.projectPaths = { alpha: 'alpha-dir' }
+  idx.indexes.featureToFiles['PE-F01'] = ['alpha-dir/src/main.js']   // workspace-relative index key
+  assert.deepEqual(
+    scopeFiles(idx, { features: ['PE-F01'] }, root),
+    ['alpha-dir/src/main.js'],
+    'an indexed file that starts with the project directory is a FILE, not a project name'
+  )
+  for (const name of ['alpha', 'editor', 'alpha-dir', 'ALPHA']) {
+    assert.deepEqual(scopeFiles(idx, { files: [name] }, root), [], `"${name}" is a scope node, not a file`)
+  }
+  assert.deepEqual(scopeFiles(idx, { files: ['alpha-dir/src/other.js'] }, root), ['alpha-dir/src/other.js'])
+})
+
 test('renderTreeText shows project tree and orphan features', (t) => {
   const root = tmpRoot(t)
   saveIndex(root, seededIndex(root))
@@ -163,4 +199,43 @@ test('renderMapHtml is a self-contained HTML document', (t) => {
   assert.ok(html.includes('<!DOCTYPE html>'))
   assert.ok(html.includes('alpha'))
   assert.ok(html.includes('PE-F01'))
+})
+
+test('sessionLabel carries the DISTINCTIVE part of a session id', () => {
+  assert.equal(sessionLabel('session-5634c6bb-93f1-4994-9c26-7f124dedee72'), '5634c6bb')
+  assert.notEqual(sessionLabel('session-aaaaaaaa-1'), sessionLabel('session-bbbbbbbb-2'))
+  assert.equal(sessionLabel(''), 'unknown')
+  assert.equal(sessionLabel('short'), 'short')
+})
+
+test('the index carries no dead tables, and metadata is stamped on every write', (t) => {
+  const idx = createEmptyIndex()
+  assert.deepEqual(Object.keys(idx.indexes), ['fileToFeature', 'featureToFiles', 'moduleToFeatures', 'projectToModules'])
+  assert.equal(idx.functionToModule, undefined, 'legacy table nobody reads')
+  assert.equal(idx.unmappedFiles, undefined, 'dead field (drift is probed live)')
+  assert.equal(idx.staleEntries, undefined, 'dead field (drift is probed live)')
+  const root = tmpRoot(t)
+  saveIndex(root, seededIndex(root))
+  const m = loadIndex(root).metadata
+  assert.equal(typeof m.generated, 'string')
+  assert.ok(Math.abs(Date.now() - Date.parse(m.generated)) < 60000, 'generated must be restamped by the write, not inherited')
+})
+
+test('generated docs never point at removed tools', (t) => {
+  const root = tmpRoot(t)
+  saveIndex(root, seededIndex(root))
+  const sec = renderProjectDocSection(loadIndex(root), {})
+  assert.doesNotMatch(sec, /nav_add_feature|nav_add_module|nav_add_doc/, sec)
+  assert.match(sec, /nav_update/, 'the routing must name the tool that actually exists')
+  const html = renderMapHtml(loadIndex(root), {})   // PE-F02 has no files → the gap hint renders
+  assert.doesNotMatch(html, /--field/, html)
+})
+
+test('renderMapHtml honours target, and reports an empty match honestly', (t) => {
+  const root = tmpRoot(t)
+  saveIndex(root, seededIndex(root))
+  const hit = renderMapHtml(loadIndex(root), { target: 'editor' })
+  assert.match(hit, /PE-F01/)
+  const miss = renderMapHtml(loadIndex(root), { target: 'no-such-thing' })
+  assert.match(miss, /No project or module matching this target/, 'an empty narrowing must say so')
 })

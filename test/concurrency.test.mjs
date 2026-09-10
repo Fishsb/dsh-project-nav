@@ -207,7 +207,9 @@ test('occupied target is visible to other sessions in nav_query', async () => {
   await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
   const asOther = await call(tools, 'nav_query', { target: 'project-nav/host/index.js' }, 'session-B')
   assert.match(asOther, /OCCUPIED/, asOther)
-  assert.match(asOther, /session-A|session-/, asOther)
+  // The holder must be identifiable. The label carries the distinctive part of the id
+  // (session-A → A): slicing the first 8 characters labelled every DSH session "session-".
+  assert.match(asOther, /by session A\b/, asOther)
 })
 
 test('the user-facing case: same file named explicitly → conflict', async () => {
@@ -632,6 +634,194 @@ test('repeat-patch gate: with no fingerprint evidence the action still counts (c
   }))
   const ledger = shared.loadActions(root)
   assert.equal(shared.repeatPressure(shared.loadArch(root), ledger.actions, 'PN-F01').count, 1, 'no evidence must never weaken the gate')
+})
+
+// ---- v0.7.4: the fingerprint must cover INDEXED files, and a lapsed lease is not a dead end ----
+// Live measurement that motivated this block: 12 of 18 features (every feature of project-nav and
+// shoucang) resolved to ZERO fingerprintable paths, because the index spells those files
+// workspace-relative ("project-nav/host/index.js") and the scope resolver dropped any path whose
+// first segment was a project directory. Drift was silently unreported.
+
+test('fingerprint: a feature-scoped action fingerprints its indexed, project-prefixed files', async () => {
+  const { root, tools } = await booted()
+  mkdirSync(join(root, 'project-nav', 'host'), { recursive: true })
+  const target = join(root, 'project-nav', 'host', 'index.js')
+  writeFileSync(target, 'v1')
+  const plan = await call(tools, 'nav_plan', { task: 'feature scope', anchor: 'PN-F01', features: 'PN-F01' }, 'session-A')
+  const id = plan.match(/ACT-\d+/)[0]
+  await call(tools, 'nav_mark', { id, action: 'begin' }, 'session-A')
+  const st = shared.loadActions(root).actions[0].scopeState
+  assert.ok(st, 'a feature scope must produce a fingerprint, not null')
+  assert.deepEqual(Object.keys(st.files), ['project-nav/host/index.js'])
+  writeFileSync(target, 'v2 — another session touched this while the action ran')
+  const done = await call(tools, 'nav_mark', { id, action: 'done' }, 'session-A')
+  assert.match(done, /Scope drift since begin/, done)
+  assert.deepEqual(shared.loadActions(root).actions[0].drift.changed, ['project-nav/host/index.js'])
+})
+
+test('fingerprint: a feature-scoped no-op close-out now records noChange (patch-gate evidence)', async () => {
+  const { root, tools } = await booted()
+  mkdirSync(join(root, 'project-nav', 'host'), { recursive: true })
+  writeFileSync(join(root, 'project-nav', 'host', 'index.js'), 'v1')
+  const plan = await call(tools, 'nav_plan', { task: 'verify only', anchor: 'PN-F01', features: 'PN-F01' }, 'session-A')
+  const id = plan.match(/ACT-\d+/)[0]
+  await call(tools, 'nav_mark', { id, action: 'begin' }, 'session-A')
+  await call(tools, 'nav_mark', { id, action: 'done' }, 'session-A')
+  const a = shared.loadActions(root).actions.find(x => x.id === id)
+  assert.equal(a.noChange, true, 'a feature-scoped bookkeeping action must be provable as no-change')
+  assert.equal(shared.repeatPressure(shared.loadArch(root), shared.loadActions(root).actions, 'PN-F01').count, 0)
+})
+
+test('lapsed lease: the owner can still re-begin, close out late, or abort', async () => {
+  const { root, tools } = await booted()
+  const old = new Date(Date.now() - 45 * 60 * 1000).toISOString()
+  const age = (ledger, id) => {
+    const a = ledger.actions.find(x => x.id === id)
+    a.startedAt = old
+    a.lease = { acquiredAt: old, renewedAt: old, ttlMs: 60 * 1000 }
+    shared.saveActions(root, ledger)
+  }
+  await call(tools, 'nav_plan', { task: 'long task', anchor: 'PN-F01', files: 'project-nav/host/index.js' }, 'session-A')
+  await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
+  age(shared.loadActions(root), 'ACT-001')
+  // expired must not be a terminal state: the owner re-acquires it
+  const again = await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
+  assert.match(again, /Re-acquired/, again)
+  assert.equal(shared.loadActions(root).actions[0].status, 'in_progress')
+  assert.ok(shared.loadActions(root).actions[0].scopeState, 'a re-acquire must retake the fingerprint')
+  // and it can be closed out late instead of being stranded
+  age(shared.loadActions(root), 'ACT-001')
+  const late = await call(tools, 'nav_mark', { id: 'ACT-001', action: 'done' }, 'session-A')
+  assert.match(late, /Late close-out/, late)
+  const closed = shared.loadActions(root).actions[0]
+  assert.equal(closed.status, 'done')
+  assert.equal(closed.lateCompletion, true)
+  // abort is reachable from expired as well
+  await call(tools, 'nav_plan', { task: 'give up', anchor: 'PN-F01', files: 'project-nav/host/index.js' }, 'session-A')
+  await call(tools, 'nav_mark', { id: 'ACT-002', action: 'begin' }, 'session-A')
+  age(shared.loadActions(root), 'ACT-002')
+  const aborted = await call(tools, 'nav_mark', { id: 'ACT-002', action: 'abort' }, 'session-A')
+  assert.match(aborted, /aborted/, aborted)
+})
+
+test('nav_map does not paint a lapsed action red (one truth with nav_status)', async () => {
+  const { root, tools } = await booted()
+  const old = new Date(Date.now() - 2 * 3600 * 1000).toISOString()
+  writeFileSync(join(root, '.internal', 'nav-actions.json'), JSON.stringify({
+    version: '1.1',
+    actions: [{ id: 'ACT-900', task: 'crashed session', scope: { features: ['PN-F01'] }, status: 'in_progress', createdAt: old, startedAt: old, lease: { renewedAt: old, ttlMs: 60 * 1000 }, owner: { sessionId: 'dead' } }]
+  }))
+  const map = await call(tools, 'nav_map', {}, 'session-A')
+  assert.doesNotMatch(map, /open action/, 'an expired lease is not a live hold: ' + map)
+  assert.match(map, /PN-F01/, 'the map itself must still render')
+})
+
+test('retire is not blocked by a lapsed lease (a dead session must not wedge the index)', async () => {
+  const { root, tools } = await booted()
+  const old = new Date(Date.now() - 2 * 3600 * 1000).toISOString()
+  writeFileSync(join(root, '.internal', 'nav-actions.json'), JSON.stringify({
+    version: '1.1',
+    actions: [{ id: 'ACT-900', task: 'dead session', scope: { features: ['PN-F01'] }, status: 'in_progress', createdAt: old, startedAt: old, lease: { renewedAt: old, ttlMs: 60 * 1000 }, owner: { sessionId: 'dead' } }]
+  }))
+  const out = await call(tools, 'nav_update', { target: 'PN-F01', retire: true }, 'session-A')
+  assert.match(out, /Retired feature PN-F01/, out)
+})
+
+test('nav_update re-homes a module between projects (and detaches it with project="")', async () => {
+  const { root, tools } = await booted()
+  await call(tools, 'nav_update', { target: 'XX-M01', features: 'PN-F01', project: 'DEMO' }, 'session-A')
+  assert.deepEqual(shared.loadIndex(root).indexes.projectToModules.DEMO, ['DM-M01', 'XX-M01'])
+  const moved = await call(tools, 'nav_update', { target: 'XX-M01', project: 'PN-P01' }, 'session-A')
+  assert.match(moved, /re-homed from DEMO to PN-P01/, moved)
+  const idx = shared.loadIndex(root)
+  assert.deepEqual(idx.indexes.projectToModules.DEMO, ['DM-M01'], 'the old attachment must be gone')
+  assert.ok(idx.indexes.projectToModules['PN-P01'].includes('XX-M01'))
+  const detached = await call(tools, 'nav_update', { target: 'XX-M01', project: '' }, 'session-A')
+  assert.match(detached, /detached from project PN-P01/, detached)
+  const after = shared.loadIndex(root)
+  assert.ok(!Object.values(after.indexes.projectToModules).some(m => m.includes('XX-M01')), 'a detached module must not remain attached anywhere')
+  assert.deepEqual(after.indexes.moduleToFeatures['XX-M01'], ['PN-F01'], 'detaching must not touch the module feature list')
+})
+
+test('a scope file that never existed is not reported as "vanished"', async () => {
+  const { tools } = await booted()
+  const plan = await call(tools, 'nav_plan', { task: 'create a file', anchor: 'PN-F01', files: 'brand/new.mjs' }, 'session-A')
+  const id = plan.match(/ACT-\d+/)[0]
+  await call(tools, 'nav_mark', { id, action: 'begin' }, 'session-A')
+  const done = await call(tools, 'nav_mark', { id, action: 'done' }, 'session-A')
+  assert.doesNotMatch(done, /vanished/, 'a file that was never created has not vanished: ' + done)
+})
+
+// ---- v0.7.4 (batch 2): declaration↔entity alignment, read-side truth, lock safety ----
+
+test('nav_adr says "first decision" only when it really is the first on that anchor', async () => {
+  const { tools } = await booted()
+  const first = await call(tools, 'nav_adr', { anchor: 'PN-F01', reason: 'r1', decision: 'd1' }, 'session-A')
+  assert.match(first, /First decision on this anchor/, first)
+  const second = await call(tools, 'nav_adr', { anchor: 'PN-F01', reason: 'r2', decision: 'd2' }, 'session-A')
+  assert.doesNotMatch(second, /First decision/, second)
+  assert.match(second, /No patches had accumulated since ADR-001/, second)
+})
+
+test('nav_docs resolves a root-relative path against the governed root, not cwd', async () => {
+  const { root, tools } = await booted()
+  writeFileSync(join(root, 'docs-note.md'), 'x')
+  const reg = await call(tools, 'nav_docs', { title: 'note', path: 'docs-note.md', when: 'anything' }, 'session-A')
+  assert.match(reg, /Registered DOC-001/, reg)
+  assert.equal(shared.loadDocs(root).docs[0].path, join(root, 'docs-note.md'), 'the stored path must be absolute and resolvable')
+})
+
+test('nav_status surfaces the architecture layer (decisions, last ADR, gate pressure)', async () => {
+  const { tools } = await booted()
+  const before = await call(tools, 'nav_status', {}, 'session-A')
+  assert.match(before, /Architecture: 0 decision\(s\) \(none recorded yet\)/, before)
+  await call(tools, 'nav_adr', { anchor: 'PN-F01', reason: 'r', decision: 'd' }, 'session-A')
+  const after = await call(tools, 'nav_status', {}, 'session-A')
+  assert.match(after, /Architecture: 1 decision\(s\), last ADR-001 on PN-F01/, after)
+  // Pressure becomes visible BEFORE it trips, so the model can act on it.
+  for (let i = 1; i <= 2; i++) {
+    await call(tools, 'nav_plan', { task: 'p' + i, anchor: 'DM-F01', features: 'DM-F01' }, 'session-A')
+    await call(tools, 'nav_mark', { id: 'ACT-00' + i, action: 'begin' }, 'session-A')
+    await call(tools, 'nav_mark', { id: 'ACT-00' + i, action: 'done' }, 'session-A')
+  }
+  const hot = await call(tools, 'nav_status', {}, 'session-A')
+  assert.match(hot, /near\/over the repeat-patch gate: DM-F01 2\/3/, hot)
+})
+
+test('nav_map target narrows both renderers (text + html)', async () => {
+  const { root, tools } = await booted()
+  const text = await call(tools, 'nav_map', { target: 'PN-P01' }, 'session-A')
+  assert.match(text, /PN-F01/, text)
+  assert.doesNotMatch(text, /DM-F01/, 'a narrowed map must not leak other projects: ' + text)
+  await call(tools, 'nav_map', { target: 'PN-P01', format: 'html' }, 'session-A')
+  const html = readFileSync(join(root, '.internal', 'map-PN-P01.html'), 'utf-8')
+  assert.match(html, /PN-F01/)
+  assert.doesNotMatch(html, /DM-F01/, 'the html renderer must honour target as well')
+})
+
+test('a nested lock acquire fails fast instead of deadlocking the queue', async () => {
+  const { root } = await booted()
+  await assert.rejects(
+    () => shared.withFileLock(root, 'outer-probe', () => shared.withFileLock(root, 'inner-probe', () => 'never reached')),
+    /nested lock acquire/,
+    'nesting must be a loud error, not a silent hang'
+  )
+  assert.equal(await shared.withFileLock(root, 'after-probe', () => 'ok'), 'ok', 'the queue must stay usable')
+  const lockDir = join(root, '.internal', 'locks')
+  const left = existsSync(lockDir) ? readdirSync(lockDir) : []
+  assert.deepEqual(left, [], 'no lock file may survive the guard: ' + left.join(','))
+})
+
+test('breaking an aged lock leaves no graveyard file behind', async () => {
+  const { root } = await booted()
+  const lockPath = shared.lockPathFor(root, 'graveyard-probe')
+  mkdirSync(join(root, '.internal', 'locks'), { recursive: true })
+  writeFileSync(lockPath, JSON.stringify({ token: 'foreign-dead-owner', pid: 999999, at: new Date(Date.now() - 60000).toISOString() }))
+  const backdated = (Date.now() - 60000) / 1000
+  utimesSync(lockPath, backdated, backdated)
+  assert.equal(await shared.withFileLock(root, 'graveyard-probe', () => 'acquired'), 'acquired')
+  const left = readdirSync(join(root, '.internal', 'locks'))
+  assert.deepEqual(left, [], 'the rename-based break must clean up after itself: ' + left.join(','))
 })
 
 process.on('exit', () => { try { rmSync(join(tmpdir(), 'nav-conc-'), { recursive: true, force: true }) } catch {} })
