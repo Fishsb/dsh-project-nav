@@ -44,27 +44,39 @@ test('normalizePath turns backslashes into forward slashes', () => {
   assert.equal(normalizePath('a/b/c'), 'a/b/c')
 })
 
-test('governedWorkspaceOf governs registered projects only, and never the rest of the root', () => {
+test('governedWorkspaceOf is opt-in per workspace and never governs the rest of the root', () => {
   const idx = createEmptyIndex()
   idx.projectPaths = { 'PN-P01': 'project-nav', alpha: 'deepseek/alpha' }
   const root = 'D:\\FF'
 
-  // inside a registered project → that project directory (any spelling of the cwd)
-  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:\\FF\\project-nav\\host')), 'D:/FF/project-nav')
-  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:/FF/deepseek/alpha')), 'D:/FF/deepseek/alpha')
-  // the root itself is governed
-  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:\\FF')), 'D:/FF')
-  // a directory inside the root that is NOT a registered project → untouched
-  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FF\\scratch'), '')
+  // OPT-IN: an empty allow-list governs NOTHING, whatever the cwd is. The native mode has
+  // exactly one writable root, so a session whose work reaches into ~/.dsh would be stopped
+  // rather than protected — the caller must name the workspaces that are self-contained.
+  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FF\\project-nav'), '')
+  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FF', []), '')
+
+  // allow by directory name / by project key / by relative path — all three spellings work
+  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:\\FF\\project-nav\\host', ['project-nav'])), 'D:/FF/project-nav')
+  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:/FF/project-nav', ['PN-P01'])), 'D:/FF/project-nav')
+  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:/FF/deepseek/alpha', ['deepseek/alpha'])), 'D:/FF/deepseek/alpha')
+  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:\\FF\\project-nav', 'project-nav')), 'D:/FF/project-nav')
+
+  // allowed project but a cwd in a DIFFERENT workspace → untouched (each workspace is its own grant)
+  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FF\\deepseek\\alpha', ['project-nav']), '')
+  // a directory inside the root that is not a registered project → untouched
+  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FF\\scratch', ['project-nav', 'scratch']), '')
   // outside the root entirely → untouched
-  assert.equal(governedWorkspaceOf(idx, root, 'C:\\Users\\lk\\elsewhere'), '')
+  assert.equal(governedWorkspaceOf(idx, root, 'C:\\Users\\lk\\elsewhere', ['project-nav']), '')
   // a sibling whose name merely starts with the root's must not read as containment
-  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FFx'), '')
-  // an index with no project table governs only the root, never a subdirectory
-  assert.equal(governedWorkspaceOf(createEmptyIndex(), root, 'D:\\FF\\project-nav'), '')
+  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FFx', ['project-nav']), '')
+  // the root itself is NEVER governed: a root-wide boundary would let a session write into
+  // every project, which is the drift this exists to prevent.
+  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FF', ['project-nav', 'FF', 'D:/FF']), '')
+  // an index with no project table has nothing to allow
+  assert.equal(governedWorkspaceOf(createEmptyIndex(), root, 'D:\\FF\\project-nav', ['project-nav']), '')
   // missing inputs never throw — the caller relies on this being total
-  assert.equal(normalizePath(governedWorkspaceOf(null, root, 'D:\\FF')), 'D:/FF')
-  assert.equal(governedWorkspaceOf(idx, root, ''), '')
+  assert.equal(governedWorkspaceOf(null, root, 'D:\\FF', ['project-nav']), '')
+  assert.equal(governedWorkspaceOf(idx, root, '', ['project-nav']), '')
 })
 
 test('index/vector/actions/docs round-trip through atomic JSON in a temp root', (t) => {

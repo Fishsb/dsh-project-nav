@@ -42,11 +42,21 @@ export const Config = z.object({
   // Multi-session leases: how long an in_progress action keeps its scope lock
   // without a heartbeat before another session may claim the same scope.
   leaseTtlMs: z.number().default(0),
-  // Workspace boundary (ADR-014): bind every session whose cwd belongs to a GOVERNED
-  // workspace to the native `workspace-write` sandbox, so its write actions cannot leave
-  // that workspace while reads stay unrestricted everywhere. The boundary itself is the
-  // harness's — this plugin only decides which workspaces are governed. Set false to
-  // leave every session untouched.
+  // Workspace boundary (ADR-014): bind a session whose cwd belongs to a selected workspace
+  // to the native `workspace-write` sandbox, so its write actions cannot leave that
+  // workspace while reads stay unrestricted everywhere. The boundary itself is the
+  // harness's — this plugin only decides which sessions get it.
+  //
+  // `boundaryWorkspaces` is the real selector and it is an ALLOW-LIST: comma-separated
+  // project keys / relative paths / directory names (e.g. "PN-P01" or "project-nav").
+  // EMPTY (the default) GOVERNS NOTHING. That default is deliberate: the native mode has
+  // exactly one writable root — the session cwd — so a session whose work reaches into
+  // ~/.dsh (memory library, skills, profile deployment) would be stopped rather than
+  // protected. Opt in only workspaces whose work is self-contained.
+  boundaryWorkspaces: z.string().default(''),
+  // Master switch, kept for a clean migration off the pre-allow-list behaviour (where the
+  // mere presence of a governed workspace was enough to bind). false leaves every session
+  // untouched regardless of the allow-list.
   autoBindWorkspace: z.boolean().default(true)
 })
 
@@ -255,8 +265,9 @@ export function apply(ctx, config) {
         const session = payload?.agent?.session
         const cwd = session?.header?.cwd
         if (!session || !cwd || typeof session.append !== 'function') return
-        // Not governed → leave the session completely alone (its workspace may merely share the root).
-        const zone = governedWorkspaceOf(loadIndex(root), root, cwd)
+        // Not governed → leave the session completely alone. The boundary is opt-in
+        // per workspace: an empty allow-list governs nothing (see Config.boundaryWorkspaces).
+        const zone = governedWorkspaceOf(loadIndex(root), root, cwd, config?.boundaryWorkspaces)
         if (!zone) return
         const policy = ctx.get?.('sandboxPolicy')
         if (!policy || typeof policy.overrideOf !== 'function') return

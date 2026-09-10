@@ -174,26 +174,41 @@ export function normalizePath(p) {
  *
  * This is the ONE fact the harness cannot supply. The harness already knows that a
  * session's cwd is its workspace and that `workspace-write` confines writes to it; what
- * it cannot know is which directories THIS deployment claims as governed projects. So the
- * plugin contributes exactly this decision and nothing else — enforcement, the approval
- * path, and projecting the policy into the model's context all stay native (ADR-014).
+ * it cannot know is which directories THIS deployment chooses to govern. So the plugin
+ * contributes exactly this decision and nothing else — enforcement, the approval path,
+ * and projecting the policy into the model's context all stay native (ADR-014).
  *
- * The root itself counts as governed (a session opened at the root governs the whole
- * root). A directory inside the root that matches no `projectPaths` entry is NOT governed,
- * so an unrelated workspace that merely shares the root is left completely alone.
+ * The boundary is OPT-IN PER WORKSPACE (`allow`), because the native mode has exactly one
+ * writable root: the session cwd. A session whose real work reaches outside that root —
+ * anything maintaining ~/.dsh (memory library, skills, profile deployment) — would be
+ * stopped, not protected. So an EMPTY allow-list governs NOTHING, and a caller opts in only
+ * the workspaces whose work is self-contained.
+ *
+ * `allow` entries match a project by its key, its relative path, or its directory name
+ * (case-insensitive). The root itself is never governed: a root-wide boundary would let a
+ * session write into every project, which is the drift this exists to prevent.
  */
-export function governedWorkspaceOf(index, rootPath, cwd) {
+export function governedWorkspaceOf(index, rootPath, cwd, allow = []) {
   const fold = (p) => normalizePath(p || '').trim().replace(/\/+$/, '').toLowerCase();
+  const base = (p) => {
+    const parts = normalizePath(p || '').split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1].toLowerCase() : '';
+  };
   const within = (p, zone) => p === zone || p.startsWith(zone + '/');
   const c = fold(cwd);
   const root = fold(rootPath);
   if (!c || !root || !within(c, root)) return '';
-  for (const rel of Object.values(index?.projectPaths || {})) {
-    const dir = resolve(rootPath, String(rel));
+  const permit = (Array.isArray(allow) ? allow : String(allow || '').split(','))
+    .map(x => fold(x)).filter(Boolean);
+  if (permit.length === 0) return ''; // opt-in: nothing is governed by default
+  for (const [key, rel] of Object.entries(index?.projectPaths || {})) {
+    const name = String(rel);
+    if (!permit.includes(fold(key)) && !permit.includes(fold(name)) && !permit.includes(base(name))) continue;
+    const dir = resolve(rootPath, name);
     const zone = fold(dir);
     if (zone && within(c, zone)) return dir;
   }
-  return c === root ? resolve(rootPath) : '';
+  return '';
 }
 
 // ---- atomic JSON IO ----

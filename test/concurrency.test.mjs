@@ -102,11 +102,12 @@ async function booted() {
   return { root, ...boot(root) }
 }
 
-test('workspace boundary: asserts the boundary over the initializer stamp, never loosens, never touches the rest', async () => {
+test('workspace boundary: opt-in per workspace, asserts over the initializer stamp, never loosens', async () => {
   const root = makeRoot()
   const appended = []
   const policy = { overrideOf: () => undefined }
-  const { handlers } = boot(root, {}, policy)
+  // The allow-list is the real selector: name the workspace(s) whose work is self-contained.
+  const { handlers } = boot(root, { boundaryWorkspaces: 'project-nav' }, policy)
   const start = handlers.find(h => h.name === 'agent/session-start')?.listener
   assert.ok(start, 'the boundary listener is registered at session start')
 
@@ -146,8 +147,17 @@ test('workspace boundary: asserts the boundary over the initializer stamp, never
   start({ agent: { id: 'session-e', session: { header: {}, append: () => assert.fail('must not append') } } })
   assert.equal(bound().length, 2)
 
-  // autoBindWorkspace=false leaves even a governed session alone
-  const off = boot(root, { autoBindWorkspace: false }, policy)
+  // An EMPTY allow-list governs nothing: the listener is registered but never binds. This is
+  // the safe default — the native mode has one writable root, so a session whose work reaches
+  // into ~/.dsh would be stopped rather than protected.
+  const none = boot(root, { boundaryWorkspaces: '' }, policy)
+  const startNone = none.handlers.find(h => h.name === 'agent/session-start')?.listener
+  const beforeEmpty = bound().length
+  startNone({ agent: { id: 'session-f', session: session(join(root, 'project-nav'), 'session-f') } })
+  assert.equal(bound().length, beforeEmpty, 'an empty allow-list must not bind anything')
+
+  // autoBindWorkspace=false leaves even an allowed session alone
+  const off = boot(root, { boundaryWorkspaces: 'project-nav', autoBindWorkspace: false }, policy)
   assert.equal(off.handlers.filter(h => h.name === 'agent/session-start').length, 0)
 })
 
