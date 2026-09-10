@@ -31,10 +31,10 @@ D:\lk\tools\dsh-web.cmd        # 现唯一启动方式；无自启 —— 重启
 
 **已知缺口（nssm 卸载的后果，不属边界本身）**：
 
-1. **自启：存在冲突记录，待用户裁定（2026-09-11）** —— nssm 卸载后 `dsh-web`(3080) 与旧桥(9915) 都失去自启。我按用户对「自启形态」提问的回答（"默认就行" → 取推荐项）用 `docs/install-logon-autostart.ps1` 建了两个交互式登录任务（`dsh-web-user` / `dsh-bge-embed-user`：`LogonType=Interactive`、`RunLevel=Limited`、user=lk）。
-   **但**同日记忆库的记录是「宿主 3080 用户拍板**保持手动启动（不自启、不保活）**」—— 两者冲突，**以用户裁定为准**；若维持手动，`... -Remove` 撤销（需管理员）。
-   与裁定无关、已成立的部分：登录任务机制**确实能拉起服务**（杀掉手工实例后 `schtasks /run /tn dsh-bge-embed-user` → 旧桥 ~4s 复活、owner=lk）—— **"建了任务" ≠ "任务能拉起服务"**，判据只能是后者。
-   宿主 `dsh-web-user` 任务**至今未跑测**（跑它等于杀宿主）：本次重启由用户手工双击 `dsh-web.cmd` 完成（任务 `LastTaskResult=267011` = 从未运行）。
+1. **自启：已按「手动启动（不自启、不保活）」收口（2026-09-11）** —— nssm 卸载后 `dsh-web`(3080) 与旧桥(9915) 都失去自启。我曾按用户对「自启形态」提问的回答（"默认就行"）用 `docs/install-logon-autostart.ps1` 建了两个交互式登录任务（`dsh-web-user` / `dsh-bge-embed-user`：`LogonType=Interactive` + `RunLevel=Limited` + user=lk）。
+   **闭环**：同日记忆库记录的是「用户拍板**保持手动启动（不自启、不保活）**」；且"默认就行"在当时默认态本就是手动这一读法下与之一致 ⇒ **按手动收口**。**复核时两个任务均已不存在**（在本轮之前已被撤除），无需再动；`install-logon-autostart.ps1` 保留为将来可选的方案（`-Remove` 可回滚，两者都需管理员）。
+   与裁定无关、已成立的技术结论：登录任务机制**确实能拉起服务**（实测：杀掉手工实例后 `schtasks /run` 该任务 → 旧桥 ~4s 内复活、owner=lk）—— **"建了任务" ≠ "任务能拉起服务"**，判据只能是后者。宿主 `dsh-web-user` 任务**始终未被跑测**（跑它等于杀宿主），每次重启都靠手工双击 `dsh-web.cmd`。
+   现状：`dsh-web` 手动启动（`D:\lk\tools\dsh-web.cmd`）；旧桥 9915 已停用，向量承载 = Ollama `bge-m3` @11434（实测可达、`provider=DmlExecutionProvider` 那条自建桥不再需要）。
 2. **旧桥 9915：已退役，不是"要复活"（我上轮在此误判，如实留痕）**
    - **当时的诊断（正确）**：9915 无监听，而 `~/.dsh/suite/scheduler.json` 那一刻仍指 9915 → 记忆 dense 召回退化为纯词法。
    - **被主线推翻的事实**：同一时刻主线已在迁移到 **Ollama** —— `02:11:53` 把 `scheduler.json` 的 `embedBaseUrl` 改成 `http://127.0.0.1:11434/v1`，`02:12:25` 起 `ollama.exe`，`02:16:27` 更新部署副本（`lib/scheduler.js` 缺省 = 11434；`panel.js` 注释明写「不再写死 9915…改由 Ollama 承载」）。**我的启动件是在配置切走 6 秒之后才把旧桥拉起来的**。

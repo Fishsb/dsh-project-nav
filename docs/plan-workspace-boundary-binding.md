@@ -154,6 +154,9 @@ cwd 在 root 之内                     → 在 projectPaths 中找"被 allow �
    - **插件自身的发布/安装路径被拒**：安装要写 `~/.dsh/profiles/web`（锁文件 + 声明 + 安装副本），全在工作区外 ⇒ **从被治理会话里无法自部署**。这正是 §6 那句 opt-in 判据的张力——"工作触达 `~/.dsh` 的工作区不该 opt-in"，而 project-nav 自己每次发版都要落到 `~/.dsh`。运行期解法有二：① §9 的**单会话逃生门** `/permission danger-full-access`（后写者胜、立即生效、无需重启）；② 把部署步骤放到**未被治理的会话或用户终端**执行。
    - **`git push` 也被拒（2026-09-11 实测）**：HTTPS 走 schannel → `AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`（受限令牌拿不到 TLS 客户端凭据）；换 `-c http.sslBackend=openssl` 后 TLS 通了，但**凭据助手与传输子进程都要 piped-stdio 的 msys 子进程**（`sh.exe` / `ssh.exe`：`couldn't create signal pipe, Win32 error 5`）⇒ 推送只能在**未被治理的会话或用户终端**里做。排除项：网络没问题 —— `node`（OpenSSL）直连 `api.github.com` 正常；`ssh -T git@github.com` 直跑也成功（`Hi Fishsb!`），只有"被 git 以管道捕获"时才会撞墙。
    - **反向确认（未受影响，且是设计意图的运行时体现）**：插件自身的 `nav_*` 工具仍能读写治理数据（`D:\FF\.internal` 在工作区外）—— 因为它们在**宿主进程内**执行，不经会话沙箱；插件就是治理根的唯一受权通道。
+6. **受限会话里的诊断工具本身会失真（2026-09-11 实测，务必换口径）**：
+   - `Get-NetTCPConnection -State Listen -LocalPort <p>` **对任何端口都静默返回空** —— 一度让我误判"3080 没有监听、宿主已死"，而事实是宿主正在跑、HTTP 调用成功。**判活改用 TCP 连接法**（`TcpClient.BeginConnect` + `Poll`）或直接打端点，勿信枚举结果。
+   - `tasklist` → `ERROR: Access denied`（响亮失败，尚可察觉）；两者叠加的教训是：**受限会话里的"看不见"与"不存在"长得一模一样**——凡是用枚举类工具得出的"没有/为空"，都要用第二种口径复核再下结论。
 
 ## 11. 附带发现（不在本次范围，单独留痕）
 
