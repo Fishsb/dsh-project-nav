@@ -191,6 +191,8 @@ export function loadIndex(rootPath) {
   return readJson(resolve(rootPath, INDEX_FILENAME), createEmptyIndex, { failLoud: true, label: 'nav index' });
 }
 
+/** LOW-LEVEL unlocked write. Production code must go through mutateIndex() — a bare
+ *  read-modify-write here loses the other writer's update (the v0.7.0 bug class). */
 export function saveIndex(rootPath, index) {
   index.generated = new Date().toISOString();
   recomputeMetadata(index);
@@ -228,6 +230,7 @@ export function loadVector(rootPath) {
   return readJson(resolve(rootPath, VECTOR_FILENAME), createDefaultVector, { label: 'vector' });
 }
 
+/** LOW-LEVEL unlocked write. Production code must go through mutateVector(). */
 export function saveVector(rootPath, vector) {
   vector.updatedAt = new Date().toISOString();
   atomicWriteJson(resolve(rootPath, VECTOR_FILENAME), vector);
@@ -641,6 +644,7 @@ export function loadArch(rootPath) {
   return readJson(resolve(rootPath, ARCH_FILENAME), createEmptyArch, { failLoud: true, label: 'architecture ledger' });
 }
 
+/** LOW-LEVEL unlocked write. Production code must go through mutateArch(). */
 export function saveArch(rootPath, arch) {
   atomicWriteJson(resolve(rootPath, ARCH_FILENAME), arch);
 }
@@ -703,6 +707,7 @@ export function loadDocs(rootPath) {
   return readJson(resolve(rootPath, DOCS_FILENAME), createEmptyDocs, { failLoud: true, label: 'reference docs registry' });
 }
 
+/** LOW-LEVEL unlocked write. Production code must go through mutateDocs(). */
 export function saveDocs(rootPath, registry) {
   atomicWriteJson(resolve(rootPath, DOCS_FILENAME), registry);
 }

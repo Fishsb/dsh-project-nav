@@ -1197,10 +1197,14 @@ _本文件应随项目推进持续更新。最后更新：2026-09-10 10:05_
 
 ① bump → ② `pnpm pack` 得 `dsh-external-project-nav-0.7.0.tgz`（42598B，内部 0.7.0，语义字段与源全 MATCH）→ ③ 归档 `0.6.0.tgz → .superseded-20260910-v070`、更新 profile 声明为 0.7.0（备份 `.bak-declfix-v070-*`）→ ④ **未走重装**（实体已与源一致，重装会触发 pnpm peer 重解析 → §11 双实例事故面）→ ⑤ 三层 SHA256 全 MATCH（src = installed = plugins）、四链接拓扑完好、patch 层无 disabled 残留 → ⑥ `dsh --profile web --dump-config` exit=0 / 594 行 / project-nav 条目正常。
 
+**发布后补记（同日 18:35，防回归护栏）**：为防 G2 回归，给 `shared/index.js` 的 4 个低层导出（`saveIndex` / `saveVector` / `saveArch` / `saveDocs`）加了「LOW-LEVEL unlocked write — 生产代码必须走 `mutateX()`」警示注释（4 条）。注释改动动了文件字节，故**重打包 0.7.0**（42831B）并重新镜像：四者 SHA256 全 MATCH（src = tgz = installed = plugins，shared=`DFE17172…`）。注释不改变行为，**无需再次重启**；套件复跑 43/43 绿。
+
+> 排查提醒：核对 profile 声明时**别用 PowerShell 的 `ConvertFrom-Json` + 中括号索引**取 `@dsh-external/project-nav` 这类含 `@`/`/` 的键——会静默返回空串（本次一度误判「声明丢失」）。用 Node 读或直接看 `profiles/web/package.json` 第 8 行。
+
 ### 34.6 遗留
 
-1. **重启 dsh-web 由用户执行**（当前 daemon 内存里仍是 v0.5.0 代码；本插件无热重载路径）。
+1. ~~**重启 dsh-web 由用户执行**~~ **已完成（lk 执行，18:28）并实机验收通过**：三层 SHA256 全 MATCH、profile 版本 0.7.0、线上 `shared` 含 v0.7.0 特征（`withFileLock` / `.internal/locks` / `mutateArch` / 单复数修复）；锁目录已建且**0 残留**（账本读与 `nav_docs` 写都实走了加锁路径）；线上 `nav_map` 渲染复现修复（无 `1 modules`、howto 含 anchor/nav_adr）；**锚点闸实拦**歧义 scope（`features=PN-F01,PN-F02` 被拒并给出锚点指引）；`nav_docs` 登记 **DOC-009**（多模态排障卡）成功；`nav_status` 健康（23 features / 44 files / 6 modules / 5 projects，STALE 仅剩 pmg 的 7 条旧脚本）。
 2. §33.5 的三项遗留（源目录 `node_modules/` 19 个 `@deepseek-ai` 拷贝、复核卡声明条目随版本 bump 再度过时、`dsh-client-runtime` junction 指向非核心副本）**仍未处理**，均待 lk 决策；本次发布走的正是 §33.4 清单，故声明与实体此刻一致。
 3. 架构档 L1/L2 指纹与行号已按本次代码变动刷新（`arch-cache` 块 + L2 行号重核）。
 
-_本文件应随项目推进持续更新。最后更新：2026-09-10 18:20_
+_本文件应随项目推进持续更新。最后更新：2026-09-10 18:35_
