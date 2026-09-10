@@ -30,15 +30,22 @@ D:\lk\tools\dsh-web.cmd        # 现唯一启动方式；无自启 —— 重启
 
 **已知缺口（nssm 卸载的后果，不属边界本身）**：
 
-1. **自启已恢复（登录自启计划任务，2026-09-11 用户拍板）** —— nssm 卸载后 `dsh-web`(3080) 与 `bge-embed`(9915) 一度都失去自启；现由 `docs/install-logon-autostart.ps1` 建两个**交互式登录任务**：`dsh-web-user` / `dsh-bge-embed-user`（`LogonType=Interactive`、`RunLevel=Limited`、user=lk、trigger=登录时）。
-   **验收走实证**：杀掉手工实例后 `schtasks /run /tn dsh-bge-embed-user` → 9915 在 ~4s 内复活（`provider=DmlExecutionProvider`、owner=lk）——**建了任务 ≠ 任务能拉起服务**，故以"任务真的把服务拉起来"为判据。手动启动件仍保留（`D:\lk\tools\dsh-web.cmd` / `bge-embed.cmd`），与任务**二选一**，别同时用（后起的会 EADDRINUSE 退出）。
-2. **连带损伤：`dsh-bge-embed`（`127.0.0.1:9915`，守藏记忆的本地 bge-m3 向量后端）随 nssm 一起消失** —— 该服务原为 `nssm AUTO_START`，卸载后 9915 无监听，记忆 **dense 召回静默退化为纯词法**（`scheduler.ts` 里 `embedBaseUrl` 仍指 9915）。**已恢复并实证**：新建启动件 `D:\lk\tools\bge-embed.cmd`（与 `dsh-web.cmd` 同一约定，ASCII-only；无 nssm、无自启），
-   ```
-   D:\AI\venv-bge\Scripts\python.exe D:\lk\deepseek\tools\bge-m3-openai-server-gpu.py D:\AI\models\bge-m3 1024 9915
-   ```
-   实测：`/health` → `provider=DmlExecutionProvider`（GPU）、`dims=1024`；批量 3 条 361ms；语义自检 `cos(排障要先取真因, debug 时先定位根因)=0.62` > `cos(…, 今天天气不错)=0.39`（**近义高于无关，鉴别力在**）。
-   > 踩坑留痕：第一版自检用 PowerShell 管道取向量，`$r.data | % { $_.embedding }` 会把 1024 维数组**展平成标量流**，算出的余弦恒为 ±1.0（假数据）。**这类"看起来是模型的错"的结果，先怀疑测量代码**；换 node 直取 `data[i].embedding` 才可信。
-3. **`switch-dsh-web-to-user.ps1` 作废** —— 它的前提（停用 nssm 服务）已不存在；其 onlogon 思路由 `install-logon-autostart.ps1` 按新形态落地。**并且不再需要最高权限**（`/rl highest`）：当前实例是标准（已过滤）令牌，受限令牌 runner 实测 PASS，故任务用 `Limited` —— 少给权限更稳。
+1. **自启：存在冲突记录，待用户裁定（2026-09-11）** —— nssm 卸载后 `dsh-web`(3080) 与旧桥(9915) 都失去自启。我按用户对「自启形态」提问的回答（"默认就行" → 取推荐项）用 `docs/install-logon-autostart.ps1` 建了两个交互式登录任务（`dsh-web-user` / `dsh-bge-embed-user`：`LogonType=Interactive`、`RunLevel=Limited`、user=lk）。
+   **但**同日记忆库的记录是「宿主 3080 用户拍板**保持手动启动（不自启、不保活）**」—— 两者冲突，**以用户裁定为准**；若维持手动，`... -Remove` 撤销（需管理员）。
+   与裁定无关、已成立的部分：登录任务机制**确实能拉起服务**（杀掉手工实例后 `schtasks /run /tn dsh-bge-embed-user` → 旧桥 ~4s 复活、owner=lk）—— **"建了任务" ≠ "任务能拉起服务"**，判据只能是后者。
+   宿主 `dsh-web-user` 任务**至今未跑测**（跑它等于杀宿主）：本次重启由用户手工双击 `dsh-web.cmd` 完成（任务 `LastTaskResult=267011` = 从未运行）。
+2. **旧桥 9915：已退役，不是"要复活"（我上轮在此误判，如实留痕）**
+   - **当时的诊断（正确）**：9915 无监听，而 `~/.dsh/suite/scheduler.json` 那一刻仍指 9915 → 记忆 dense 召回退化为纯词法。
+   - **被主线推翻的事实**：同一时刻主线已在迁移到 **Ollama** —— `02:11:53` 把 `scheduler.json` 的 `embedBaseUrl` 改成 `http://127.0.0.1:11434/v1`，`02:12:25` 起 `ollama.exe`，`02:16:27` 更新部署副本（`lib/scheduler.js` 缺省 = 11434；`panel.js` 注释明写「不再写死 9915…改由 Ollama 承载」）。**我的启动件是在配置切走 6 秒之后才把旧桥拉起来的**。
+   - **误判根因（值得记）**：我据以判断的是 `CHANGELOG.md:64` / `ARCHITECTURE.md:54`，而它们**当时还在写 nssm AUTO_START :9915** —— 正是 ACT-037 记录的文档脱钩。**教训：判定"当前在用什么"，先读实时配置（`scheduler.json`）与部署副本，再读文档；文档可能是上一代。**
+   - **已处置**：9915 进程与 `D:\lk\tools\bge-embed.cmd` 启动件均已撤（不再无谓占用 ~2GB 显存）；当前向量承载 = **Ollama `bge-m3:latest` @11434**（OpenAI 兼容 `/v1`）。
+   - **万一要复活旧桥**（资产仍在：`D:\AI\models\bge-m3\onnx\model_quantized.onnx` 569MB，实测能加载且语义正常；已删的是 `~\.dsh\memory` 那棵树，旧桥缺省并不用它）：
+     ```
+     D:\AI\venv-bge\Scripts\python.exe D:\lk\deepseek\tools\bge-m3-openai-server-gpu.py D:\AI\models\bge-m3 1024 9915
+     ```
+   - 旧桥当时的实测（供参考）：`provider=DmlExecutionProvider`、`dims=1024`、批量 3 条 361ms、语义自检 近义 0.62 > 无关 0.39。
+   > 附带踩坑：第一版语义自检用 PowerShell 管道取向量，`$r.data | % { $_.embedding }` 会把 1024 维数组**展平成标量流**，算出的余弦恒为 ±1.0（假数据）。**"看起来是模型的错"的结果，先怀疑测量代码**；换 node 直取 `data[i].embedding` 才可信。
+3. **`switch-dsh-web-to-user.ps1` 作废** —— 它的前提（停用 nssm 服务）已不存在；其 onlogon 思路由 `install-logon-autostart.ps1` 承接（是否安装见第 1 条裁定）。**且不再需要最高权限**（`/rl highest`）：当前实例是标准（已过滤）令牌，受限令牌 runner 实测 PASS，故任务用 `Limited` —— 少给权限更稳。
 
 **本次踩到的三个 Windows 坑（均实测，别再踩）**：
 
