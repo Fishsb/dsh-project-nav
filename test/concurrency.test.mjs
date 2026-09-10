@@ -243,6 +243,32 @@ test('workspace boundary: a failed boot probe is retried, never cached for the p
   assert.ok(diag.sessions.some(s => s.decision === 'bound'), 'the bound session is recorded')
 })
 
+test('nav_query resolves an absolute path inside the root — no silent false negative', async () => {
+  // Index keys are root-relative, while a model naturally hands over the absolute path it is
+  // already working with. Before the fix an absolute path matched nothing, so nav_query said
+  // "No mapping found … register it via nav_update" about a file that was registered all
+  // along — a false negative that invites a duplicate registration and actually manufactured
+  // a phantom governance action on 2026-09-11.
+  const { root, tools } = await booted()
+  const abs = await call(tools, 'nav_query', { target: join(root, 'project-nav', 'host', 'index.js') }, 'session-q')
+  assert.match(abs, /Features: PN-F01/, 'an absolute path must reach the same mapping')
+  assert.match(abs, /\[resolved from: /, 'the resolution is stated, not silent')
+  assert.match(abs, /project-nav\/host\/index\.js/, 'the canonical root-relative form is echoed back')
+
+  // Outside the governed root: say so instead of implying nothing is registered.
+  const outside = await call(tools, 'nav_query', { target: 'C:\\elsewhere\\x.js' }, 'session-q')
+  assert.match(outside, /OUTSIDE the governed root/)
+
+  // The root itself is not a file target.
+  const atRoot = await call(tools, 'nav_query', { target: root }, 'session-q')
+  assert.match(atRoot, /governed root itself/)
+
+  // The relative form keeps working, and is not mislabelled as a resolution.
+  const rel = await call(tools, 'nav_query', { target: 'project-nav/host/index.js' }, 'session-q')
+  assert.match(rel, /Features: PN-F01/)
+  assert.doesNotMatch(rel, /resolved from/)
+})
+
 test('disjoint scopes: two sessions hold live locks at the same time', async () => {
   const { tools } = await booted()
   const a = await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' , anchor: 'PN-F01' }, 'session-A')

@@ -78,6 +78,33 @@ function splitList(s) {
 }
 
 /**
+ * Resolve a nav_query target into the form the index is keyed by.
+ *
+ * Index keys are ROOT-RELATIVE (`project-nav/host/index.js`), but a model naturally hands
+ * over the ABSOLUTE path it is already working with. An absolute path missed every key, so
+ * nav_query answered "No mapping found … register it via nav_update" for a file that was
+ * registered all along — a false negative that invites a duplicate registration (observed
+ * 2026-09-11: it manufactured a phantom governance action). A silent wrong answer is worse
+ * than a miss, so this both normalizes and reports the two cases the caller must name
+ * explicitly (the root itself, and paths outside the governed root).
+ *
+ * @returns {{target: string, outside?: boolean, atRoot?: boolean, resolved?: string}}
+ */
+function relativizeQueryTarget(rootPath, target) {
+  const raw = String(target ?? '').trim()
+  if (!raw) return { target: raw }
+  const isAbsolute = /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith('\\\\') || raw.startsWith('/')
+  if (!isAbsolute) return { target: raw }
+  const norm = (p) => normalizePath(p).replace(/\/+$/, '').toLowerCase()
+  const rootNorm = norm(rootPath)
+  const targetNorm = norm(raw)
+  if (targetNorm === rootNorm) return { target: raw, atRoot: true }
+  if (!targetNorm.startsWith(rootNorm + '/')) return { target: raw, outside: true }
+  const rel = normalizePath(raw).slice(normalizePath(rootPath).replace(/\/+$/, '').length).replace(/^\/+/, '')
+  return { target: rel, resolved: rel }
+}
+
+/**
  * Session identity of the caller. The governed workspace is shared by every DSH
  * session, so this is what tells two concurrent sessions apart; `exec.agent.id`
  * is the agent's SessionId. Returns null outside a session (tests, CLI), which
@@ -449,14 +476,24 @@ export function apply(ctx, config) {
       const sid = sidOf(exec)
       const ttl = ttlOf(config)
       try {
+        // Index keys are root-relative while a model hands over absolute paths — normalize
+        // BEFORE the lookup (see relativizeQueryTarget for the false negative this removes).
+        const q = relativizeQueryTarget(root, args.target)
+        if (q.atRoot) {
+          return `"${args.target}" is the governed root itself — nav_query maps files INSIDE it. Pass a root-relative path (e.g. "project-nav/host/index.js") or a feature code.`
+        }
+        if (q.outside) {
+          return `"${args.target}" is an absolute path OUTSIDE the governed root (${root}), so nothing here can map it. Pass a root-relative path or a feature code; if that file belongs to another governed root, query it from a session rooted there.`
+        }
         const index = loadIndex(root)
-        const result = queryIndex(index, args.target)
+        const result = queryIndex(index, q.target)
         if (!result || (result.features.length === 0 && result.files.length === 0 && result.modules.length === 0)) {
-          const partials = partialSearch(index, args.target)
+          const from = q.resolved ? ` (resolved from "${args.target}")` : ''
+          const partials = partialSearch(index, q.target)
           if (partials.length > 0) {
-            return `No exact match for "${args.target}". Did you mean:\n${partials.map(m => `  - ${m}`).join('\n')}`
+            return `No exact match for "${q.target}"${from}. Did you mean:\n${partials.map(m => `  - ${m}`).join('\n')}`
           }
-          return `No mapping found for "${args.target}". Register it via nav_update (upsert: a feature with files=, a module with features=/project=).`
+          return `No mapping found for "${q.target}"${from}. Register it via nav_update (upsert: a feature with files=, a module with features=/project=).`
         }
         const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
         const notices = [scopeGate(ledger, args.target, sid, index), mainlineGate(loadVector(root), result)].filter(Boolean)
@@ -464,9 +501,9 @@ export function apply(ctx, config) {
         // 查询目标的影响面时顺手就知道本目标的架构档在哪、还新不新鲜（ADR-011 接线①）。
         let archStates = []
         try { archStates = archDocsFor(index, root, args.target) } catch { archStates = [] }
-        if (args.format === 'json') return JSON.stringify({ ...result, notices, archDocs: archStates }, null, 2)
+        if (args.format === 'json') return JSON.stringify({ ...result, ...(q.resolved ? { resolvedFrom: args.target } : {}), notices, archDocs: archStates }, null, 2)
         const lines = [
-          `Query: ${result.query} (${result.type})`,
+          `Query: ${result.query} (${result.type})${q.resolved ? `  [resolved from: ${args.target}]` : ''}`,
           `Features: ${result.features.join(', ') || 'none'}`,
           `Modules: ${result.modules.join(', ') || 'none'}`,
           `Projects: ${result.projects.join(', ') || 'none'}`,
