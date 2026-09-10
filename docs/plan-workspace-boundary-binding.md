@@ -2,8 +2,7 @@
 
 > 整理日期：2026-09-11（本地）
 > 架构依据：**ADR-014**（现行，收敛 ADR-012/ADR-013）
-> 状态（2026-09-11 00:45）：v0.8.2 已装，且**绑定能力已实证可用**——重启后本会话被正确绑到 `workspace-write`（运行时上下文实证），fs 边界也真的在拦（写 `D:\FF\__boundary-live-probe.txt` → `[sandbox: file access denied under workspace-write mode]`）。
-> 但**宿主沙箱后端仍不可用**（`dsh-web` 仍是 `LocalSystem`），而该组合下 shell 是 **fail-closed** → 每个被治理会话都会失去 shell。故 profile 已把 `autoBindWorkspace` 显式置为 **false**（安全默认：任何重启顺序下都不会再绑死会话）。修好后端并验证 PASS 后改回 `true` 即恢复边界。事故经过与暴露的架构缺口见 §13。
+> 状态（2026-09-11 01:00，v0.8.4）：机制链已完整并全部实证 —— **覆盖判定**（白名单 opt-in，空名单即惰性）、**能力判定**（只读探针，宿主不能强制就不绑）、**绑定**（`agent/session-start`，实测生效过）、**原生强制**（fs 边界实测拦截）。当前部署刻意保持**惰性**：profile 里 `autoBindWorkspace: false` 且白名单为空——因为本机沙箱后端**仍不可用**（`dsh-web` 仍 `LocalSystem`）。修好后端并验证 PASS 后，把白名单填上（如 `boundaryWorkspaces: 'project-nav'`）即可启用，探针会自行确认宿主真的能强制。事故经过与架构调整见 §12/§13 与 ADR-016。
 
 ---
 
@@ -57,12 +56,20 @@
 **钩子**：`agent/session-start` —— 契约写明 "once before the first turn"，早于 agent 任何动作，每会话一次。
 
 ```
+启动时（仅在允名单非空时才探）：
+  probeBoundary(): shell.resolve({command:'exit 0', workdir: root, timeoutMs: 20000,
+                    sandboxPolicy:{mode:'read-only', workspaceRoot: root}}) → shell.run(spec)
+     ├─ sandbox.runnerFailed 或 exitCode ≠ 0 或抛错 → boundaryUsable = false
+     └─ 否则 → true        （每插件实例只探一次；用 read-only 是因为 workspace-write
+                            的 eager ACE 传播要遍历整棵工作区树，代价过高）
+
 agent/session-start(payload)
   ├─ agent = payload.agent ; cwd = agent.session.header.cwd
   ├─ 无 cwd → 返回
   ├─ index = loadIndex(root)            ← 抛错则吞掉并返回（见下）
-  ├─ zone = governedWorkspaceOf(index, root, cwd)
-  ├─ zone 为空 → 返回（未治理工作区：零操作）
+  ├─ zone = governedWorkspaceOf(index, root, cwd, Config.boundaryWorkspaces)
+  ├─ zone 为空 → 返回（白名单外：零操作）
+  ├─ boundaryUsable ≠ true → 触发探针并返回   ← 宿主不能强制就绝不绑定
   ├─ pol = ctx.get('sandboxPolicy')
   ├─ pol 不存在 → 返回
   ├─ current = pol.overrideOf(session)
@@ -71,8 +78,10 @@ agent/session-start(payload)
        + ctx.logger.info(...)  一行
 ```
 
-三条纪律（**v0.8.2 修正后的版本**）：
-- **边界断言，而不是"填空"**：会话在**本钩子运行之前就被盖了一个模式戳**——`dsh-permission-presets` 在 `session/created` 时执行 `pinInitialPermission` → `setSandboxMode(session, spec.sandbox)`。所以判据**不能是"有没有覆盖"**（v0.8.1 就是这么写的，导致每个会话都被跳过、边界永远惰性），必须看**值是什么**：`workspace-write` → 已在边界（幂等，含恢复）；`read-only` → 比我们要设的更严，采用我们的值等于**放松**它，所以不动；其余（`undefined` 或初始化器的默认戳）→ 断言边界。
+纪律（v0.8.4 现行版）：
+- **宿主可强制性是前置输入**（ADR-016，v0.8.4）：宿主后端起不来时 `workspace-write` 下**任何 shell 都 fail-closed**，绑上去等于**夺走会话的 shell**。探针用公开 seam（`shell.resolve`/`run`）+ `read-only` 策略——与上游自己的 readiness 探针（`defaultProbeWindowsAcl`：read-only、零授权、无 ACL 变更）同形，只探一次、结论按插件实例缓存；**探针未绿就不绑**（含 pending，宁可第一个候选会话不绑，也不在未验证的宿主上绑）。
+- **覆盖是 opt-in 白名单**（ADR-016，v0.8.3）：空名单不治理任何工作区。
+- **边界断言，而不是"填空"**（v0.8.2 修正）：会话在**本钩子运行之前就被盖了一个模式戳**——`dsh-permission-presets` 在 `session/created` 时执行 `pinInitialPermission` → `setSandboxMode(session, spec.sandbox)`。所以判据**不能是"有没有覆盖"**（v0.8.1 就是这么写的，导致每个会话都被跳过、边界永远惰性），必须看**值是什么**：`workspace-write` → 已在边界（幂等，含恢复）；`read-only` → 比我们要设的更严，采用我们的值等于**放松**它，所以不动；其余（`undefined` 或初始化器的默认戳）→ 断言边界。
 - **会话内的显式切换仍然有效**：`/permission danger-full-access` 在该会话里 append 更晚的事件，**后写者胜**。插件只在会话建立时表态，不中途干预。
 - **失败安全**：整段 `try/catch`；**任何异常一律不绑定**（宁可不设边界，也绝不阻断会话建立或污染日志）。
 - **部署级出口**：`Config.autoBindWorkspace = false`。
@@ -80,11 +89,14 @@ agent/session-start(payload)
 ## 6. 覆盖判定规则（`governedWorkspaceOf`）
 
 ```
-cwd === root                        → 边界 = root
-cwd 位于 root 之下                   → 在 projectPaths 各目录中找包含 cwd 的那个 → 边界 = 该目录
-                                       找不到（root 内未登记目录）→ ''（不治理）
-cwd 在 root 之外                      → ''（不治理）
+allow = Config.boundaryWorkspaces（逗号分隔，可用项目码 / 相对路径 / 目录名）
+allow 为空                          → ''（不治理任何工作区 —— 安全默认）
+cwd 在 root 之外，或 cwd === root    → ''（root 本身永不治理）
+cwd 在 root 之内                     → 在 projectPaths 中找"被 allow 命中且包含 cwd"的项目 → 边界 = 该目录
+                                       没有命中的 → ''（不治理）
 ```
+
+**为什么 root 永不治理**：root 级边界的可写范围是整个 root，等于允许一个会话写进**每一个**项目——正是这个能力要防的那种漂移。
 
 路径比较：统一 `\` → `/`、盘符小写、去尾斜杠；包含判定为 `p === zone || p.startsWith(zone + '/')`。
 
@@ -182,5 +194,5 @@ CreateRestrictedToken prerequisite failed: no logon SID found among 4 token grou
 | # | 对策 | 代价 |
 |---|---|---|
 | ① | 保持人工前置（现状）：宿主先修好，再打开开关 | 顺序靠人守——已被现实否证两次 |
-| ② | 插件加**一次性能力探针**：真正起一次受限进程，失败则不绑（按进程缓存） | 要弄清 `shell.run/start` 的 spec；每次启动多一次进程开销 |
+| ② | 插件加**一次性能力探针**：真正起一次受限进程，失败则不绑（按进程缓存） | ✅ **已落 v0.8.4**——不需要新数据文件：`shell.resolve`/`run` 是公开 seam，且 `ShellRunResult.sandbox.runnerFailed` 是一等字段；探针用 `read-only`（零授权、无 ACL 变更），避开 `workspace-write` 的 eager ACE 传播 |
 | ③ | 把"宿主可强制"做成**显式能力声明**（`.internal/` 下一份标记），由验证流程写入、插件只读 | 引入一个新数据文件（无进程开销，天然可审计） |

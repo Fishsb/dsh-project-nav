@@ -111,6 +111,26 @@ dsh plugin --profile web add "@dsh-external/project-nav@file:<tgz 路径>"
 
 可选 `leaseTtlMs`（默认 30 分钟）：会话崩溃后其 scope 锁在此之前保持有效，超时自动过期释放。
 
+## 🔒 工作区边界（可选，默认关闭）
+
+让被选中的工作区会话写入不出界（读仍全域自由）。**机制全部由 harness 原生沙箱承担**，本插件只做两个判定：*哪些工作区要治理*、*这台宿主能不能真的强制*。
+
+```yaml
+- id: project-nav
+  config:
+    root: 'C:/path/to/your/workspace'
+    boundaryWorkspaces: 'project-nav'   # 白名单：逗号分隔，可用项目码/相对路径/目录名
+                                        # 留空 = 什么都不治理（默认）
+```
+
+- **opt-in 白名单，空名单即不治理**。这不是保守，而是机制事实：原生 `workspace-write` **只有一个可写根**（会话 cwd + 平台临时区），**不含 `~/.dsh`**。所以凡是工作会伸到 `~/.dsh` 的会话（记忆库、技能、profile 部署）会被**挡住工作**而不是挡住越界 —— 只把"工作自包含在工作区内"的工作区列进来。
+- `root` 本身**永不治理**：root 级边界等于允许写进每个项目，正是要防的那种漂移。
+- **宿主可强制性是前置条件**：绑定前插件会跑一次只读探针（`read-only`，零授权、无 ACL 变更），探针不过就**不绑定**。原因很硬：宿主沙箱后端起不来时，`workspace-write` 下**任何 shell 都 fail-closed**，把会话绑上去等于**夺走它的 shell**，不是保护它。探针结果每进程一次。
+- **不夺权**：会话内手动 `/permission danger-full-access` 后写者胜；已是 `read-only` 的会话不会被放松。
+- `autoBindWorkspace: false` 是总开关（默认 `true`）。它只管"要不要"，"管哪里"由 `boundaryWorkspaces` 决定。
+
+> Windows 宿主的前置条件：`dsh-sandbox-windows-acl` 的受限令牌**必须**带 logon SID（`[logon SID, Everyone]` 是 keep-alive 不变量），而 `LocalSystem` 的令牌没有 → 以服务方式运行 DSH 时该后端**起不来**。修法是让服务以真实用户账户运行。诊断与修复见 `docs/runbook-sandbox-backend-windows.md`。
+
 ## 🗃️ 数据
 
 单一数据真身 `<root>/.internal/`（nav-index / vector / nav-actions / nav-docs / nav-arch），其余全部自动派生——**除 `root` 外零每项目配置**。索引与数据文件不进 git（`.gitignore`），数据手术一律先备份。`.internal/arch/*.md` 由配套 arch-view 技能维护，不在本包数据流内。

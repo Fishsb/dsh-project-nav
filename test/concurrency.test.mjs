@@ -74,15 +74,36 @@ function makeRoot() {
   return root
 }
 
+/** A shell seam whose confined run succeeds — the "host can enforce" case. */
+const SHELL_OK = {
+  resolve: (req) => ({ ...req, workdir: req.workdir || 'C:/tmp', timeoutMs: req.timeoutMs || 1000 }),
+  run: async () => ({
+    exitCode: 0, signal: null, timedOut: false, aborted: false, timeoutMs: 0,
+    stdout: { text: '', truncated: false }, stderr: { text: '', truncated: false },
+    sandbox: { mode: 'read-only', denied: false }
+  })
+}
+/** A shell seam whose confined RUNNER fails to start — the broken-backend case. */
+const SHELL_RUNNER_FAILED = {
+  resolve: (req) => ({ ...req, workdir: req.workdir || 'C:/tmp', timeoutMs: req.timeoutMs || 1000 }),
+  run: async () => ({
+    exitCode: 127, signal: null, timedOut: false, aborted: false, timeoutMs: 0,
+    stdout: { text: '', truncated: false }, stderr: { text: 'windows-acl-run: no logon SID', truncated: false },
+    sandbox: { mode: 'read-only', denied: false, runnerFailed: true }
+  })
+}
+/** Let the readiness probe's promise settle (the hook only binds on a green probe). */
+const tick = () => new Promise((r) => setImmediate(r))
+
 /** Boot the real host module against a temp root and hand back its tool table + listeners. */
-function boot(root, config = {}, sandboxPolicy = undefined) {
+function boot(root, config = {}, sandboxPolicy = undefined, shell = SHELL_OK) {
   const tools = new Map()
   const handlers = []
   const ctx = {
     logger: { info() {}, warn() {} },
     effect: (fn) => { fn(); return () => {} },
     on: (name, listener) => { handlers.push({ name, listener }); return () => {} },
-    get: (name) => (name === 'sandboxPolicy' ? sandboxPolicy : undefined),
+    get: (name) => (name === 'sandboxPolicy' ? sandboxPolicy : name === 'shell' ? shell : undefined),
     tools: { register: (t) => { tools.set(t.name, t); return () => {} } }
   }
   hostMod.apply(ctx, { root, ...config })
@@ -108,6 +129,7 @@ test('workspace boundary: opt-in per workspace, asserts over the initializer sta
   const policy = { overrideOf: () => undefined }
   // The allow-list is the real selector: name the workspace(s) whose work is self-contained.
   const { handlers } = boot(root, { boundaryWorkspaces: 'project-nav' }, policy)
+  await tick() // a non-empty allow-list kicks the readiness probe; bind only on its verdict
   const start = handlers.find(h => h.name === 'agent/session-start')?.listener
   assert.ok(start, 'the boundary listener is registered at session start')
 
@@ -147,10 +169,21 @@ test('workspace boundary: opt-in per workspace, asserts over the initializer sta
   start({ agent: { id: 'session-e', session: { header: {}, append: () => assert.fail('must not append') } } })
   assert.equal(bound().length, 2)
 
+  // A host whose sandbox backend cannot start fails CLOSED on every confined shell call, so
+  // binding there would take the session's shell away instead of protecting it. The probe
+  // verdict is therefore a precondition: a failed probe must never bind.
+  const broken = boot(root, { boundaryWorkspaces: 'project-nav' }, policy, SHELL_RUNNER_FAILED)
+  await tick()
+  const startBroken = broken.handlers.find(h => h.name === 'agent/session-start')?.listener
+  const beforeBroken = bound().length
+  startBroken({ agent: { id: 'session-g', session: session(join(root, 'project-nav'), 'session-g') } })
+  assert.equal(bound().length, beforeBroken, 'a host that cannot enforce must not be bound')
+
   // An EMPTY allow-list governs nothing: the listener is registered but never binds. This is
   // the safe default — the native mode has one writable root, so a session whose work reaches
   // into ~/.dsh would be stopped rather than protected.
   const none = boot(root, { boundaryWorkspaces: '' }, policy)
+  await tick()
   const startNone = none.handlers.find(h => h.name === 'agent/session-start')?.listener
   const beforeEmpty = bound().length
   startNone({ agent: { id: 'session-f', session: session(join(root, 'project-nav'), 'session-f') } })

@@ -246,20 +246,57 @@ export function apply(ctx, config) {
     ctx.logger.warn('[project-nav] a sandboxed fs capability (ctx.fs) is present, but this plugin reads/writes .internal/ through node:fs directly. If this deployment confines plugin fs access, governance data may bypass the fence — see HANDOFF §33 (G3).')
   }
 
-  // ---- workspace boundary (ADR-014) ----
+  // ---- workspace boundary (ADR-014, ADR-016) ----
   // The harness owns the boundary: a session's cwd IS its workspace, and `workspace-write`
   // confines every write (files, shell, subprocesses, third-party plugins) to it while
-  // leaving reads unrestricted everywhere. The plugin contributes the one fact the harness
-  // cannot know — whether THIS deployment governs that workspace — by binding matching
-  // sessions to that mode once, at session start. Enforcement, the approval path, and
-  // projecting the policy into the model's own context are all native; nothing is
-  // re-implemented here.
-  if (config?.autoBindWorkspace !== false && typeof ctx.on !== 'function') {
+  // leaving reads unrestricted everywhere. The plugin contributes the two facts the harness
+  // cannot know — whether THIS deployment chooses to govern that workspace, and whether this
+  // host can actually enforce it — by binding matching sessions once, at session start.
+  // Enforcement, the approval path, and projecting the policy into the model's context are
+  // all native; nothing is re-implemented here.
+  //
+  // Enforceability is an INPUT, not a deployment note (ADR-016). A host whose sandbox backend
+  // cannot start fails CLOSED on every confined shell call, so binding a session there would
+  // not protect it — it would take the session's shell away (observed: every governed session
+  // lost pwsh). The probe mirrors upstream's own readiness probe — `read-only`, zero grants,
+  // no ACL mutation — so it detects the token-side failure without side effects, and a
+  // `workspace-write` probe is deliberately NOT used because its eager workspace ACE
+  // propagation would be far too heavy to run per boot.
+  const boundaryOn = config?.autoBindWorkspace !== false
+  let boundaryUsable = null // null = not probed yet / pending, else the verdict
+  function probeBoundary() {
+    if (boundaryUsable !== null) return // one attempt per plugin instance, like upstream
+    boundaryUsable = false // fail-safe while the probe is in flight
+    try {
+      const shell = ctx.get?.('shell')
+      if (!shell || typeof shell.resolve !== 'function' || typeof shell.run !== 'function') return
+      const spec = shell.resolve({
+        command: 'exit 0',
+        workdir: root,
+        timeoutMs: 20000,
+        sandboxPolicy: { mode: 'read-only', workspaceRoot: root }
+      })
+      Promise.resolve(shell.run(spec)).then((res) => {
+        const runnerFailed = !!(res && res.sandbox && res.sandbox.runnerFailed)
+        boundaryUsable = !runnerFailed && !!res && res.exitCode === 0
+        ctx.logger?.info?.(`[project-nav] workspace boundary: sandbox probe ${boundaryUsable ? 'PASS' : 'FAIL'} (read-only, runnerFailed=${runnerFailed})`)
+      }, (e) => {
+        boundaryUsable = false
+        ctx.logger?.warn?.(`[project-nav] workspace boundary: sandbox probe failed — sessions will NOT be bound (${(e && e.message) || e})`)
+      })
+    } catch (e) {
+      boundaryUsable = false
+      ctx.logger?.warn?.(`[project-nav] workspace boundary: sandbox probe threw — sessions will NOT be bound (${e.message})`)
+    }
+  }
+  if (boundaryOn && String(config?.boundaryWorkspaces || '').trim() && typeof ctx.on === 'function') probeBoundary()
+
+  if (boundaryOn && typeof ctx.on !== 'function') {
     // Fail VISIBLE: a context without ctx.on would silently leave every session unbound,
     // and a boundary that reports nothing is worse than one that reports it is missing.
     ctx.logger?.warn?.('[project-nav] workspace boundary: this context exposes no ctx.on — sessions will NOT be bound to their workspace. Set autoBindWorkspace=false to silence.')
   }
-  if (config?.autoBindWorkspace !== false && typeof ctx.on === 'function') {
+  if (boundaryOn && typeof ctx.on === 'function') {
     ctx.on('agent/session-start', (payload) => {
       try {
         const session = payload?.agent?.session
@@ -269,6 +306,10 @@ export function apply(ctx, config) {
         // per workspace: an empty allow-list governs nothing (see Config.boundaryWorkspaces).
         const zone = governedWorkspaceOf(loadIndex(root), root, cwd, config?.boundaryWorkspaces)
         if (!zone) return
+        // Never bind a session into a mode this host cannot enforce — see the probe above.
+        // A pending probe also lands here, so the first candidate session stays unbound
+        // rather than being bound on an unverified host.
+        if (boundaryUsable !== true) { probeBoundary(); return }
         const policy = ctx.get?.('sandboxPolicy')
         if (!policy || typeof policy.overrideOf !== 'function') return
         // A session is already stamped with a mode before this hook runs — the permission-preset
