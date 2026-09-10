@@ -502,23 +502,25 @@ export function apply(ctx, config) {
             if (missingFeatures.length) deltaLines.push(`  - 未登记功能（需 nav_add_feature）: ${missingFeatures.join(', ')}`)
             if (unregisteredFiles.length) deltaLines.push(`  - 索引外文件（需登记到所属功能，nav_update --field files）: ${unregisteredFiles.join(', ')}`)
             // Releasing a scope is what unblocks the sessions queued behind it.
-            // 架构先行协议：完结动作按锚点记入补丁账本 + 计数闸复查
+            // 架构先行协议：完结动作按锚点记入补丁账本 + 计数闸复查（结果随返回值带出，不依赖跨作用域副作用）
             const waiters = (ledger.actions || []).filter(o => o.status === 'planned' && o.id !== a.id && checkScopeConflicts(ledger, o, { index }).length === 0)
+            let pressureNote = ''
             if (a.anchor) {
               try {
                 const pl = loadPatches(root)
                 recordPatch(pl, { actionId: a.id, anchor: a.anchor, at: a.completedAt, files: a.scope?.files || [], note: a.task })
                 savePatches(root, pl)
-                const ag = loadArch(root)
-                const pr = repeatPressure(ag, pl, a.anchor)
-                var archPressure = pr.exceeded
-                  ? `  ⛔ ${a.anchor} 已累计 ${pr.count} 次补丁（阈值 ${pr.threshold}），最近架构决策 ${pr.sinceDecision || '无'}：这是「同一死胡同反复打补丁」的信号——下次改动前先 nav_adr 出架构决策。`
-                  : (pr.count >= pr.threshold - 1 ? `  ⚠ ${a.anchor} 补丁计数 ${pr.count}/${pr.threshold}，接近升格阈值：先想根因，别拆东墙补西墙。` : '')
-              } catch { var archPressure = '' }
+                const pr = repeatPressure(loadArch(root), pl, a.anchor)
+                if (pr.exceeded) {
+                  pressureNote = '  [计数闸] ' + a.anchor + ' 已有 ' + pr.count + ' 次补丁（阈值 ' + pr.threshold + '），最近架构决策 ' + (pr.sinceDecision || '无') + '：这是「同一死胡同反复打补丁」的信号——下次改动前先 nav_adr 出架构决策。'
+                } else if (pr.count >= pr.threshold - 1) {
+                  pressureNote = '  [计数闸] ' + a.anchor + ' 补丁计数 ' + pr.count + '/' + pr.threshold + '，接近升格阈值：先想根因，别拆东墙补西墙。'
+                }
+              } catch (e) { pressureNote = '  ⚠ 架构补丁账本写入失败：' + e.message }
             } else {
-              var archPressure = '  ⚠ 本动作无锚点（未走锚点闸）——无法计入架构补丁账本。'
+              pressureNote = '  ⚠ 本动作无锚点（未走锚点闸）——无法计入架构补丁账本。'
             }
-            return { kind: 'done', action: a, waiters: waiters.map(w => w.id) }
+            return { kind: 'done', action: a, waiters: waiters.map(w => w.id), pressureNote }
           })
           if (res.kind === 'no-action') return `ERROR: no action "${args.id}". Use nav_plan to create one.`
           if (res.kind === 'foreign') return `ERROR: ${res.action.id} is held by ${actorLabel(res.action)} — only the holding session can close it. Ask that session to nav_mark done / abort, or let its lease expire (self-heals).`
@@ -538,7 +540,7 @@ export function apply(ctx, config) {
           } else if (scopeDrift) {
             lines.push('  ✓ Scope fingerprint verified: none of the scoped files changed during this action.')
           }
-          if (typeof archPressure === 'string' && archPressure) lines.push(archPressure)
+          if (res.pressureNote) lines.push(res.pressureNote)
           if (res.waiters.length) lines.push(`  Scope released — ${res.waiters.length} queued action(s) can now begin: ${res.waiters.join(', ')}`)
           return lines.join('\n')
         }
