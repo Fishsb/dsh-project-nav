@@ -41,21 +41,28 @@ no logon SID found among 4 token groups
 
 ## 三、修复步骤（用户执行）
 
+> **最快路径**：以**管理员身份**运行随附脚本，它把下面 1–4 步全做了（含备份、权限补授、失败自动回滚、新 token 打印）：
+> ```powershell
+> powershell -ExecutionPolicy Bypass -File D:\FF\project-nav\docs\enable-sandbox-backend.ps1
+> ```
+> 下方的分步说明是它的等价手工版，供审计与排障。
+
 ### 0. 前置确认（已核实，无需重做）
 - `DESKTOP-97Q0S5H\lk` 在 `Administrators` 组内（`Get-LocalGroupMember Administrators` 已确认）
 - `lk` 是当前交互登录用户
 - 关键路径属主为 `BUILTIN\Administrators`（`.dsh`、`.dsh\profiles\web`、`.dsh\sessions`、`D:\FF\.internal`、`D:\lk\tools\nssm`）→ lk 在组内，迁移后仍可读写
+- ⚠️ **`lk` 目前并不具备"作为服务登录"权限**（`SeServiceLogonRight` 实测只授予了 `NT SERVICE\ALL SERVICES` / `NT VIRTUAL MACHINE\Virtual Machines` 等）。nssm 的 `set ObjectName` 通常会代为授予；若它没有，服务会因缺此权限而**起不来**——脚本会在切换后复查该权限并缺则补授。
 
 ### 1. 备份服务配置（可回滚的前提）
 ```powershell
 reg export "HKLM\SYSTEM\CurrentControlSet\Services\dsh-web" "$env:USERPROFILE\.dsh\backups\dsh-web-svc-20260911.reg" /y
 # 或： nssm dump dsh-web > "$env:USERPROFILE\.dsh\backups\dsh-web-dump-20260911.txt"
 ```
-> 注意：nssm 控制台输出是 **UTF-16**，直接读会看到字符间空格，判读前先转码。
+> 注意：nssm 控制台输出是 **UTF-16**，直接读会看到字符间空格；取路径/参数请**从注册表读**（`Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\dsh-web`），别解析 `nssm get` 的回显。
 
 ### 2. 切换服务账户
 ```powershell
-# 需要该账户密码；lk 在 Administrators 组，通常已具备 "Log on as a service" 权限
+# 需要该账户密码（agent 不代持密码，必须由你输入）
 D:\lk\tools\nssm\nssm.exe set dsh-web ObjectName DESKTOP-97Q0S5H\lk <密码>
 D:\lk\tools\nssm\nssm.exe set dsh-web ObjectName        # 回显确认
 ```
@@ -107,6 +114,11 @@ sc.exe start dsh-web ; sc.exe query dsh-web     # 确认 RUNNING
 2. **属主迁移**：现有文件属主是 `BUILTIN\Administrators`。lk 在组内通常无碍；若真出现拒绝访问，对 `.dsh` 做一次 ACL/属主修正即可（**先判因再改，勿整组覆盖 ACL**）。
 3. **不要用 `Set-Content -Encoding UTF8` 改任何 DSH 的 JSON/YAML 配置**（本环境会写 BOM），一律走 node `fs.writeFileSync` 或 .NET `UTF8Encoding($false)`。
 4. **删服务用 `nssm remove dsh-web confirm`，不要 `sc delete`**；`AppEnvironmentExtra` 整体替换会清空既有环境变量。
+5. **`enable-sandbox-backend.ps1` 必须保持 UTF-8 *带 BOM*。** 脚本含中文，而 PowerShell 读无 BOM 脚本时按 ANSI/GBK 猜编码，会把某个中文字符的尾字节吃成引号、导致"字符串未终止"——**实测：同一份内容按 UTF-8 解码 0 错误、按 GBK936 解码 7 错误**。改了它之后务必确认首三字节仍是 `EF BB BF`：
+   ```powershell
+   ([System.IO.File]::ReadAllBytes($p))[0..2] | ForEach-Object { $_.ToString('X2') }
+   ```
+   > 与本机既有的"JSON/YAML 一律不许有 BOM"恰好相反——**配置类无 BOM，含非 ASCII 的 .ps1 必须有 BOM**。
 
 ## 六、修好之后 project-nav 侧要做什么
 
