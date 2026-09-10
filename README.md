@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.7.1-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.7.2-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)

@@ -18,7 +18,7 @@ import {
   queryIndex, partialSearch, normalizePath,
   renderTreeText, renderMapHtml, renderProjectDocSection,
   findStaleFiles, scopeTargetsOfOpenActions,
-  snapshotScopeFiles, verifyScopeFingerprint,
+  snapshotScopeFiles, verifyScopeFingerprint, resolveScopeFile, indexedOwnersOf,
   loadArch, nextDecisionId, checkAnchor, repeatPressure, REPEAT_PATCH_THRESHOLD, lastDecisionFor
 } from '../shared/index.js'
 
@@ -340,10 +340,13 @@ export function apply(ctx, config) {
         }
         // B4: scope-vs-index pre-validation at plan time — every scope item must either exist in the
         // index or be explicitly new. Silent unknowns are how a plan quietly points at the wrong target.
+        // File resolution goes through the index-aware resolvers: a scope written from inside a project
+        // directory (`host/index.js`) resolves to the indexed `project-nav/host/index.js` and must NOT
+        // be reported as unknown — a false alarm here trains the agent to ignore real ones.
         const unknown = {
           features: scope.features.filter(f => !index.indexes?.featureToFiles?.[f] && !index.descriptions?.[f]),
           modules: scope.modules.filter(mod => !index.indexes?.moduleToFeatures?.[mod]),
-          files: scope.files.filter(f => !(index.indexes?.fileToFeature || {})[f] && !existsSync(resolve(root, f)))
+          files: scope.files.filter(f => !indexedOwnersOf(root, f, index) && !resolveScopeFile(root, f, index))
         }
         const unknownNote = (unknown.features.length || unknown.modules.length || unknown.files.length)
           ? `\n  ⚠ Scope items not found in index: features=[${unknown.features.join(', ')}] modules=[${unknown.modules.join(', ')}] files=[${unknown.files.join(', ')}]\n    If this task CREATES them, ignore. If it should MODIFY existing ones, the identifier is likely wrong — re-check with nav_query.`
@@ -513,10 +516,11 @@ export function apply(ctx, config) {
             if (scopeDrift && !scopeDrift.ok) a.drift = { at: a.completedAt, changed: scopeDrift.changed, removed: scopeDrift.removed, added: scopeDrift.added }
             // Delta close-out (OpenSpec archive semantics): surface index deltas the
             // agent must merge before this change counts as synced.
-            const f2f = index.indexes?.fileToFeature || {}
             const f2files = index.indexes?.featureToFiles || {}
             const missingFeatures = (a.scope?.features || []).filter(c => !f2files[c])
-            const unregisteredFiles = (a.scope?.files || []).filter(f => !f2f[normalizePath(f)])
+            // Same index-aware resolution as the fingerprint path and the plan-time pre-check:
+            // a literal map lookup here reported already-registered files as "outside the index".
+            const unregisteredFiles = (a.scope?.files || []).filter(f => !indexedOwnersOf(root, f, index))
             if (missingFeatures.length) deltaLines.push(`  - 未登记功能（需 nav_update 创建）: ${missingFeatures.join(', ')}`)
             if (unregisteredFiles.length) deltaLines.push(`  - 索引外文件（需登记到所属功能，nav_update --field files）: ${unregisteredFiles.join(', ')}`)
             // Releasing a scope is what unblocks the sessions queued behind it.

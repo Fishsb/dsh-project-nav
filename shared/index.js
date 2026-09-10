@@ -5,7 +5,7 @@
 import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync, renameSync, openSync, closeSync, unlinkSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { readdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, relative } from 'node:path';
 
 const INDEX_FILENAME = '.internal/nav-index.json';
 const VECTOR_FILENAME = '.internal/vector.json';
@@ -669,6 +669,36 @@ export function resolveScopeFile(rootPath, file, index = null) {
   for (const rel of Object.values(index?.projectPaths || {})) {
     const cand = resolve(rootPath, rel, file);
     try { if (existsSync(cand)) return cand; } catch { /* try next */ }
+  }
+  return null;
+}
+
+/**
+ * Which indexed feature(s) own this file? The single source of truth for "is this scope
+ * file registered?" — index-aware in the same way resolveScopeFile is, so a scope written
+ * from inside a project directory (`host/index.js`) is not mistaken for an unregistered
+ * file merely because the index spells it `project-nav/host/index.js`.
+ *
+ * Comparison folds case and separators (canonPath). A suffix match is accepted only when
+ * exactly one index entry can fit — never guess between two candidates.
+ * Returns feature codes, or null when the index does not know the file.
+ */
+export function indexedOwnersOf(rootPath, file, index = null) {
+  const f2f = index?.indexes?.fileToFeature || {};
+  const keys = Object.keys(f2f);
+  if (keys.length === 0) return null;
+  const want = canonPath(file);
+  if (!want) return null;
+  const byCanon = new Map(keys.map(k => [canonPath(k), k]));
+  const direct = byCanon.get(want);
+  if (direct) return [...f2f[direct]];
+  const abs = resolveScopeFile(rootPath, file, index);
+  if (abs) {
+    const rel = canonPath(relative(rootPath, abs));
+    const hit = byCanon.get(rel);
+    if (hit) return [...f2f[hit]];
+    const near = keys.filter(k => { const c = canonPath(k); return c.endsWith('/' + rel) || rel.endsWith('/' + c); });
+    if (near.length === 1) return [...f2f[near[0]]];
   }
   return null;
 }

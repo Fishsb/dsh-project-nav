@@ -563,4 +563,33 @@ test('retire: a reverse-only mapping is swept too (asymmetric index)', async () 
   assert.equal(shared.loadIndex(root).indexes.fileToFeature['ghost/file.mjs'], undefined, 'the orphan must not survive')
 })
 
+// ---- scope file resolution: one rule, not three (v0.7.2) ----
+// nav_plan's pre-check, nav_mark done's delta and the fingerprint snapshot each asked
+// "is this scope file registered?" with a different rule, so a scope written from inside
+// a project directory was reported as an unregistered file even though the index knew it.
+// A false alarm at close-out is worse than no check: it teaches the agent to ignore the signal.
+
+test('scope files: a project-relative spelling resolves instead of crying "unregistered"', async () => {
+  const { root, tools } = await booted()
+  // The index spells this file project-nav/host/index.js; the session sits in project-nav.
+  mkdirSync(join(root, 'project-nav', 'host'), { recursive: true })
+  writeFileSync(join(root, 'project-nav', 'host', 'index.js'), '// host\n')
+  const plan = await call(tools, 'nav_plan', { task: 'touch host', anchor: 'PN-F01', files: 'host/index.js' }, 'session-A')
+  assert.doesNotMatch(plan, /Scope items not found in index/, 'plan must not report the indexed file as unknown')
+  const id = plan.match(/ACT-\d+/)[0]
+  await call(tools, 'nav_mark', { id, action: 'begin' }, 'session-A')
+  const done = await call(tools, 'nav_mark', { id, action: 'done' }, 'session-A')
+  assert.doesNotMatch(done, /索引外文件/, 'close-out must not ask to register an already-registered file')
+})
+
+test('scope files: a genuinely new file is still surfaced as unregistered', async () => {
+  const { root, tools } = await booted()
+  const plan = await call(tools, 'nav_plan', { task: 'add a file', anchor: 'PN-F01', files: 'brand/new.mjs' }, 'session-A')
+  assert.match(plan, /Scope items not found in index/, 'an unknown identifier must still be reported')
+  const id = plan.match(/ACT-\d+/)[0]
+  await call(tools, 'nav_mark', { id, action: 'begin' }, 'session-A')
+  const done = await call(tools, 'nav_mark', { id, action: 'done' }, 'session-A')
+  assert.match(done, /索引外文件/, 'close-out must still ask to register a genuinely new file')
+})
+
 process.on('exit', () => { try { rmSync(join(tmpdir(), 'nav-conc-'), { recursive: true, force: true }) } catch {} })
