@@ -101,8 +101,8 @@ async function booted() {
 
 test('disjoint scopes: two sessions hold live locks at the same time', async () => {
   const { tools } = await booted()
-  const a = await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' }, 'session-A')
-  const b = await call(tools, 'nav_plan', { task: 'B', features: 'DM-F01' }, 'session-B')
+  const a = await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' , anchor: 'PN-F01' }, 'session-A')
+  const b = await call(tools, 'nav_plan', { task: 'B', features: 'DM-F01' , anchor: 'PN-F01' }, 'session-B')
   assert.match(a, /ACT-001/)
   assert.match(b, /ACT-002/)
   const aId = /ACT-\d+/.exec(a)[0]
@@ -115,8 +115,8 @@ test('disjoint scopes: two sessions hold live locks at the same time', async () 
 
 test('same module (disjoint features) is still a conflict', async () => {
   const { tools } = await booted()
-  await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' }, 'session-A')
-  await call(tools, 'nav_plan', { task: 'B', features: 'PN-F02' }, 'session-B')
+  await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' , anchor: 'PN-F01' }, 'session-A')
+  await call(tools, 'nav_plan', { task: 'B', features: 'PN-F02' , anchor: 'PN-F01' }, 'session-B')
   const beginA = await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
   assert.match(beginA, /in_progress/)
   const beginB = await call(tools, 'nav_mark', { id: 'ACT-002', action: 'begin' }, 'session-B')
@@ -127,8 +127,8 @@ test('same module (disjoint features) is still a conflict', async () => {
 test('derived-file overlap: different features in different modules, same file', async () => {
   const { tools } = await booted()
   // both scopes name a file that maps to the OTHER feature's file via the index
-  await call(tools, 'nav_plan', { task: 'A', files: 'project-nav/host/index.js' }, 'session-A')
-  await call(tools, 'nav_plan', { task: 'B', features: 'PN-F01' }, 'session-B')
+  await call(tools, 'nav_plan', { task: 'A', files: 'project-nav/host/index.js' , anchor: 'PN-F01' }, 'session-A')
+  await call(tools, 'nav_plan', { task: 'B', features: 'PN-F01' , anchor: 'PN-F01' }, 'session-B')
   await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
   const beginB = await call(tools, 'nav_mark', { id: 'ACT-002', action: 'begin' }, 'session-B')
   assert.match(beginB, /BLOCKED/)
@@ -137,8 +137,8 @@ test('derived-file overlap: different features in different modules, same file',
 
 test('wait=true queues until the holder finishes', async () => {
   const { tools } = await booted()
-  await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' }, 'session-A')
-  await call(tools, 'nav_plan', { task: 'B', features: 'PN-F01' }, 'session-B')
+  await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' , anchor: 'PN-F01' }, 'session-A')
+  await call(tools, 'nav_plan', { task: 'B', features: 'PN-F01' , anchor: 'PN-F01' }, 'session-B')
   await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
   const pending = call(tools, 'nav_mark', { id: 'ACT-002', action: 'begin', wait: true, waitMs: 6000 }, 'session-B')
   await new Promise(r => setTimeout(r, 300))
@@ -151,8 +151,8 @@ test('wait=true queues until the holder finishes', async () => {
 
 test('lease expiry: a dead session never wedges the workspace', async () => {
   const { root, tools } = await booted()
-  await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' }, 'session-A')
-  await call(tools, 'nav_plan', { task: 'B', features: 'PN-F01' }, 'session-B')
+  await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' , anchor: 'PN-F01' }, 'session-A')
+  await call(tools, 'nav_plan', { task: 'B', features: 'PN-F01' , anchor: 'PN-F01' }, 'session-B')
   await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
   // simulate: session-A crashed two hours ago, its lease lapsed
   const ledger = shared.loadActions(root)
@@ -169,9 +169,9 @@ test('lease expiry: a dead session never wedges the workspace', async () => {
 
 test('one in_progress per session (other sessions keep their lock)', async () => {
   const { tools } = await booted()
-  await call(tools, 'nav_plan', { task: 'A1', features: 'PN-F01' }, 'session-A')
-  await call(tools, 'nav_plan', { task: 'A2', features: 'PN-F02' }, 'session-A')
-  await call(tools, 'nav_plan', { task: 'B1', features: 'DM-F01' }, 'session-B')
+  await call(tools, 'nav_plan', { task: 'A1', features: 'PN-F01' , anchor: 'PN-F01' }, 'session-A')
+  await call(tools, 'nav_plan', { task: 'A2', features: 'PN-F02' , anchor: 'PN-F01' }, 'session-A')
+  await call(tools, 'nav_plan', { task: 'B1', features: 'DM-F01' , anchor: 'PN-F01' }, 'session-B')
   await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
   const second = await call(tools, 'nav_mark', { id: 'ACT-002', action: 'begin' }, 'session-A')
   assert.match(second, /ERROR/)
@@ -182,7 +182,7 @@ test('one in_progress per session (other sessions keep their lock)', async () =>
 
 test('only the holding session can close an action', async () => {
   const { tools } = await booted()
-  await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' }, 'session-A')
+  await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' , anchor: 'PN-F01' }, 'session-A')
   await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
   const stolen = await call(tools, 'nav_mark', { id: 'ACT-001', action: 'done' }, 'session-B')
   assert.match(stolen, /ERROR/)
@@ -194,7 +194,7 @@ test('only the holding session can close an action', async () => {
 test('concurrent planners lose no action and duplicate no id', async () => {
   const { root, tools } = await booted()
   const scopes = ['PN-F01', 'PN-F02', 'DM-F01', 'PN-F01', 'DM-F01', 'PN-F02']
-  await Promise.all(scopes.map((f, i) => call(tools, 'nav_plan', { task: 'P' + i, features: f }, 'session-' + i)))
+  await Promise.all(scopes.map((f, i) => call(tools, 'nav_plan', { task: 'P' + i, features: f , anchor: 'PN-F01' }, 'session-' + i)))
   const ledger = shared.loadActions(root)
   const ids = ledger.actions.map(a => a.id)
   assert.equal(ledger.actions.length, scopes.length, 'every concurrent plan must survive: ' + ids.join(','))
@@ -203,7 +203,7 @@ test('concurrent planners lose no action and duplicate no id', async () => {
 
 test('occupied target is visible to other sessions in nav_query', async () => {
   const { tools } = await booted()
-  await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' }, 'session-A')
+  await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' , anchor: 'PN-F01' }, 'session-A')
   await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
   const asOther = await call(tools, 'nav_query', { target: 'project-nav/host/index.js' }, 'session-B')
   assert.match(asOther, /OCCUPIED/, asOther)
@@ -212,8 +212,8 @@ test('occupied target is visible to other sessions in nav_query', async () => {
 
 test('the user-facing case: same file named explicitly → conflict', async () => {
   const { tools } = await booted()
-  await call(tools, 'nav_plan', { task: 'A edits host/index.js', files: 'host/index.js' }, 'session-A')
-  await call(tools, 'nav_plan', { task: 'B edits the same file, other path form', files: 'project-nav/host/index.js' }, 'session-B')
+  await call(tools, 'nav_plan', { task: 'A edits host/index.js', files: 'host/index.js' , anchor: 'PN-F01' }, 'session-A')
+  await call(tools, 'nav_plan', { task: 'B edits the same file, other path form', files: 'project-nav/host/index.js' , anchor: 'PN-F01' }, 'session-B')
   await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
   const beginB = await call(tools, 'nav_mark', { id: 'ACT-002', action: 'begin', wait: false }, 'session-B')
   assert.match(beginB, /BLOCKED/, 'the same file in two path forms is still the same file: ' + beginB)
@@ -221,8 +221,8 @@ test('the user-facing case: same file named explicitly → conflict', async () =
 
 test('the user-facing case: disjoint directories → real parallelism', async () => {
   const { tools } = await booted()
-  await call(tools, 'nav_plan', { task: 'A edits src/voice/', files: 'src/voice/mic.js' }, 'session-A')
-  await call(tools, 'nav_plan', { task: 'B edits src/panel/', files: 'src/panel/tab.js' }, 'session-B')
+  await call(tools, 'nav_plan', { task: 'A edits src/voice/', files: 'src/voice/mic.js' , anchor: 'PN-F01' }, 'session-A')
+  await call(tools, 'nav_plan', { task: 'B edits src/panel/', files: 'src/panel/tab.js' , anchor: 'PN-F01' }, 'session-B')
   const beginA = await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
   const beginB = await call(tools, 'nav_mark', { id: 'ACT-002', action: 'begin' }, 'session-B')
   assert.match(beginA, /in_progress/, beginA)
@@ -236,7 +236,7 @@ test('fingerprint drift: a file changed under the action is reported at done', a
   mkdirSync(join(root, 'src', 'voice'), { recursive: true })
   const target = join(root, 'src', 'voice', 'mic.js')
   writeFileSync(target, 'original')
-  await call(tools, 'nav_plan', { task: 'A edits mic.js', files: 'src/voice/mic.js' }, 'session-A')
+  await call(tools, 'nav_plan', { task: 'A edits mic.js', files: 'src/voice/mic.js' , anchor: 'PN-F01' }, 'session-A')
   const begin = await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
   assert.match(begin, /in_progress/)
   writeFileSync(target, 'somebody else rewrote this')   // another session / an editor / a cleanup
@@ -253,7 +253,7 @@ test('fingerprint drift: a file that vanished under the action is reported', asy
   mkdirSync(join(root, 'src', 'panel'), { recursive: true })
   const target = join(root, 'src', 'panel', 'tab.js')
   writeFileSync(target, 'panel')
-  await call(tools, 'nav_plan', { task: 'B edits tab.js', files: 'src/panel/tab.js' }, 'session-B')
+  await call(tools, 'nav_plan', { task: 'B edits tab.js', files: 'src/panel/tab.js' , anchor: 'PN-F01' }, 'session-B')
   await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-B')
   rmSync(target, { force: true })
   const done = await call(tools, 'nav_mark', { id: 'ACT-001', action: 'done' }, 'session-B')
@@ -265,7 +265,7 @@ test('fingerprint clean run reports verification, not drift', async () => {
   const { root, tools } = await booted()
   mkdirSync(join(root, 'src', 'quiet'), { recursive: true })
   writeFileSync(join(root, 'src', 'quiet', 'a.js'), 'quiet')
-  await call(tools, 'nav_plan', { task: 'C edits a.js', files: 'src/quiet/a.js' }, 'session-C')
+  await call(tools, 'nav_plan', { task: 'C edits a.js', files: 'src/quiet/a.js' , anchor: 'PN-F01' }, 'session-C')
   await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-C')
   const done = await call(tools, 'nav_mark', { id: 'ACT-001', action: 'done' }, 'session-C')
   assert.match(done, /Scope fingerprint verified/, done)
@@ -276,8 +276,84 @@ test('legacy entries (no owner) keep the old global single-lock behaviour', asyn
   const { root, tools } = await booted()
   const legacy = { version: '1.0', actions: [{ id: 'ACT-001', task: 'legacy', plan: '', scope: { features: ['PN-F01'] }, status: 'in_progress', createdAt: new Date().toISOString(), startedAt: new Date().toISOString(), completedAt: null }] }
   shared.saveActions(root, legacy)
-  const plan = await call(tools, 'nav_plan', { task: 'B', features: 'DM-F01' }, 'session-B')
+  const plan = await call(tools, 'nav_plan', { task: 'B', features: 'DM-F01' , anchor: 'PN-F01' }, 'session-B')
   assert.match(plan, /ACT-002|live action/, 'a legacy holder still blocks planning: ' + plan)
 })
 
+test('architecture-first: nav_plan refuses an action with no anchor', async () => {
+  const { tools } = await booted()
+  const out = await call(tools, 'nav_plan', { task: 'no anchor', features: 'PN-F01' }, 'session-A')
+  assert.match(out, /requires anchor/, out)
+  assert.doesNotMatch(out, /ACT-\d+/)
+})
+
+test('architecture-first: nav_plan refuses an anchor that is not an architecture node', async () => {
+  const { tools } = await booted()
+  const out = await call(tools, 'nav_plan', { task: 'bad anchor', features: 'PN-F01', anchor: 'NOPE-X99' }, 'session-A')
+  assert.match(out, /不是真实架构节点/, out)
+})
+
+test('architecture-first: a real anchor is recorded on the action', async () => {
+  const { root, tools } = await booted()
+  const out = await call(tools, 'nav_plan', { task: 'anchored', features: 'PN-F01', anchor: 'PN-F01' }, 'session-A')
+  assert.match(out, /Anchor: PN-F01 \(feature\)/, out)
+  const led = shared.loadActions(root)
+  assert.equal(led.actions[0].anchor, 'PN-F01')
+  assert.equal(led.actions[0].anchorKind, 'feature')
+})
+
+test('architecture-first: missing arch= reflection warns but does not block', async () => {
+  const { tools } = await booted()
+  const out = await call(tools, 'nav_plan', { task: 'no reflection', features: 'PN-F01', anchor: 'PN-F01' }, 'session-A')
+  assert.match(out, /架构反思缺失/, out)
+  assert.match(out, /ACT-001/)
+  const withArch = await call(tools, 'nav_plan', { task: 'with reflection', features: 'DM-F01', anchor: 'DM-F01', arch: '架构成立，改动是局部的' }, 'session-B')
+  assert.doesNotMatch(withArch, /架构反思缺失/)
+  assert.match(withArch, /arch: 架构成立/)
+})
+
+test('architecture-first: three patches on one anchor trigger the repeat-patch gate', async () => {
+  const { root, tools } = await booted()
+  for (let i = 1; i <= 3; i++) {
+    const id = 'ACT-00' + i
+    await call(tools, 'nav_plan', { task: 'patch ' + i, features: 'PN-F01', anchor: 'PN-F01' }, 'session-A')
+    await call(tools, 'nav_mark', { id, action: 'begin' }, 'session-A')
+    const done = await call(tools, 'nav_mark', { id, action: 'done' }, 'session-A')
+    if (i === 3) assert.match(done, /3 次补丁/, done)   // threshold message wording
+  }
+  const logged = shared.loadPatches(root)
+  assert.equal(logged.patches.length, 3, 'each done writes one patch entry')
+  const next = await call(tools, 'nav_plan', { task: 'patch 4', features: 'PN-F01', anchor: 'PN-F01' }, 'session-A')
+  assert.match(next, /计数闸触发/, next)
+  assert.match(next, /nav_adr/, next)
+})
+
+test('architecture-first: patch log is idempotent per action id', async () => {
+  const { root, tools } = await booted()
+  await call(tools, 'nav_plan', { task: 'once', features: 'PN-F01', anchor: 'PN-F01' }, 'session-A')
+  await call(tools, 'nav_mark', { id: 'ACT-001', action: 'begin' }, 'session-A')
+  await call(tools, 'nav_mark', { id: 'ACT-001', action: 'done' }, 'session-A')
+  await call(tools, 'nav_mark', { id: 'ACT-001', action: 'done' }, 'session-A')   // second close must not double-count
+  const logged = shared.loadPatches(root)
+  assert.equal(logged.patches.length, 1)
+})
+
+test('architecture-first: nav_adr records a decision and resets the anchor counter', async () => {
+  const { root, tools } = await booted()
+  for (let i = 1; i <= 3; i++) {
+    await call(tools, 'nav_plan', { task: 'patch ' + i, features: 'PN-F01', anchor: 'PN-F01' }, 'session-A')
+    await call(tools, 'nav_mark', { id: 'ACT-00' + i, action: 'begin' }, 'session-A')
+    await call(tools, 'nav_mark', { id: 'ACT-00' + i, action: 'done' }, 'session-A')
+  }
+  const bad = await call(tools, 'nav_adr', { anchor: 'NOPE-X99', reason: 'r', decision: 'd' }, 'session-A')
+  assert.match(bad, /ERROR/, bad)
+  const adr = await call(tools, 'nav_adr', { anchor: 'PN-F01', reason: '三次补丁说明职责过载', decision: '把闸门判定抽成独立层', impact: 'PN-F01 → PN-M02' }, 'session-A')
+  assert.match(adr, /ADR-001/, adr)
+  assert.match(adr, /Patch counter reset: 3/, adr)
+  const arch = shared.loadArch(root)
+  assert.equal(arch.decisions.length, 1)
+  assert.equal(arch.decisions[0].anchor, 'PN-F01')
+  const after = await call(tools, 'nav_plan', { task: 'after adr', features: 'PN-F01', anchor: 'PN-F01' }, 'session-B')
+  assert.doesNotMatch(after, /计数闸触发/, 'a decision must reset the anchor pressure')
+})
 process.on('exit', () => { try { rmSync(join(tmpdir(), 'nav-conc-'), { recursive: true, force: true }) } catch {} })
