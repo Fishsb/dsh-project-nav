@@ -194,6 +194,55 @@ test('workspace boundary: opt-in per workspace, asserts over the initializer sta
   assert.equal(off.handlers.filter(h => h.name === 'agent/session-start').length, 0)
 })
 
+test('workspace boundary: a failed boot probe is retried, never cached for the process', async () => {
+  // Regression guard for the v0.8.4 defect observed live on 2026-09-11: the probe ran ONCE at
+  // apply() and `boundaryUsable !== null → return` cached that first verdict forever, while its
+  // early returns logged nothing. A boot-time failure (the seam exists but its executor/backend
+  // is not live yet — the same spec PASSES when run after boot) therefore left the boundary
+  // permanently inert with ZERO trace: config correct, plugin mounted, allow-list matching and
+  // not one session bound. Here the first confined run fails and every later one succeeds.
+  const root = makeRoot()
+  const appended = []
+  const policy = { overrideOf: () => undefined }
+  let runs = 0
+  const flaky = {
+    resolve: (req) => ({ ...req, workdir: req.workdir || 'C:/tmp', timeoutMs: req.timeoutMs || 1000 }),
+    run: async () => {
+      runs += 1
+      const ok = runs > 1
+      return {
+        exitCode: ok ? 0 : 127, signal: null, timedOut: false, aborted: false, timeoutMs: 0,
+        stdout: { text: '', truncated: false },
+        stderr: { text: ok ? '' : 'windows-acl-run: executor not ready', truncated: false },
+        sandbox: { mode: 'read-only', denied: false, runnerFailed: !ok }
+      }
+    }
+  }
+  const { handlers } = boot(root, { boundaryWorkspaces: 'project-nav' }, policy, flaky)
+  await tick()
+  const start = handlers.find(h => h.name === 'agent/session-start')?.listener
+  const session = (cwd, id) => ({ header: { cwd }, append: (type, data) => appended.push({ id, type, data }) })
+  const bound = () => appended.filter(a => a.type === 'sandbox/mode')
+
+  // Boot probe failed → the first governed session stays unbound (fail-safe) and re-arms the probe.
+  start({ agent: { id: 'session-r1', session: session(join(root, 'project-nav'), 'session-r1') } })
+  assert.equal(bound().length, 0, 'a FAILED verdict must not bind')
+  await tick() // the first failure retries immediately rather than waiting out the throttle
+
+  // The retry is green → the next governed session is bound. Under the old rule this stayed
+  // unbound for the whole process lifetime, silently.
+  start({ agent: { id: 'session-r2', session: session(join(root, 'project-nav'), 'session-r2') } })
+  assert.equal(bound().length, 1, 'a late-usable host must still bind — no permanent poisoning')
+  assert.equal(bound()[0].data.mode, 'workspace-write')
+
+  // The decision journal lands beside the governance data, so "silently inert" is impossible.
+  const diag = JSON.parse(readFileSync(join(root, '.internal', 'boundary-diag.json'), 'utf-8'))
+  assert.equal(diag.probe.verdict, true)
+  assert.ok(diag.probe.attempts >= 2, 'every attempt is recorded')
+  assert.ok(diag.sessions.some(s => s.decision === 'deferred-probe'), 'the deferred session is recorded')
+  assert.ok(diag.sessions.some(s => s.decision === 'bound'), 'the bound session is recorded')
+})
+
 test('disjoint scopes: two sessions hold live locks at the same time', async () => {
   const { tools } = await booted()
   const a = await call(tools, 'nav_plan', { task: 'A', features: 'PN-F01' , anchor: 'PN-F01' }, 'session-A')

@@ -30,7 +30,14 @@ import {
 // ---- Plugin metadata (Cordis contract) ----
 
 export const name = '@dsh-external/project-nav'
-export const inject = ['tools']
+// `shell` is a REAL hard dependency, not a convenience: the workspace-boundary readiness
+// probe (ADR-016) runs through the shell seam, and reading it optionally let the plugin
+// apply BEFORE the pwsh executor registered the service. The probe then saw no `shell`,
+// reported nothing, cached `false` for the whole process — and the boundary stayed inert
+// while every visible signal (config, mount, allow-list, matching) looked correct.
+// Declaring it makes Cordis defer apply until the seam exists, and reactivate the plugin
+// if it ever disappears.
+export const inject = ['tools', 'shell']
 
 export const Config = z.object({
   // Workspace root governed by this plugin — the folder whose .internal/
@@ -263,13 +270,83 @@ export function apply(ctx, config) {
   // `workspace-write` probe is deliberately NOT used because its eager workspace ACE
   // propagation would be far too heavy to run per boot.
   const boundaryOn = config?.autoBindWorkspace !== false
-  let boundaryUsable = null // null = not probed yet / pending, else the verdict
-  function probeBoundary() {
-    if (boundaryUsable !== null) return // one attempt per plugin instance, like upstream
-    boundaryUsable = false // fail-safe while the probe is in flight
+  // Probe verdict: null = never probed, true = usable, false = the last attempt failed.
+  // v0.8.5 — the verdict is no longer cached for the process lifetime, and no branch is
+  // silent. v0.8.4 cached the FIRST attempt forever (`boundaryUsable !== null → return`)
+  // and its early returns logged nothing, so a boot-time failure left the boundary
+  // permanently inert with ZERO trace: config correct, plugin mounted, allow-list
+  // matching, and not one session bound (observed 2026-09-11 on this host — the identical
+  // probe PASSES when run after boot, from a plugin context that applied later). Now a
+  // non-true verdict is retried on the next session start (throttled), and every decision
+  // is journaled to `<root>/.internal/boundary-diag.json` so the next failure is
+  // diagnosable instead of invisible.
+  let boundaryUsable = null
+  let boundaryReason = 'not probed yet'
+  let boundaryInFlight = false
+  let boundaryAttempts = 0
+  let boundaryLastAttemptAt = 0
+  const BOUNDARY_RETRY_MS = 10000
+  const boundarySessions = []
+
+  function boundaryDiagPath() { return resolve(root, '.internal', 'boundary-diag.json') }
+  /** Write the boundary decision journal. NEVER throws: diagnostics must not break a session. */
+  function writeBoundaryDiag() {
     try {
-      const shell = ctx.get?.('shell')
-      if (!shell || typeof shell.resolve !== 'function' || typeof shell.run !== 'function') return
+      const payload = {
+        updatedAt: new Date().toISOString(),
+        root,
+        enabled: boundaryOn,
+        allow: String(config?.boundaryWorkspaces || ''),
+        probe: {
+          verdict: boundaryUsable,
+          reason: boundaryReason,
+          attempts: boundaryAttempts,
+          lastAttemptAt: boundaryLastAttemptAt ? new Date(boundaryLastAttemptAt).toISOString() : null
+        },
+        sessions: boundarySessions.slice(-25)
+      }
+      const file = boundaryDiagPath()
+      const dir = dirname(file)
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+      const tmp = `${file}.tmp-${process.pid}`
+      writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf-8')
+      renameSync(tmp, file)
+    } catch { /* diagnostics are best-effort by design */ }
+  }
+  function recordSession(cwd, zone, decision, detail) {
+    boundarySessions.push({
+      at: new Date().toISOString(),
+      cwd: String(cwd || ''),
+      zone: String(zone || ''),
+      decision: String(decision),
+      detail: String(detail || '')
+    })
+    writeBoundaryDiag()
+  }
+
+  /** Probe host enforceability through the public shell seam (read-only, zero grants). */
+  function probeBoundary(trigger) {
+    const why = trigger || 'boot'
+    if (boundaryInFlight || boundaryUsable === true) return
+    const now = Date.now()
+    // The FIRST failure may be a boot-time race (the seam is registered but its executor or
+    // sandbox backend is not live yet), so the next session start retries immediately; only
+    // after that is retrying throttled, so a genuinely broken host does not probe on every
+    // session start.
+    if (boundaryAttempts >= 2 && now - boundaryLastAttemptAt < BOUNDARY_RETRY_MS) return
+    boundaryInFlight = true
+    boundaryAttempts += 1
+    boundaryLastAttemptAt = now
+    const shell = ctx.get?.('shell')
+    if (!shell || typeof shell.resolve !== 'function' || typeof shell.run !== 'function') {
+      boundaryInFlight = false
+      boundaryUsable = false
+      boundaryReason = `shell seam unavailable (shell=${typeof shell}, resolve=${typeof shell?.resolve}, run=${typeof shell?.run}, trigger=${why})`
+      ctx.logger?.warn?.(`[project-nav] workspace boundary: ${boundaryReason}; sessions will NOT be bound`)
+      writeBoundaryDiag()
+      return
+    }
+    try {
       const spec = shell.resolve({
         command: 'exit 0',
         workdir: root,
@@ -277,19 +354,30 @@ export function apply(ctx, config) {
         sandboxPolicy: { mode: 'read-only', workspaceRoot: root }
       })
       Promise.resolve(shell.run(spec)).then((res) => {
-        const runnerFailed = !!(res && res.sandbox && res.sandbox.runnerFailed)
+        boundaryInFlight = false
+        const sb = res && res.sandbox
+        const runnerFailed = !!(sb && sb.runnerFailed)
         boundaryUsable = !runnerFailed && !!res && res.exitCode === 0
-        ctx.logger?.info?.(`[project-nav] workspace boundary: sandbox probe ${boundaryUsable ? 'PASS' : 'FAIL'} (read-only, runnerFailed=${runnerFailed})`)
+        boundaryReason = `probe ${boundaryUsable ? 'PASS' : 'FAIL'} (attempt ${boundaryAttempts}, trigger=${why}, exitCode=${res ? res.exitCode : 'n/a'}, runnerFailed=${runnerFailed}, enforcement=${sb && sb.enforcement ? sb.enforcement : 'n/a'})`
+        if (boundaryUsable) ctx.logger?.info?.(`[project-nav] workspace boundary: ${boundaryReason}`)
+        else ctx.logger?.warn?.(`[project-nav] workspace boundary: ${boundaryReason}; sessions will NOT be bound`)
+        writeBoundaryDiag()
       }, (e) => {
+        boundaryInFlight = false
         boundaryUsable = false
-        ctx.logger?.warn?.(`[project-nav] workspace boundary: sandbox probe failed — sessions will NOT be bound (${(e && e.message) || e})`)
+        boundaryReason = `probe rejected (attempt ${boundaryAttempts}, trigger=${why}): ${(e && e.message) || e}`
+        ctx.logger?.warn?.(`[project-nav] workspace boundary: ${boundaryReason}; sessions will NOT be bound`)
+        writeBoundaryDiag()
       })
     } catch (e) {
+      boundaryInFlight = false
       boundaryUsable = false
-      ctx.logger?.warn?.(`[project-nav] workspace boundary: sandbox probe threw — sessions will NOT be bound (${e.message})`)
+      boundaryReason = `probe threw (attempt ${boundaryAttempts}, trigger=${why}): ${e.message}`
+      ctx.logger?.warn?.(`[project-nav] workspace boundary: ${boundaryReason}; sessions will NOT be bound`)
+      writeBoundaryDiag()
     }
   }
-  if (boundaryOn && String(config?.boundaryWorkspaces || '').trim() && typeof ctx.on === 'function') probeBoundary()
+  if (boundaryOn && String(config?.boundaryWorkspaces || '').trim() && typeof ctx.on === 'function') probeBoundary('boot')
 
   if (boundaryOn && typeof ctx.on !== 'function') {
     // Fail VISIBLE: a context without ctx.on would silently leave every session unbound,
@@ -301,17 +389,27 @@ export function apply(ctx, config) {
       try {
         const session = payload?.agent?.session
         const cwd = session?.header?.cwd
-        if (!session || !cwd || typeof session.append !== 'function') return
+        if (!session || !cwd || typeof session.append !== 'function') {
+          recordSession(cwd, '', 'skipped-no-session-or-append', `session=${!!session} cwd=${cwd || ''}`)
+          return
+        }
         // Not governed → leave the session completely alone. The boundary is opt-in
         // per workspace: an empty allow-list governs nothing (see Config.boundaryWorkspaces).
         const zone = governedWorkspaceOf(loadIndex(root), root, cwd, config?.boundaryWorkspaces)
-        if (!zone) return
+        if (!zone) { recordSession(cwd, '', 'not-governed', ''); return }
         // Never bind a session into a mode this host cannot enforce — see the probe above.
-        // A pending probe also lands here, so the first candidate session stays unbound
-        // rather than being bound on an unverified host.
-        if (boundaryUsable !== true) { probeBoundary(); return }
+        // A non-true verdict also lands here: the session stays unbound and the probe is
+        // RETRIED (throttled) instead of the plugin instance staying inert forever.
+        if (boundaryUsable !== true) {
+          probeBoundary('session-start')
+          recordSession(cwd, zone, 'deferred-probe', boundaryReason)
+          return
+        }
         const policy = ctx.get?.('sandboxPolicy')
-        if (!policy || typeof policy.overrideOf !== 'function') return
+        if (!policy || typeof policy.overrideOf !== 'function') {
+          recordSession(cwd, zone, 'skipped-no-sandboxPolicy', `policy=${typeof policy}`)
+          return
+        }
         // A session is already stamped with a mode before this hook runs — the permission-preset
         // initializer fills it at `session/created` — so "is there an override?" is NOT the
         // question, and asking it made the boundary silently inert (the v0.8.1 defect: every
@@ -323,11 +421,16 @@ export function apply(ctx, config) {
         // An explicit switch inside a session still wins for that session: it appends a later
         // event. `autoBindWorkspace: false` is the deployment-level escape.
         const current = policy.overrideOf(session)
-        if (current === 'workspace-write' || current === 'read-only') return
+        if (current === 'workspace-write' || current === 'read-only') {
+          recordSession(cwd, zone, `already-${current}`, '')
+          return
+        }
         session.append('sandbox/mode', { mode: 'workspace-write' })
+        recordSession(cwd, zone, 'bound', `previous=${current === undefined ? 'undefined' : current}`)
         ctx.logger?.info?.(`[project-nav] workspace boundary: session ${sessionLabel(payload?.agent?.id)} bound to workspace-write (${zone})`)
       } catch (e) {
         // Fail-safe: a boundary that cannot be set must never break session establishment.
+        recordSession('', '', 'error', (e && e.message) || String(e))
         ctx.logger?.warn?.(`[project-nav] workspace boundary: left session untouched (${e.message})`)
       }
     })
