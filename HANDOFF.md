@@ -614,7 +614,7 @@ v0.2.5 打包重装（12 工具）、dsh-web 重启 3080+token 303、本地跑�
 
 v0.2.6 打包重装、dsh-web 重启 3080+token 303、孤儿功能渲染本地验证通过（当前数据无孤儿，机制就绪）。最新 token：`http://127.0.0.1:3080/?token=<redacted>`
 
-_本文件应随项目推进持续更新。最后更新：2026-09-07_
+
 
 ## 十九、2026-09-08 00:25 · v0.2.7 功能循环链闭环审查 + 四项修复（B1–B4）
 
@@ -1026,3 +1026,53 @@ _本文件应随项目推进持续更新。最后更新：2026-09-10 10:05_
 - [ ] git 写操作串行化（scope 之外的元冲突）。
 - [ ] 指纹粒度细化（同文件不同函数的并行；当前文件级保守串行）。
 - [ ] `docs/` 与 `package-lock.json` 的入库策略（当前未跟踪）。
+
+---
+
+## 31. v0.5.0 架构先行协议（核心治理理念 → 可执行闸门；lk 2026-09-10 定调）
+
+### 31.1 理念（第一原则，不得违反）
+
+> **所有开发动作必须从架构出发。架构不出错，开发过程中的问题就只是局部小问题。**
+>
+> **任何任务在具体动作之前必须先做架构思考与反思：是否需要调整架构？** 而不是拿到用户指令直接动手——否则会在同一个死胡同反复打补丁、拆东墙补西墙，永远解决不了根本需求。
+
+此前这条理念只活在人的约定与文档纪律里；v0.5.0 把它落成**三个工具拦得住的闸门**。
+
+### 31.2 三个闸门
+
+| 闸门 | 位置 | 行为 |
+|---|---|---|
+| **锚点闸** | `nav_plan`（新增必填参数 `anchor`） | 无 anchor 直接拒绝登记；anchor 必须经 `checkAnchor` 校验为真实架构节点（功能码 / 模块名 / 索引内文件 / 磁盘实存文件 / `.internal/arch/*.md`）。拒绝文案直接说明「无锚点的动作 = 还没有架构思考」 |
+| **计数闸** | `nav_plan` + `nav_mark done` | 同一锚点自「最近一次架构决策」以来累计 **3** 次补丁（`REPEAT_PATCH_THRESHOLD`）→ plan 输出 `⛔ 计数闸触发`、done 输出升级警告；计数 2/3 时预告「接近升格阈值」 |
+| **决策闸** | 新工具 `nav_adr`（第 13 个） | 记录 `anchor + reason + decision + impact` 到 `.internal/nav-arch.json`（ADR-xxx）；**登记即重置该锚点补丁计数** —— 这是第一性原理的复位点 |
+
+配套：`nav_plan` 新增可选参数 `arch=`（一句话架构反思）。缺失时 plan 输出 `⚠ 架构反思缺失` 但**不阻塞**——先立「可记录」，再逐步收紧为硬闸。
+
+### 31.3 数据与语义
+
+- `.internal/nav-arch.json`：架构决策账本（`{id: ADR-xxx, anchor, anchorKind, reason, decision, impact, action, session, createdAt}`）。
+- `.internal/nav-patches.json`：补丁账本（`{id: ACT-xxx, anchor, at, files, note}`，同一 ACT 幂等，重复 done 不重复计数）。
+- 计数窗口：「最近一次架构决策之后」的补丁——决策一旦登记，历史补丁不再累积压力（避免旧账压死新方向）。
+
+### 31.4 验证
+
+- 实机（仓库代码 + 临时 root）：锚点闸（无锚点/假锚点拒绝、架构文档锚点通过）、计数闸（done2 预告 2/3、done3 报 3/3、plan4 报⛔）、决策闸（ADR-001 记录并重置、决策后 plan 不再触发）**全部通过**。
+- 回归：`test/core.test.mjs` 12 + `test/concurrency.test.mjs` 22 = **34/34 绿**（新增 7 个架构先行协议用例；既有 24 处 `nav_plan` 调用补 anchor）。
+- 提交：`2d18ab1`（协议）、`c4e6b63`（测试）、`a7d934e`（修复压力串跨作用域丢失）→ 均已推送 origin/main。
+
+### 31.5 复盘：一个被静默 catch 吃掉的 bug
+
+计数闸告警首版用回调内 `var archPressure` 跨作用域带出，运行时报 `archPressure is not defined`，**被外层 catch 吞成 ERROR**，表现为「done 永远不出压力提示」而单测只断言 plan 侧，未覆盖 done 侧。修复：把 `pressureNote` 放进 `mutateActions` 回调的返回值（`res.pressureNote`），消除跨作用域副作用；catch 分支改为显式报账本写入失败。**教训：静默 catch 是闸门类代码的毒药——闸门失效必须可见。**
+
+### 31.6 开源同类对比与自身架构审查（要点）
+
+完整对照与逐项证据见 `docs/devref/shoucang/2026-09-10-reference-开源对比与架构审查.md`。
+
+- 对照体系：OpenSpec（specs/changes + propose→apply→archive）、GitHub Spec Kit（constitution + specify→plan→tasks→implement）、ADR（Nygard）、arc42、Backstage catalog、policy-as-code（OPA）。
+- **强于同类**：闸门可执行（拒绝登记）而非文档约定；索引由 agent 自维护；文档自动派生消除「文档与代码漂移」。
+- **弱于同类**：无「宪法/不变量」层；决策不随仓库传播；无组件所有者/生命周期语义。
+- **架构不足（高优先）**：G1 决策账本落在 gitignore 的 `.internal/`（不可传播）；G2 索引写路径仍无互斥（PN-P01 索引被反复回退的根因）；G3 `node:fs` 与沙箱 `ctx.fs` 不兼容；G4 锚点粒度未覆盖影响面越界；G5 无不变量层；G6 架构档过期未接入 done。
+- **架构冗余**：R1 两套指纹机制同构（宜抽公共原语）；R2 向量三处（宜显式声明 SSOT）；R3 文档层三套载体缺权威边界声明；R4 `nav_status`/`nav_map` 边界已在文档声明，保留。
+
+_本文件应随项目推进持续更新。最后更新：2026-09-10 10:35_

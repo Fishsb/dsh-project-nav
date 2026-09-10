@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/project-nav",
-  "version": "0.4.0",
-  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, and a governance-first action ledger (plan/begin/done). v0.3.0: multi-session concurrency — scope locks instead of a global single-in_progress rule (disjoint scopes run in PARALLEL, overlapping ones QUEUE via wait=true), self-healing leases, and a cross-process ledger lock so concurrent planners never lose an action. v0.4.0: scope fingerprints — nav_mark begin records size/mtime/sha1 of every file in scope, nav_mark done reports DRIFT when a file changed or vanished WHILE the action ran, and nav_status shows live drift for running actions.",
+  "version": "0.5.0",
+  "description": "DSH plugin: anti-drift project governance — bidirectional feature<->file mapping, mainline vector, and a governance-first action ledger. v0.4.0: multi-session concurrency (per-scope leases + queueing) and scope file fingerprints (drift detection). v0.5.0: architecture-first protocol — every action must anchor to a real architecture node (nav_plan refuses otherwise), three patches on one anchor without an architecture decision trip a repeat-patch gate, and nav_adr records the architecture decision that resets it.",
   "type": "module",
   "main": "./host/index.js",
   "exports": {
