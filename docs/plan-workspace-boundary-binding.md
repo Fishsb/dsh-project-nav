@@ -2,8 +2,8 @@
 
 > 整理日期：2026-09-11（本地）
 > 架构依据：**ADR-014**（现行，收敛 ADR-012/ADR-013）
-> 状态：**已实施并安装 v0.8.2**（84/84 测试通过）——**未生效，等待重启**。
-> ⚠️ **在修好沙箱后端（§3）之前不要重启**：重启会让新会话被绑定到 `workspace-write`，而本机 shell 后端 fail-closed，**新会话将失去 shell**。顺序必须是：先改 `dsh-web` 服务账户 → 再重启 → 一次生效。
+> 状态（2026-09-11 00:45）：v0.8.2 已装，且**绑定能力已实证可用**——重启后本会话被正确绑到 `workspace-write`（运行时上下文实证），fs 边界也真的在拦（写 `D:\FF\__boundary-live-probe.txt` → `[sandbox: file access denied under workspace-write mode]`）。
+> 但**宿主沙箱后端仍不可用**（`dsh-web` 仍是 `LocalSystem`），而该组合下 shell 是 **fail-closed** → 每个被治理会话都会失去 shell。故 profile 已把 `autoBindWorkspace` 显式置为 **false**（安全默认：任何重启顺序下都不会再绑死会话）。修好后端并验证 PASS 后改回 `true` 即恢复边界。事故经过与暴露的架构缺口见 §13。
 
 ---
 
@@ -152,3 +152,35 @@ cwd 在 root 之外                      → ''（不治理）
 **为什么判据不能用 `defaultMode` 比较**：实测 `sandboxPolicy.defaultMode = workspace-write`，而初始化器盖的戳是 `danger-full-access`（来自预设推导，部署配置里没有 `defaultPreset`）。两者不等，所以"等于部署默认就绑定"这条规则同样不成立。**唯一可用的判据是值本身**（见 §5）。
 
 **教训**：这条 bug 与 HANDOFF §37.6 记录的三次"假信号"是**同一枚硬币的反面**——那三次是**误报**，这次是**静默漏报**：报错时人还能看见，什么都不做时连日志都没有（`ctx.logger` 的输出根本没进 nssm 日志）。**"不夺权"这种听起来正确的礼貌规则，如果判据选错了输入，就会变成"永远不做"。** 检测手段只能是对**真实部署**做端到端探针——单元测试当时全绿，因为它测的是我写下的那条错判据。
+
+## 13. 实机事故：正确的策略落在没有执行力的宿主上（2026-09-11 00:40）
+
+**重启后的实测（好消息）**：v0.8.2 的绑定**按设计工作了**——本会话在重启后被绑到 `workspace-write`（运行时上下文实证），fs 边界也真的在拦：
+```
+写 D:\FF\__boundary-live-probe.txt  →  [sandbox: file access denied under workspace-write mode]
+```
+
+**但（坏消息）**：`dsh-web` 仍是 `LocalSystem`，沙箱后端起不来，而该模式下 shell 是 **fail-closed**：
+```
+sandbox mode "workspace-write" is requested but no sandbox backend is usable on this host;
+refusing to run the command unconfined.  Runner failure: windows-acl-run:
+CreateRestrictedToken prerequisite failed: no logon SID found among 4 token groups
+```
+于是**每个被治理会话都失去了 shell**——包括本会话（cwd `D:\FF\project-nav`）与另一个活会话 `session-ab5e360d`（cwd `D:\FF\shoucang`）。
+
+**当场修复（三步，全部实证）**：
+1. 用动态插件给**调用方会话** append `sandbox/mode=danger-full-access` → 本会话 shell 立即恢复（运行时上下文回到 `danger-full-access`）。
+2. 遍历活会话，把卡在 `workspace-write` 的**全部释放** → 命中并释放 `session-ab5e360d`（cwd `D:\FF\shoucang`）；并保留一个 `session-start` 中和器，保证此后新建/恢复的会话不再被绑死。
+3. profile 里把 `autoBindWorkspace` 显式置为 **false**，使**任何重启顺序**下都不再出现该状态（安全默认优先于功能可用）。
+
+**暴露的架构缺口**：插件**无法感知宿主能不能真的强制**。
+- `sandbox.confine()` 在后端不可用时**不抛错**——实测返回 `enforcement=partial` 的包装 argv（`argv0` 是 runner 的 node），失败发生在 **runner 执行时**。所以"绑定前自检"这条近路不存在。
+- 后果具有普遍性：**一个正确的策略落在没有执行力的宿主上，不是保护环境，而是弄坏环境**——fail-closed 把"不能强制"变成了"不能用"。
+
+**候选对策（待决策，不擅自加机制）**：
+
+| # | 对策 | 代价 |
+|---|---|---|
+| ① | 保持人工前置（现状）：宿主先修好，再打开开关 | 顺序靠人守——已被现实否证两次 |
+| ② | 插件加**一次性能力探针**：真正起一次受限进程，失败则不绑（按进程缓存） | 要弄清 `shell.run/start` 的 spec；每次启动多一次进程开销 |
+| ③ | 把"宿主可强制"做成**显式能力声明**（`.internal/` 下一份标记），由验证流程写入、插件只读 | 引入一个新数据文件（无进程开销，天然可审计） |
