@@ -126,32 +126,75 @@ Ok "服务账户已写入（SCM 回显 '$afterName'）"
 
 # ---------------------------------------------------------------- 4. 服务登录权限
 Step 3 '检查「作为服务登录」权限'
-function Get-LogonRightSids {
+# secedit stores a right's holders EITHER as `*S-1-5-...` or as a plain ACCOUNT NAME (`lk`), so
+# comparing the raw text against a SID string is a FALSE NEGATIVE -- which is exactly what made
+# this script roll back twice on a host where the right was already present. Resolve every entry
+# to a SID and compare those.
+function Resolve-RightEntry([string]$e) {
+  $t = $e.Trim()
+  if (-not $t) { return $null }
+  if ($t.StartsWith('*')) { return $t.Substring(1) }
+  try { return (New-Object Security.Principal.NTAccount($t)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { return $null }
+}
+function Test-ServiceLogonRight([string]$sid) {
   $f = Join-Path $env:TEMP "ur-check-$stamp.inf"
-  & secedit /export /areas USER_RIGHTS /cfg $f | Out-Null
+  & secedit /export /areas USER_RIGHTS /cfg $f *> $null   # never pipe: $LASTEXITCODE must stay secedit's
   $line = (Get-Content $f -Encoding Unicode | Select-String '^SeServiceLogonRight').Line
   Remove-Item $f -Force -ErrorAction SilentlyContinue
-  if (-not $line) { return @() }
-  return @(($line -split '=', 2)[1].Trim() -split '\s*,\s*' | Where-Object { $_ })
-}
-$sids = Get-LogonRightSids
-if ($sids -contains "*$acctSid") {
-  Ok "$Account 已具备该权限（nssm 已处理）"
-} else {
-  Warn "$Account 尚不具备该权限 -> 现在补授（仅增量追加，基于本次导出的策略）"
-  $inf = $infTmp
-  $content = Get-Content $inf -Encoding Unicode
-  $patched = foreach ($l in $content) {
-    if ($l -match '^SeServiceLogonRight') {
-      if ($l.Trim() -match '=\s*$') { "$l*$acctSid" } else { "$l,*$acctSid" }
-    } else { $l }
+  if (-not $line) { return $false }
+  foreach ($e in (($line -split '=', 2)[1]).Split(',')) {
+    if ((Resolve-RightEntry $e) -eq $sid) { return $true }
   }
-  $patched | Set-Content -Path $inf -Encoding Unicode
-  & secedit /configure /db (Join-Path $env:TEMP "secedit-$stamp.sdb") /cfg $inf /areas USER_RIGHTS | Out-Null
-  if ($LASTEXITCODE -ne 0) { Restore-Service '用户权限策略应用失败' }
-  $sids2 = Get-LogonRightSids
-  if ($sids2 -contains "*$acctSid") { Ok '权限已授予' }
-  else { Restore-Service '权限授予后仍未生效' }
+  return $false
+}
+# Additive grant through the LSA API. Deliberately NOT a secedit INF round-trip: applying the
+# whole USER_RIGHTS area rewrites every line, and an entry this host cannot resolve (as an orphan
+# localized name here) is silently dropped by that rewrite.
+if (-not ('LsaRight' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class LsaRight {
+  [StructLayout(LayoutKind.Sequential)] private struct LSA_UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+  [StructLayout(LayoutKind.Sequential)] private struct LSA_OBJECT_ATTRIBUTES {
+    public int Length; public IntPtr RootDirectory; public IntPtr ObjectName;
+    public int Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService;
+  }
+  [DllImport("advapi32.dll", SetLastError = true)]
+  private static extern uint LsaOpenPolicy(IntPtr SystemName, ref LSA_OBJECT_ATTRIBUTES ObjectAttributes, uint DesiredAccess, out IntPtr PolicyHandle);
+  [DllImport("advapi32.dll", SetLastError = true)]
+  private static extern uint LsaAddAccountRights(IntPtr PolicyHandle, byte[] AccountSid, LSA_UNICODE_STRING[] UserRights, uint CountOfRights);
+  [DllImport("advapi32.dll", SetLastError = true)]
+  private static extern uint LsaClose(IntPtr PolicyHandle);
+  public static void Add(string account, string right) {
+    var sid = new System.Security.Principal.NTAccount(account).Translate(typeof(System.Security.Principal.SecurityIdentifier)) as System.Security.Principal.SecurityIdentifier;
+    if (sid == null) throw new Exception("cannot resolve account: " + account);
+    byte[] bytes = new byte[sid.BinaryLength];
+    sid.GetBinaryForm(bytes, 0);
+    var oa = new LSA_OBJECT_ATTRIBUTES();
+    oa.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
+    IntPtr policy;
+    uint st = LsaOpenPolicy(IntPtr.Zero, ref oa, 0x000F0FFF, out policy);
+    if (st != 0) throw new Exception("LsaOpenPolicy NTSTATUS 0x" + st.ToString("X8"));
+    var rights = new LSA_UNICODE_STRING[1];
+    rights[0].Buffer = Marshal.StringToHGlobalUni(right);
+    rights[0].Length = (ushort)(right.Length * 2);
+    rights[0].MaximumLength = (ushort)((right.Length + 1) * 2);
+    try {
+      uint st2 = LsaAddAccountRights(policy, bytes, rights, 1);
+      if (st2 != 0) throw new Exception("LsaAddAccountRights NTSTATUS 0x" + st2.ToString("X8"));
+    } finally { Marshal.FreeHGlobal(rights[0].Buffer); LsaClose(policy); }
+  }
+}
+'@
+}
+if (Test-ServiceLogonRight $acctSid) {
+  Ok "$Account 已具备该权限（检测按账户名/SID 双向解析）"
+} else {
+  Warn "$Account 缺少该权限 -> 用 LSA API 增量补授（不重写整片策略）"
+  try { [LsaRight]::Add($Account, 'SeServiceLogonRight') }
+  catch { Restore-Service "补授失败：$($_.Exception.Message)" }
+  if (Test-ServiceLogonRight $acctSid) { Ok '权限已授予' } else { Restore-Service '补授后仍未生效' }
 }
 
 # ---------------------------------------------------------------- 5. 重启
