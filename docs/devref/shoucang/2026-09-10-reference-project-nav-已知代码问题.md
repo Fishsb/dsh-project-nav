@@ -1,7 +1,7 @@
-# [项目事实] reference · project-nav 已知代码问题（v0.7.0 复核）
+# [项目事实] reference · project-nav 已知代码问题（v0.7.2 复核）
 
 - 卡类型：reference
-- 溯源：project-nav 审查 seq37326（原始快照已过时；本卡按 **v0.7.0** 实测逐项复核）
+- 溯源：project-nav 审查 seq37326（原始快照已过时；本卡按 **v0.7.2** 实测逐项复核）
 - 源会话：session-471aca03-3da2-4078-8dc1-3493071f0953（原始） / 2026-09-10 多次复核
 - 工作区：D:\FF\project-nav
 
@@ -12,12 +12,14 @@
 | `host/index.js` 硬编码 `D:/FF/project-nav` | ✅ 已修（v0.2.10） | `root` 默认空串，`config.root` 显式传入，未配置时回退 `process.cwd()` 并 boot warn |
 | `host` 与 `shared` 逻辑重复 | ✅ 已修（v0.2.0） | host 仅 import `../shared/index.js`，无内联复制 |
 | `client/` 已声明移除但目录仍存 | ✅ 已修 | 仓库无 `client/` 目录；README 不再声称 UI 面板 |
-| `package.json` scripts 指向缺失文件 | ✅ 已修（v0.4.0） | `test = node --test test/core.test.mjs test/concurrency.test.mjs`，**43 用例实跑全绿** |
-| 索引 PN-P01 死条目 / 多重挂载 | ✅ 已修（本轮） | `shared/tools/*`（5）、`client/index.js`、`scripts/build.mjs` 已移出索引；`PN-F01..F05` 三重挂载收敛为单模块；`functionToModule` 4 条层级错置键清除；PN 模块 5→2 |
+| `package.json` scripts 指向缺失文件 | ✅ 已修（v0.4.0） | `test = node --test test/core.test.mjs test/concurrency.test.mjs`，**51 用例实跑全绿** |
+| 索引 PN-P01 死条目 / 多重挂载 | ✅ 已修（v0.7.0） | `shared/tools/*`（5）、`client/index.js`、`scripts/build.mjs` 已移出索引；`PN-F01..F05` 三重挂载收敛为单模块；`functionToModule` 4 条层级错置键清除；PN 模块 5→2 |
 | **索引写路径无互斥（G2）** | ✅ 已修（v0.7.0） | 四个 `mutate*` 入口 + `nav_sync_docs` 全部入 per-target 锁（`.internal/locks/`）；`saveIndex/saveDocs/saveVector/saveArch` 在 host 中已无直接调用 |
-| 部署声明与实体不一致 | ✅ 当前一致（v0.7.0） | 声明 `file:…dsh-external-project-nav-0.7.0.tgz` = 产物内部 0.7.0 = 已装副本 0.7.0（三层 SHA256 MATCH）。**注意这是每版必做的动作**，见下「流程风险」 |
+| **索引只能增不能删（生命周期缺口）** | ✅ 已修（v0.7.1） | `nav_update retire=true` 级联退役（feature 双向映射全扫 + 模块成员；module 摘项目挂载；project 摘模块），在飞动作引用时拒绝；用 pmg 实测：假 STALE 由 7 条清零 |
+| **「索引外文件」误报（假警报）** | ✅ 已修（v0.7.2） | 同一判定曾被写三遍（plan 预校验 / done delta / 指纹快照），前两处字面查表 → 项目相对拼写被误报。新增 `indexedOwnersOf` 收敛为单一事实源（canonPath 折叠 + 项目相对回退 + 唯一后缀）；真机验证 `host/index.js` → PN-F01..F05 已登记，`brand/new-file.mjs` 仍正确报未登记 |
+| 部署声明与实体不一致 | ✅ 当前一致（v0.7.2） | 声明 `file:…dsh-external-project-nav-0.7.2.tgz` = 产物内部 0.7.2 = 已装副本 0.7.2（四者 SHA256 MATCH）。**注意这是每版必做的动作**，见下「流程风险」 |
 
-## 开放问题（v0.7.0 复核仍存在）
+## 开放问题（v0.7.2 复核仍存在）
 
 1. **`shared/index.js` 直接依赖 `node:fs`（G3，沙箱不兼容）**——已处置为「探测 + 显式告警」而非改造：`apply` 时会探测 `ctx.fs`，存在则 warn 提示「本插件仍走 node:fs 直读直写 `.internal/`，若本部署对插件 fs 强制围栏，治理数据可能绕过围栏」。
    暂不做异步 fs 端口双后端：当前宿主进程未受限（node:fs 全程可用），双后端会让 IO 层翻倍，违反 v0.6.0 的复杂度预算。**触发条件**：出现真实受限部署时一次性迁移；届时若注入能力无独占创建，锁必须显式降级告警（进程内队列 + `replaceIfVersion` 陈旧守卫），不得静默失效。
