@@ -30,14 +30,21 @@ D:\lk\tools\dsh-web.cmd        # 现唯一启动方式；无自启 —— 重启
 
 **已知缺口（nssm 卸载的后果，不属边界本身）**：
 
-1. **`dsh-web` 无自启** —— 重启电脑后 GUI 不会自动回来，现靠手动 `D:\lk\tools\dsh-web.cmd`。
+1. **自启已恢复（登录自启计划任务，2026-09-11 用户拍板）** —— nssm 卸载后 `dsh-web`(3080) 与 `bge-embed`(9915) 一度都失去自启；现由 `docs/install-logon-autostart.ps1` 建两个**交互式登录任务**：`dsh-web-user` / `dsh-bge-embed-user`（`LogonType=Interactive`、`RunLevel=Limited`、user=lk、trigger=登录时）。
+   **验收走实证**：杀掉手工实例后 `schtasks /run /tn dsh-bge-embed-user` → 9915 在 ~4s 内复活（`provider=DmlExecutionProvider`、owner=lk）——**建了任务 ≠ 任务能拉起服务**，故以"任务真的把服务拉起来"为判据。手动启动件仍保留（`D:\lk\tools\dsh-web.cmd` / `bge-embed.cmd`），与任务**二选一**，别同时用（后起的会 EADDRINUSE 退出）。
 2. **连带损伤：`dsh-bge-embed`（`127.0.0.1:9915`，守藏记忆的本地 bge-m3 向量后端）随 nssm 一起消失** —— 该服务原为 `nssm AUTO_START`，卸载后 9915 无监听，记忆 **dense 召回静默退化为纯词法**（`scheduler.ts` 里 `embedBaseUrl` 仍指 9915）。**已恢复并实证**：新建启动件 `D:\lk\tools\bge-embed.cmd`（与 `dsh-web.cmd` 同一约定，ASCII-only；无 nssm、无自启），
    ```
    D:\AI\venv-bge\Scripts\python.exe D:\lk\deepseek\tools\bge-m3-openai-server-gpu.py D:\AI\models\bge-m3 1024 9915
    ```
    实测：`/health` → `provider=DmlExecutionProvider`（GPU）、`dims=1024`；批量 3 条 361ms；语义自检 `cos(排障要先取真因, debug 时先定位根因)=0.62` > `cos(…, 今天天气不错)=0.39`（**近义高于无关，鉴别力在**）。
    > 踩坑留痕：第一版自检用 PowerShell 管道取向量，`$r.data | % { $_.embedding }` 会把 1024 维数组**展平成标量流**，算出的余弦恒为 ±1.0（假数据）。**这类"看起来是模型的错"的结果，先怀疑测量代码**；换 node 直取 `data[i].embedding` 才可信。
-3. 原先 `switch-dsh-web-to-user.ps1` 的 onlogon 计划任务思路仍成立（且同样满足 logon SID 要求），但该脚本以"停用 nssm 服务"为前提、服务已不存在 → 需按新形态重写，或另走一条自启路径（**待用户拍板**）。
+3. **`switch-dsh-web-to-user.ps1` 作废** —— 它的前提（停用 nssm 服务）已不存在；其 onlogon 思路由 `install-logon-autostart.ps1` 按新形态落地。**并且不再需要最高权限**（`/rl highest`）：当前实例是标准（已过滤）令牌，受限令牌 runner 实测 PASS，故任务用 `Limited` —— 少给权限更稳。
+
+**本次踩到的三个 Windows 坑（均实测，别再踩）**：
+
+- **PS 5.1：`$ErrorActionPreference='Stop'` 会把原生命令写 stderr 当成终止错误** —— 连 `*> $null` 都压不住，脚本会在自己的 FAIL 分支之前就中断（非提权跑 `schtasks /create` 即复现：Access is denied 直接把脚本打死，连"需要提权"的提示都打不出来）。修法：原生命令统一走一个局部把 EAP 降为 `Continue` 的包装函数，退出码与输出自判。
+- **`schtasks /query /fo list` 的字段名是本地化的**（中文为 状态:/下次运行时间:/作为用户运行:）→ 按英文正则解析恒得 `?`。要机器可读就走 `Get-ScheduledTask` 的结构化字段（与显示语言无关）。
+- **从 harness 的 shell 里 `Start-Process -Verb RunAs` 会把该 shell 的作业对象带崩** —— 本次报 `subprocess-local: Windows Job runner exited with exit code 3221225786`（`0xC000013A` = Ctrl+C 退出码），而**提权侧其实跑成功了**。做法：让提权进程把输出重定向到文件，父侧轮询该文件取结果，别指望同一个工具调用还能活着拿返回。
 
 ---
 
