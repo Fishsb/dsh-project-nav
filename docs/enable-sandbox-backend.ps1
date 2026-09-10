@@ -116,8 +116,13 @@ try {
 }
 $after = (& sc.exe qc $Service | Select-String 'SERVICE_START_NAME').ToString().Trim()
 Write-Host "    之后: $after"
-if ($after -notmatch [regex]::Escape($Account)) { Restore-Service '服务账户未按预期写入' }
-Ok '服务账户已写入'
+# Compare the ACCOUNT NAME only. SCM normalises the reference — it reports `.\lk` for a local
+# account even when `MACHINE\lk` was set — so matching the full spelling is a FALSE NEGATIVE.
+# That is exactly what made this script roll back a perfectly good account change once.
+$acctName = ($Account -split '\\')[-1]
+$afterName = ($after -split '\\')[-1]
+if ($afterName.Trim().ToLower() -ne $acctName.Trim().ToLower()) { Restore-Service "服务账户未按预期写入（读到 '$afterName'，期望 '$acctName'）" }
+Ok "服务账户已写入（SCM 回显 '$afterName'）"
 
 # ---------------------------------------------------------------- 4. 服务登录权限
 Step 3 '检查「作为服务登录」权限'
@@ -194,7 +199,7 @@ $summary = @"
 
 ==================== 接下来验证（实证，不看「应该好了」）====================
 1) 服务身份
-     sc.exe qc $Service | Select-String SERVICE_START_NAME     # 期望 $Account
+     sc.exe qc $Service | Select-String SERVICE_START_NAME     # 期望回显 .\lk（SCM 会规范化账户写法）
 
 2) 后端真的能用（在任意 DSH 会话里）
      /permission workspace-write
