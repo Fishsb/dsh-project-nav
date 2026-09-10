@@ -575,6 +575,104 @@ export function verifyScopeFingerprint(rootPath, index, scopeState, scope = null
   return { changed, removed, added, ok: changed.length === 0 && removed.length === 0 };
 }
 
+// ---- architecture-first protocol (核心治理理念的可执行形态) ----
+// 理念（lk 2026-09-10 定调）：所有开发动作从架构出发；架构不出错，过程中的小问题影响
+// 就是局部的。任何任务在动作之前先做架构思考（是否需要调整架构），而不是拿到指令直接
+// 动手——否则会在同一个死胡同反复打补丁、拆东墙补西墙，永远解决不了根本需求。
+//
+// 三个闸门把这句话变成工具拦得住的规则：
+//   ① 锚点闸  每个动作必须锚定架构节点（功能/模块/文件/架构文档），无锚点 = 架构思考缺失
+//   ② 计数闸  同一锚点累计 N 次补丁仍无架构决策 → 强制回架构层（不靠灵感自查）
+//   ③ 决策闸  架构层改动留 ADR（锚点 + 触发原因 + 决策 + 影响面），可回溯可复盘
+
+const ARCH_FILENAME = '.internal/nav-arch.json';
+const PATCHES_FILENAME = '.internal/nav-patches.json';
+
+/** 同一锚点累计补丁达到该阈值 → 升格要求架构决策（第一性原理的触发线）。 */
+export const REPEAT_PATCH_THRESHOLD = 3;
+
+export function createEmptyArch() {
+  return { version: '1.0', decisions: [] };
+}
+
+export function createEmptyPatches() {
+  return { version: '1.0', patches: [] };
+}
+
+export function loadArch(rootPath) {
+  return readJson(resolve(rootPath, ARCH_FILENAME), createEmptyArch, { failLoud: true, label: 'architecture ledger' });
+}
+
+export function saveArch(rootPath, arch) {
+  atomicWriteJson(resolve(rootPath, ARCH_FILENAME), arch);
+}
+
+export function loadPatches(rootPath) {
+  return readJson(resolve(rootPath, PATCHES_FILENAME), createEmptyPatches, { failLoud: true, label: 'patch log' });
+}
+
+export function savePatches(rootPath, patches) {
+  atomicWriteJson(resolve(rootPath, PATCHES_FILENAME), patches);
+}
+
+/** Next architecture decision id: ADR-001, ADR-002, ... */
+export function nextDecisionId(arch) {
+  let max = 0;
+  for (const d of arch.decisions || []) {
+    const m = /^ADR-(\d+)$/.exec(d.id);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  return `ADR-${String(max + 1).padStart(3, '0')}`;
+}
+
+/** 锚点是否指向真实架构节点：功能码 / 模块名 / 索引内文件 / 磁盘实存文件 / 架构文档。 */
+export function checkAnchor(index, rootPath, anchor) {
+  if (!anchor || !String(anchor).trim()) return { ok: false, kind: null, hint: '锚点为空' };
+  const a = normalizePath(String(anchor).trim());
+  const f2f = index?.indexes?.fileToFeature || {};
+  const f2files = index?.indexes?.featureToFiles || {};
+  const m2f = index?.indexes?.moduleToFeatures || {};
+  if (/^[A-Z]{2,}-[A-Z]?\d+$/i.test(a) && (f2files[a] || index?.descriptions?.[a])) return { ok: true, kind: 'feature' };
+  if (m2f[a]) return { ok: true, kind: 'module' };
+  if (f2f[a]) return { ok: true, kind: 'file' };
+  try {
+    if (existsSync(resolve(rootPath, a))) return { ok: true, kind: /\.internal\/arch\/.*\.md$/.test(a) ? 'arch-doc' : 'file' };
+  } catch { /* unreadable → 继续判定 */ }
+  return { ok: false, kind: null, hint: '既不在索引内，也不在磁盘上' };
+}
+
+/** 锚点最近一次架构决策（同一 anchor 取最新 createdAt）。 */
+export function lastDecisionFor(arch, anchor) {
+  const a = normalizePath(String(anchor || ''));
+  const hits = (arch?.decisions || []).filter(d => normalizePath(String(d.anchor || '')) === a);
+  if (!hits.length) return null;
+  return hits.slice().sort((x, y) => String(x.createdAt || '').localeCompare(String(y.createdAt || '')))[hits.length - 1];
+}
+
+export function patchesFor(patches, anchor) {
+  const a = normalizePath(String(anchor || ''));
+  return (patches?.patches || []).filter(p => normalizePath(String(p.anchor || '')) === a);
+}
+
+/**
+ * 计数闸：同一锚点自「最近一次架构决策」以来累计的补丁数。
+ * 达到阈值 → 要求先出架构决策（第一性原理的硬触发），而不是继续打补丁。
+ */
+export function repeatPressure(arch, patches, anchor, { threshold = REPEAT_PATCH_THRESHOLD } = {}) {
+  const since = lastDecisionFor(arch, anchor);
+  const sinceAt = since?.createdAt || null;
+  const list = patchesFor(patches, anchor).filter(p => !sinceAt || String(p.at || '') > String(sinceAt));
+  return { anchor, count: list.length, threshold, exceeded: list.length >= threshold, sinceDecision: since ? since.id : null, patches: list.map(p => p.id) };
+}
+
+/** 把已完结动作记进补丁账本（同一 ACT 幂等）。 */
+export function recordPatch(patches, { actionId, anchor, at, files = [], note = '' }) {
+  patches.patches = patches.patches || [];
+  if (patches.patches.some(p => p.id === actionId)) return patches;
+  patches.patches.push({ id: actionId, anchor: normalizePath(String(anchor || '')), at: at || new Date().toISOString(), files, note });
+  return patches;
+}
+
 // ---- reference docs registry (project reference foundation) ----
 
 export function createEmptyDocs() {

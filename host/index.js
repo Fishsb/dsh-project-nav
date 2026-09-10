@@ -1,7 +1,7 @@
 // @dsh-external/project-nav — anti-drift governance for agent-maintained projects
 // Design core: governance-first transaction loop (HANDOFF §14):
 //   nav_query (scope) → nav_plan (register action) → nav_mark begin → change → nav_mark done
-// 12 tools. Core logic lives in ../shared/index.js (single source, no duplication).
+// 13 tools. Core logic lives in ../shared/index.js (single source, no duplication).
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
@@ -16,7 +16,8 @@ import {
   queryIndex, partialSearch, normalizePath,
   renderTreeText, renderMapHtml, renderProjectDocSection,
   findStaleFiles, scopeTargetsOfOpenActions, withLedgerLock,
-  snapshotScopeFiles, verifyScopeFingerprint
+  snapshotScopeFiles, verifyScopeFingerprint,
+  loadArch, saveArch, loadPatches, savePatches, nextDecisionId, checkAnchor, repeatPressure, recordPatch, REPEAT_PATCH_THRESHOLD, lastDecisionFor
 } from '../shared/index.js'
 
 // ---- Plugin metadata (Cordis contract) ----
@@ -264,7 +265,9 @@ export function apply(ctx, config) {
       plan: { type: 'string', description: 'Change plan summary derived from governance info' },
       features: { type: 'string', description: 'Comma-separated feature codes in scope' },
       modules: { type: 'string', description: 'Comma-separated module names in scope' },
-      files: { type: 'string', description: 'Comma-separated file paths in scope' }
+      files: { type: 'string', description: 'Comma-separated file paths in scope' },
+      anchor: { type: 'string', description: 'Architecture-first protocol: the architecture node this task belongs to (feature code / module / file / .internal/arch/*.md). Required — an action with no architecture anchor is a local patch in the making.' },
+      arch: { type: 'string', description: 'One-line architecture reflection: does this task need an architecture change, or is the architecture sound and the change local?' }
     },
     output: OUTPUT,
     async execute(args, exec) {
@@ -291,6 +294,32 @@ export function apply(ctx, config) {
         }
         const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
         const index = loadIndex(root)
+        // ---- 架构先行协议：锚点闸 + 计数闸 ----
+        const anchor = normalizePath(String(args.anchor || '').trim())
+        if (!anchor) {
+          return [
+            'ERROR: nav_plan requires anchor=<架构节点> —— 所有开发动作必须从架构出发。',
+            '  改哪个功能就锚功能码（PN-F01），动哪个模块就锚模块名（PN-M02），修哪个文件就锚文件路径；架构层改动锚 .internal/arch/*.md。',
+            '  先跑 nav_query <目标> 拿到锚点，再登记动作。无锚点的动作 = 还没有架构思考，十有八九会变成局部补丁。',
+            '  arch=<一句话架构判断> 可选但强烈建议：本任务是否需要调整架构？'
+          ].join('\n')
+        }
+        const anchorChk = checkAnchor(index, root, anchor)
+        if (!anchorChk.ok) {
+          return `ERROR: anchor "${anchor}" 不是真实架构节点（${anchorChk.hint}）。先 nav_query 确认，或 nav_add_feature / nav_add_module / nav_update --field files 补登记。`
+        }
+        const archLedger = loadArch(root)
+        const patchLog = loadPatches(root)
+        const pressure = repeatPressure(archLedger, patchLog, anchor)
+        const archNote = []
+        if (!String(args.arch || '').trim()) {
+          archNote.push('⚠ 架构反思缺失（arch= 未填）：动手前请用一句话回答「本任务是否需要调整架构」——需要则先出架构决策（nav_adr），不需要则说明架构为何仍然成立。')
+        }
+        if (pressure.exceeded) {
+          archNote.push(`⛔ 计数闸触发：锚点 ${anchor} 自 ${pressure.sinceDecision || '项目开始'} 以来已有 ${pressure.count} 次补丁（阈值 ${pressure.threshold}）——按第一性原理，先出架构决策（nav_adr anchor="${anchor}"），再判断这次改动是不是又一个局部补丁。`)
+        } else if (pressure.count > 0) {
+          archNote.push(`ℹ 该锚点已有 ${pressure.count} 次补丁（阈值 ${pressure.threshold}）${pressure.sinceDecision ? `，最近架构决策 ${pressure.sinceDecision}` : '，尚无架构决策'}。`)
+        }
         // B4: scope-vs-index pre-validation at plan time — every scope item must either exist in the
         // index or be explicitly new. Silent unknowns are how a plan quietly points at the wrong target.
         const unknown = {
@@ -321,6 +350,9 @@ export function apply(ctx, config) {
           plan: args.plan || '',
           scope,
           status: 'planned',
+          anchor,
+          anchorKind: anchorChk.kind,
+          archNote: String(args.arch || '').trim(),
           owner: selfOwner(sid, { cwd: process.cwd() }),
           lease: null,
           createdAt: new Date().toISOString(),
@@ -344,6 +376,8 @@ export function apply(ctx, config) {
         }).slice(0, 5)
         return [
           `✓ Action ${action.id} registered (planned): ${action.task}`,
+          `  Anchor: ${anchor} (${anchorChk.kind})${action.archNote ? ` · arch: ${action.archNote}` : ''}`,
+          ...(archNote.length ? ['', ...archNote] : []),
           `  Scope: features=[${scope.features.join(', ')}] modules=[${scope.modules.join(', ')}] files=[${scope.files.join(', ')}]`,
           ...(unknownNote ? [unknownNote] : []),
           ...(suggestions.length ? [
@@ -468,7 +502,22 @@ export function apply(ctx, config) {
             if (missingFeatures.length) deltaLines.push(`  - 未登记功能（需 nav_add_feature）: ${missingFeatures.join(', ')}`)
             if (unregisteredFiles.length) deltaLines.push(`  - 索引外文件（需登记到所属功能，nav_update --field files）: ${unregisteredFiles.join(', ')}`)
             // Releasing a scope is what unblocks the sessions queued behind it.
+            // 架构先行协议：完结动作按锚点记入补丁账本 + 计数闸复查
             const waiters = (ledger.actions || []).filter(o => o.status === 'planned' && o.id !== a.id && checkScopeConflicts(ledger, o, { index }).length === 0)
+            if (a.anchor) {
+              try {
+                const pl = loadPatches(root)
+                recordPatch(pl, { actionId: a.id, anchor: a.anchor, at: a.completedAt, files: a.scope?.files || [], note: a.task })
+                savePatches(root, pl)
+                const ag = loadArch(root)
+                const pr = repeatPressure(ag, pl, a.anchor)
+                var archPressure = pr.exceeded
+                  ? `  ⛔ ${a.anchor} 已累计 ${pr.count} 次补丁（阈值 ${pr.threshold}），最近架构决策 ${pr.sinceDecision || '无'}：这是「同一死胡同反复打补丁」的信号——下次改动前先 nav_adr 出架构决策。`
+                  : (pr.count >= pr.threshold - 1 ? `  ⚠ ${a.anchor} 补丁计数 ${pr.count}/${pr.threshold}，接近升格阈值：先想根因，别拆东墙补西墙。` : '')
+              } catch { var archPressure = '' }
+            } else {
+              var archPressure = '  ⚠ 本动作无锚点（未走锚点闸）——无法计入架构补丁账本。'
+            }
             return { kind: 'done', action: a, waiters: waiters.map(w => w.id) }
           })
           if (res.kind === 'no-action') return `ERROR: no action "${args.id}". Use nav_plan to create one.`
@@ -489,6 +538,7 @@ export function apply(ctx, config) {
           } else if (scopeDrift) {
             lines.push('  ✓ Scope fingerprint verified: none of the scoped files changed during this action.')
           }
+          if (typeof archPressure === 'string' && archPressure) lines.push(archPressure)
           if (res.waiters.length) lines.push(`  Scope released — ${res.waiters.length} queued action(s) can now begin: ${res.waiters.join(', ')}`)
           return lines.join('\n')
         }
@@ -894,6 +944,56 @@ export function apply(ctx, config) {
       } catch (e) { return err(e) }
     }
   })), 'project-nav: set-vector')
+  // ---- 13. nav_adr — 架构层改动留痕（架构先行协议的第 3 个闸门） ----
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 'nav_adr',
+    description: 'Architecture-first protocol: record an architecture decision for one anchor (feature / module / file / arch-doc). Required whenever a task changes the ARCHITECTURE (new module, scope move, interface change) and mandatory once the same anchor has accumulated three patches without one — otherwise local patches keep curing symptoms inside the same dead end. Recording a decision resets that anchor patch counter (the first-principles trigger).',
+    parameters: {
+      anchor: { type: 'string', required: true, description: 'The architecture node this decision belongs to: feature code, module name, file path, or .internal/arch/*.md doc' },
+      reason: { type: 'string', required: true, description: 'Why the architecture must change now (the root need, not the symptom)' },
+      decision: { type: 'string', required: true, description: 'What the architecture becomes after this decision' },
+      impact: { type: 'string', description: 'Affected features/modules/files or cross-project impact' },
+      action: { type: 'string', description: 'Related ledger action id, e.g. ACT-004 (optional)' }
+    },
+    output: OUTPUT,
+    async execute(args, exec) {
+      const sid = sidOf(exec)
+      try {
+        const index = loadIndex(root)
+        const chk = checkAnchor(index, root, args.anchor)
+        if (!chk.ok) {
+          return [
+            `ERROR: anchor "${args.anchor}" is not an architecture node (${chk.hint}).`,
+            '  Register the feature/module first (nav_add_feature / nav_add_module), or anchor to an arch doc under .internal/arch/ — an unanchored ADR is not traceable.'
+          ].join('\n')
+        }
+        const arch = loadArch(root)
+        const pressure = repeatPressure(arch, loadPatches(root), args.anchor)
+        const d = {
+          id: nextDecisionId(arch),
+          anchor: normalizePath(String(args.anchor)),
+          anchorKind: chk.kind,
+          reason: args.reason,
+          decision: args.decision,
+          impact: args.impact || '',
+          action: args.action || '',
+          session: sid || '',
+          createdAt: new Date().toISOString()
+        }
+        arch.decisions.push(d)
+        saveArch(root, arch)
+        return [
+          `✓ ${d.id} recorded for anchor ${d.anchor} (${d.anchorKind})`,
+          `  reason:   ${d.reason}`,
+          `  decision: ${d.decision}`,
+          ...(d.impact ? [`  impact:   ${d.impact}`] : []),
+          pressure.count > 0
+            ? `  Patch counter reset: ${pressure.count} patch(es) had accumulated on this anchor — those were local fixes; this is the architecture-level answer.`
+            : '  First decision on this anchor.'
+        ].join('\n')
+      } catch (e) { return err(e) }
+    }
+  })), 'project-nav: adr')
 }
 
 function now_() {
