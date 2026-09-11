@@ -100,3 +100,30 @@ $t = $t -replace 'dsh-external-project-nav-0\.9\.0\.tgz','dsh-external-project-n
 **本手册对应的产物**：`dsh-external-project-nav-0.9.0.tgz`
 SHA256 `9A7FAF772CD2FC44299746B0EEEBE007DB0E8D41D35CA5F01D420FAF57644385`
 （与已装实体逐字节一致 —— 由 `verify-0.9.0-install.ps1` 证明）
+
+---
+
+## 6. 后续版本（0.9.1 起）
+
+`install-0.9.0.ps1` / `verify-0.9.0-install.ps1` 里的产物名与版本判据都是**硬编码 0.9.0** 的，
+拿它们装新版会在自证环节报「实体版本 = 0.9.0，不是…」而假失败。每个版本各带一套同名脚本：
+
+| 版本 | 安装 | 校验（只读） |
+|---|---|---|
+| 0.9.1 | `install-0.9.1.ps1` | `verify-0.9.1-install.ps1` |
+| 0.9.0 | `install-0.9.0.ps1` | `verify-0.9.0-install.ps1` |
+
+流程不变（与 0.9.0 那套完全同形）：
+
+```powershell
+npm pack --cache .npm-cache                                    # 出 tgz
+powershell -NoProfile -ExecutionPolicy Bypass -File install-0.9.1.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File verify-0.9.1-install.ps1   # 独立复验，10 项全绿
+# 重启 dsh-web（只能你手动做）
+```
+
+> ⚠ 两个坑（0.9.1 发布时实测踩到，别再踩）：
+> ① 含非 ASCII 的 `.ps1` **必须存成 UTF-8 with BOM**——PS 5.1 读无 BOM 的会按 GBK 解码，
+> 全角标点会吃掉字符串终结符，报 `Unexpected token '}'`。
+> ② 改脚本里的版本号时，**判据也要一起改**：`($decl -like '*0.9.0*')` 只改文案不改判据 = 永久假失败。
+
