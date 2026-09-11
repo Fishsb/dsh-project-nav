@@ -1,5 +1,13 @@
 # project-nav 项目交接文档
 
+> **⛔ v0.9.0 起本文是历史档，不再是现行文档。**
+> 现行架构契约：[`ARCHITECTURE.md`](./ARCHITECTURE.md)　现行项目主档：[`PROJECT.md`](./PROJECT.md)
+>
+> v0.9.0 是按「一切从架构出发」做的一次性重写：旧的 11 工具 / 5 账本 / begin-done 生命周期**已整体放弃**。
+> 本文记录 v0.8.x 及更早的**事实与事故**——其中仍然有效、必须继续满足的是 F1–F9（见 `ARCHITECTURE.md` §8）；
+> 但文中描述的具体实现（工具名、文件布局、数据结构）**已失效**，阅读时请自行折价。
+
+
 > **创建日期**：2026-09-07  
 > **工作目录**：`D:\FF\project-nav`  
 > **关联工作区**：`D:\FF`（四项目治理文档：`PROJECT.md` + `modules/` + `.internal/nav-index.json`）

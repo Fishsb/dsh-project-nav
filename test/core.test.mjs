@@ -1,429 +1,595 @@
-// test/core.test.mjs — regression tests for the shared core layer.
-// Run with: node --test test/*.test.mjs   (pnpm test)
-// All disk IO happens under a per-test temp dir; never touches a real workspace.
+// test/core.test.mjs — 领域行为基准（新架构口径）
+//
+// 旧套件的 74 项是**行为基准**，不是兼容目标：每一条背后的事故事实都必须在新架构下继续成立，
+// 所以这里按"事实"而非"旧 API"重写。跑法：node --test test/*.test.mjs
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, statSync, readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join, dirname } from 'node:path'
-import {
-  normalizePath, governedWorkspaceOf,
-  createEmptyIndex, saveIndex, loadIndex,
-  createDefaultVector, saveVector, loadVector,
-  createEmptyActions, saveActions, loadActions, nextActionId,
-  createEmptyDocs, saveDocs, loadDocs, nextDocId, suggestDocs,
-  queryIndex, partialSearch,
-  renderTreeText, renderMapHtml, renderProjectDocSection,
-  findStaleFiles, scopeTargetsOfOpenActions, scopeFiles, sessionLabel,
-  parseArchCache, archDocStatus, listArchDocs, archDocsFor, archDocsForScope,
-  renderArchPointer, stampArchDoc
-} from '../shared/index.js'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpRoot, put, touch, seed } from './helper.mjs'
+import { appendEvents, readEvents, verifyLog, logStamp } from '../core/log.js'
+import { buildModel, loadModel, normalizeAnchor, coverage, pressureFor, nodeId } from '../core/model.js'
+import { resolveScope, evidenceOf, diffEvidence, globToRegExp } from '../core/scope.js'
+import { anchorGate, scopeGate, mainlineGate, countGate, decisionGate, runGates } from '../core/gates.js'
+import { commitIntent, reconcile, archiveIntent } from '../core/commit.js'
+import { migrateLegacy, inspectLegacy, legacyToDrafts } from '../core/legacy.js'
+import { governedWorkspaceOf } from '../core/boundary.js'
+import { paths } from '../core/paths.js'
 
-function tmpRoot(t) {
-  const dir = mkdtempSync(join(tmpdir(), 'pn-test-'))
-  t.after(() => rmSync(dir, { recursive: true, force: true }))
-  return dir
-}
+// ============ 事件流（唯一事实源） ============
 
-function seededIndex(root) {
-  // PE-F01 (editor module of project alpha) + orphan feature PE-F02
-  const idx = createEmptyIndex()
-  idx.indexes.featureToFiles['PE-F01'] = ['src/main.js']
-  idx.indexes.fileToFeature['src/main.js'] = ['PE-F01']
-  idx.indexes.featureToFiles['PE-F02'] = [] // registered but attached to no module → orphan
-  idx.indexes.moduleToFeatures['editor'] = ['PE-F01']
-  idx.indexes.projectToModules['alpha'] = ['editor']
-  idx.descriptions['PE-F01'] = { name: 'Editor', userView: 'edit', systemView: 'edit sys' }
-  idx.descriptions['PE-F02'] = { name: 'Orphan' }
-  return idx
-}
-
-test('normalizePath turns backslashes into forward slashes', () => {
-  assert.equal(normalizePath('host\\index.js'), 'host/index.js')
-  assert.equal(normalizePath('a/b/c'), 'a/b/c')
-})
-
-test('governedWorkspaceOf is opt-in per workspace and never governs the rest of the root', () => {
-  const idx = createEmptyIndex()
-  idx.projectPaths = { 'PN-P01': 'project-nav', alpha: 'deepseek/alpha' }
-  const root = 'D:\\FF'
-
-  // OPT-IN: an empty allow-list governs NOTHING, whatever the cwd is. The native mode has
-  // exactly one writable root, so a session whose work reaches into ~/.dsh would be stopped
-  // rather than protected — the caller must name the workspaces that are self-contained.
-  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FF\\project-nav'), '')
-  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FF', []), '')
-
-  // allow by directory name / by project key / by relative path — all three spellings work
-  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:\\FF\\project-nav\\host', ['project-nav'])), 'D:/FF/project-nav')
-  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:/FF/project-nav', ['PN-P01'])), 'D:/FF/project-nav')
-  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:/FF/deepseek/alpha', ['deepseek/alpha'])), 'D:/FF/deepseek/alpha')
-  assert.equal(normalizePath(governedWorkspaceOf(idx, root, 'D:\\FF\\project-nav', 'project-nav')), 'D:/FF/project-nav')
-
-  // allowed project but a cwd in a DIFFERENT workspace → untouched (each workspace is its own grant)
-  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FF\\deepseek\\alpha', ['project-nav']), '')
-  // a directory inside the root that is not a registered project → untouched
-  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FF\\scratch', ['project-nav', 'scratch']), '')
-  // outside the root entirely → untouched
-  assert.equal(governedWorkspaceOf(idx, root, 'C:\\Users\\lk\\elsewhere', ['project-nav']), '')
-  // a sibling whose name merely starts with the root's must not read as containment
-  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FFx', ['project-nav']), '')
-  // the root itself is NEVER governed: a root-wide boundary would let a session write into
-  // every project, which is the drift this exists to prevent.
-  assert.equal(governedWorkspaceOf(idx, root, 'D:\\FF', ['project-nav', 'FF', 'D:/FF']), '')
-  // an index with no project table has nothing to allow
-  assert.equal(governedWorkspaceOf(createEmptyIndex(), root, 'D:\\FF\\project-nav', ['project-nav']), '')
-  // missing inputs never throw — the caller relies on this being total
-  assert.equal(governedWorkspaceOf(null, root, 'D:\\FF', ['project-nav']), '')
-  assert.equal(governedWorkspaceOf(idx, root, '', ['project-nav']), '')
-})
-
-test('index/vector/actions/docs round-trip through atomic JSON in a temp root', (t) => {
+test('事件流 seq 从 1 开始、严格连续、append-only', async (t) => {
   const root = tmpRoot(t)
-  saveIndex(root, createEmptyIndex())
-  assert.ok(existsSync(join(root, '.internal', 'nav-index.json')))
-  assert.equal(loadIndex(root).metadata.coverage, 'empty')
-
-  saveVector(root, createDefaultVector())
-  const v = loadVector(root)
-  assert.equal(v.doing, '')
-  assert.equal(v.next, '')
-  assert.equal(v.notDoing, '')
-  assert.equal(v.exitCondition, '')
-  assert.equal(typeof v.updatedAt, 'string') // saveVector stamps updatedAt
-
-  saveActions(root, createEmptyActions())
-  assert.deepEqual(loadActions(root).actions, [])
-
-  saveDocs(root, createEmptyDocs())
-  assert.deepEqual(loadDocs(root).docs, [])
+  await appendEvents(root, [{ kind: 'set', vector: { doing: 'a' } }])
+  await appendEvents(root, [{ kind: 'set', vector: { doing: 'b' } }, { kind: 'set', vector: { doing: 'c' } }])
+  const { events } = readEvents(root)
+  assert.deepEqual(events.map((e) => e.seq), [1, 2, 3])
+  assert.deepEqual(events.map((e) => e.vector.doing), ['a', 'b', 'c'])
+  assert.ok(verifyLog(root).ok)
 })
 
-test('metadata recompute derives totals instead of hardcoding', (t) => {
+test('事件流只追加：旧行永不改写，历史每次调用都在', async (t) => {
   const root = tmpRoot(t)
-  saveIndex(root, seededIndex(root))
-  const m = loadIndex(root).metadata
-  assert.equal(m.totalFeatures, 2)
-  assert.equal(m.totalFiles, 1)
-  assert.equal(m.totalModules, 1)
-  assert.equal(m.totalProjects, 1)
-  assert.equal(m.coverage, 'partial')
+  await appendEvents(root, [{ kind: 'set', vector: { doing: 'first' } }])
+  const after1 = readFileSync(paths.events(root), 'utf-8')
+  await appendEvents(root, [{ kind: 'set', vector: { doing: 'second' } }])
+  const after2 = readFileSync(paths.events(root), 'utf-8')
+  assert.ok(after2.startsWith(after1), '第二次追加必须保留第一次的全部字节')
 })
 
-test('queryIndex resolves feature codes and file paths in both directions', (t) => {
+test('坏行不被静默丢弃：计入 corrupt 而不是消失', async (t) => {
   const root = tmpRoot(t)
-  saveIndex(root, seededIndex(root))
-  const byFeature = queryIndex(loadIndex(root), 'PE-F01')
-  assert.equal(byFeature.type, 'feature')
-  assert.deepEqual(byFeature.files, ['src/main.js'])
-  assert.deepEqual(byFeature.modules, ['editor'])
-  assert.deepEqual(byFeature.projects, ['alpha'])
-  const byFile = queryIndex(loadIndex(root), 'src/main.js')
-  assert.equal(byFile.type, 'file')
-  assert.deepEqual(byFile.features, ['PE-F01'])
+  await appendEvents(root, [{ kind: 'set', vector: { doing: 'ok' } }])
+  const file = paths.events(root)
+  writeFileSync(file, `${readFileSync(file, 'utf-8')}{ this is not json\n`, 'utf-8')
+  const { events, corrupt } = readEvents(root)
+  assert.equal(events.length, 1)
+  assert.equal(corrupt.length, 1)
+  const check = verifyLog(root)
+  assert.equal(check.ok, false)
+  assert.match(check.problems[0], /corrupt line/)
 })
 
-test('partialSearch offers loose suggestions on near-miss targets', (t) => {
+test('并发追加：seq 不重复、不丢事件（F1 的根治：追加不需要读改写）', async (t) => {
   const root = tmpRoot(t)
-  saveIndex(root, seededIndex(root))
-  // 'EDIT' is a case-insensitive substring of index key 'editor'
-  assert.ok(partialSearch(loadIndex(root), 'EDIT').includes('editor'))
+  const writers = 8
+  await Promise.all(Array.from({ length: writers }, (_, i) => appendEvents(root, [{ kind: 'set', vector: { doing: `w${i}` } }])))
+  const { events } = readEvents(root)
+  assert.equal(events.length, writers)
+  assert.deepEqual(events.map((e) => e.seq), Array.from({ length: writers }, (_, i) => i + 1))
+  assert.equal(new Set(events.map((e) => e.vector.doing)).size, writers)
 })
 
-test('nextActionId / nextDocId increment past existing entries', () => {
-  const ledger = createEmptyActions()
-  ledger.actions.push({ id: 'ACT-001' }, { id: 'ACT-009' })
-  assert.equal(nextActionId(ledger), 'ACT-010')
-  const reg = createEmptyDocs()
-  reg.docs.push({ id: 'DOC-003' })
-  assert.equal(nextDocId(reg), 'DOC-004')
-})
-
-test('suggestDocs scores by project match and when-keywords', () => {
-  const reg = createEmptyDocs()
-  reg.docs.push(
-    { id: 'DOC-001', title: 'plugin guide', path: '/x', when: '插件开发, 工具注册', tags: ['gov'], project: 'PN-P01' },
-    { id: 'DOC-002', title: 'other', path: '/y', when: '音频', tags: [], project: '' }
+test('F9 写回校验：追加成功但内容对不上 → 抛错，绝不静默', async (t) => {
+  const root = tmpRoot(t)
+  const file = paths.events(root)
+  await appendEvents(root, [{ kind: 'set', vector: { doing: 'a' } }])
+  // 模拟"另一个写手把文件截断/换掉"：先让前缀校验失败
+  writeFileSync(file, `${JSON.stringify({ seq: 99, kind: 'set', at: 'x', vector: { doing: 'intruder' } })}\n`, 'utf-8')
+  await assert.rejects(
+    () => appendEvents(root, [{ kind: 'set', vector: { doing: 'b' } }]),
+    /(write-back check|integrity) FAILED/
   )
-  const hits = suggestDocs(reg, { taskText: '把插件打包发布到 github', projects: ['PN-P01'], modules: [] })
-  assert.deepEqual(hits.map(d => d.id), ['DOC-001'])
 })
 
-test('scopeTargetsOfOpenActions collects only open action scopes', () => {
-  const ledger = createEmptyActions()
-  ledger.actions.push(
-    { id: 'ACT-001', status: 'planned', task: 'a', scope: { features: ['PE-F01'], modules: [], files: [] } },
-    { id: 'ACT-002', status: 'done', task: 'b', scope: { features: ['PE-F99'], modules: [], files: [] } }
-  )
-  const s = scopeTargetsOfOpenActions(ledger)
-  assert.ok(s.feats.has('PE-F01'))
-  assert.ok(!s.feats.has('PE-F99'))
-  assert.equal(s.ids.length, 1)
-})
+// ============ 折叠与模型（I1） ============
 
-test('findStaleFiles flags only files missing on disk', (t) => {
+test('折叠是纯函数：同事件序列必得同模型', async (t) => {
   const root = tmpRoot(t)
-  writeFileSync(join(root, 'real.txt'), 'x')
-  const idx = seededIndex(root)
-  idx.indexes.featureToFiles['PE-F01'] = ['real.txt', 'ghost.txt']
-  idx.indexes.fileToFeature['real.txt'] = ['PE-F01']
-  idx.indexes.fileToFeature['ghost.txt'] = ['PE-F01']
-  const stale = findStaleFiles(idx, root)
-  assert.deepEqual(stale, ['ghost.txt [alpha]'])
-})
-
-test('findStaleFiles probes orphan-feature files too (no module must not mean no check)', (t) => {
-  const root = tmpRoot(t)
-  writeFileSync(join(root, 'real.txt'), 'x')
-  const idx = seededIndex(root)
-  idx.indexes.featureToFiles['PE-F01'] = ['real.txt']
-  idx.indexes.fileToFeature = { 'real.txt': ['PE-F01'] }
-  idx.indexes.featureToFiles['PE-F02'] = ['ghost-orphan.txt']   // PE-F02 belongs to no module
-  assert.deepEqual(findStaleFiles(idx, root), ['ghost-orphan.txt [orphan feature PE-F02]'])
-})
-
-test('findStaleFiles reports a shared missing file once, not once per owner', (t) => {
-  const root = tmpRoot(t)
-  const idx = seededIndex(root)
-  idx.indexes.moduleToFeatures['editor'] = ['PE-F01', 'PE-F02']
-  idx.indexes.featureToFiles['PE-F01'] = ['shared-ghost.txt']
-  idx.indexes.featureToFiles['PE-F02'] = ['shared-ghost.txt']
-  idx.indexes.fileToFeature = { 'shared-ghost.txt': ['PE-F01', 'PE-F02'] }
-  assert.deepEqual(findStaleFiles(idx, root), ['shared-ghost.txt [alpha]'])
-})
-
-test('scopeFiles: project-prefixed index keys survive; bare project/module names are not files', (t) => {
-  const root = tmpRoot(t)
-  const idx = seededIndex(root)
-  idx.projectPaths = { alpha: 'alpha-dir' }
-  idx.indexes.featureToFiles['PE-F01'] = ['alpha-dir/src/main.js']   // workspace-relative index key
+  await seed(root)
+  const a = buildModel(root)
+  const b = buildModel(root)
   assert.deepEqual(
-    scopeFiles(idx, { features: ['PE-F01'] }, root),
-    ['alpha-dir/src/main.js'],
-    'an indexed file that starts with the project directory is a FILE, not a project name'
+    [...a.nodes.values()].map((n) => [n.id, n.name, n.status, n.files]),
+    [...b.nodes.values()].map((n) => [n.id, n.name, n.status, n.files])
   )
-  for (const name of ['alpha', 'editor', 'alpha-dir', 'ALPHA']) {
-    assert.deepEqual(scopeFiles(idx, { files: [name] }, root), [], `"${name}" is a scope node, not a file`)
-  }
-  assert.deepEqual(scopeFiles(idx, { files: ['alpha-dir/src/other.js'] }, root), ['alpha-dir/src/other.js'])
+  assert.deepEqual(a.vector, b.vector)
 })
 
-test('renderTreeText shows project tree and orphan features', (t) => {
+test('node upsert：创建 / 字段替换 / 落点整体替换', async (t) => {
   const root = tmpRoot(t)
-  saveIndex(root, seededIndex(root))
-  const tree = renderTreeText(loadIndex(root), {})
-  assert.ok(tree.includes('▼ alpha'))
-  assert.ok(tree.includes('PE-F01'))
-  assert.ok(tree.includes('PE-F02')) // orphan feature section
+  await appendEvents(root, [{ kind: 'node', op: 'upsert', layer: 'feature', id: 'F1', fields: { name: 'F1', files: ['a.js', 'b.js'] } }])
+  let m = buildModel(root)
+  assert.deepEqual(m.nodes.get('feature:f1').files, ['a.js', 'b.js'])
+  await appendEvents(root, [{ kind: 'node', op: 'upsert', layer: 'feature', id: 'F1', fields: { files: ['c.js'] } }])
+  m = buildModel(root)
+  assert.deepEqual(m.nodes.get('feature:f1').files, ['c.js'], 'files 是整体替换语义（旧行为契约）')
+  assert.equal(m.nodes.get('feature:f1').name, 'F1', '未提供的字段不丢')
 })
 
-test('renderProjectDocSection emits nav:auto markers and derived bullets', (t) => {
+test('node retired 级联：feature 退役摘除模块成员关系', async (t) => {
   const root = tmpRoot(t)
-  saveIndex(root, seededIndex(root))
-  const sec = renderProjectDocSection(loadIndex(root), { vector: { doing: 'x', next: '', notDoing: '', exitCondition: '' } })
-  assert.ok(sec.includes('<!-- nav:auto:start -->'))
-  assert.ok(sec.includes('<!-- nav:auto:end -->'))
-  assert.ok(sec.includes('### alpha'))
-  assert.ok(sec.includes('**PE-F01**'))
-  assert.ok(sec.includes('Doing**'))
+  await seed(root)
+  await appendEvents(root, [{ kind: 'node', op: 'retire', layer: 'feature', id: 'PN-F01' }])
+  const m = buildModel(root)
+  assert.equal(m.nodes.get('feature:pn-f01').status, 'retired')
+  assert.deepEqual(m.nodes.get('module:core').features, [], '退役功能必须离开模块成员表')
+  assert.equal(m.fileOwners.size, 0, '退役后落点映射消失')
 })
 
-test('renderMapHtml is a self-contained HTML document', (t) => {
+test('node retired 级联：module 退役后其功能存活但失去模块', async (t) => {
   const root = tmpRoot(t)
-  saveIndex(root, seededIndex(root))
-  const html = renderMapHtml(loadIndex(root), {})
-  assert.ok(html.includes('<!DOCTYPE html>'))
-  assert.ok(html.includes('alpha'))
-  assert.ok(html.includes('PE-F01'))
+  await seed(root)
+  await appendEvents(root, [{ kind: 'node', op: 'retire', layer: 'module', id: 'core' }])
+  const m = buildModel(root)
+  assert.equal(m.nodes.get('module:core').status, 'retired')
+  assert.equal(m.nodes.get('feature:pn-f01').status, 'active', '功能不能随模块一起死')
 })
 
-test('sessionLabel carries the DISTINCTIVE part of a session id', () => {
-  assert.equal(sessionLabel('session-5634c6bb-93f1-4994-9c26-7f124dedee72'), '5634c6bb')
-  assert.notEqual(sessionLabel('session-aaaaaaaa-1'), sessionLabel('session-bbbbbbbb-2'))
-  assert.equal(sessionLabel(''), 'unknown')
-  assert.equal(sessionLabel('short'), 'short')
-})
-
-test('the index carries no dead tables, and metadata is stamped on every write', (t) => {
-  const idx = createEmptyIndex()
-  assert.deepEqual(Object.keys(idx.indexes), ['fileToFeature', 'featureToFiles', 'moduleToFeatures', 'projectToModules'])
-  assert.equal(idx.functionToModule, undefined, 'legacy table nobody reads')
-  assert.equal(idx.unmappedFiles, undefined, 'dead field (drift is probed live)')
-  assert.equal(idx.staleEntries, undefined, 'dead field (drift is probed live)')
+test('退役让假 STALE 归零（F3/F8：索引能删才不会永远报漂移）', async (t) => {
   const root = tmpRoot(t)
-  saveIndex(root, seededIndex(root))
-  const m = loadIndex(root).metadata
-  assert.equal(typeof m.generated, 'string')
-  assert.ok(Math.abs(Date.now() - Date.parse(m.generated)) < 60000, 'generated must be restamped by the write, not inherited')
+  await seed(root, { files: ['src/gone.js'] })
+  rmSync(join(root, 'src/gone.js'))
+  let m = buildModel(root)
+  assert.equal(m.stale.length, 1, '文件消失 → 先报 STALE')
+  await appendEvents(root, [{ kind: 'node', op: 'retire', layer: 'feature', id: 'PN-F01' }])
+  m = buildModel(root)
+  assert.equal(m.stale.length, 0, '退役后不再有假警报')
 })
 
-test('generated docs never point at removed tools', (t) => {
+test('set 事件：向量按最后一次为准，并带时间戳', async (t) => {
   const root = tmpRoot(t)
-  saveIndex(root, seededIndex(root))
-  const sec = renderProjectDocSection(loadIndex(root), {})
-  assert.doesNotMatch(sec, /nav_add_feature|nav_add_module|nav_add_doc/, sec)
-  assert.match(sec, /nav_update/, 'the routing must name the tool that actually exists')
-  const html = renderMapHtml(loadIndex(root), {})   // PE-F02 has no files → the gap hint renders
-  assert.doesNotMatch(html, /--field/, html)
+  await appendEvents(root, [{ kind: 'set', vector: { doing: 'x' } }])
+  await appendEvents(root, [{ kind: 'set', vector: { doing: 'y', notDoing: 'z' } }])
+  const m = buildModel(root)
+  assert.equal(m.vector.doing, 'y')
+  assert.equal(m.vector.notDoing, 'z')
+  assert.ok(m.vector.updatedAt)
 })
 
-test('renderMapHtml honours target, and reports an empty match honestly', (t) => {
+test('decide 的 id 由 seq 派生（并发下不可能撞 id）', async (t) => {
   const root = tmpRoot(t)
-  saveIndex(root, seededIndex(root))
-  const hit = renderMapHtml(loadIndex(root), { target: 'editor' })
-  assert.match(hit, /PE-F01/)
-  const miss = renderMapHtml(loadIndex(root), { target: 'no-such-thing' })
-  assert.match(miss, /No project or module matching this target/, 'an empty narrowing must say so')
+  await seed(root)
+  await appendEvents(root, [{ kind: 'decide', anchor: 'PN-F01', reason: 'r1', decision: 'd1' }])
+  await appendEvents(root, [{ kind: 'decide', anchor: 'PN-F01', reason: 'r2', decision: 'd2' }])
+  const m = buildModel(root)
+  const ids = m.decisions.map((d) => d.id)
+  assert.equal(new Set(ids).size, 2)
+  assert.deepEqual(ids, ['ADR-5', 'ADR-6'])
 })
 
-// ---- architecture docs layer (v0.8.0, ADR-011) ----
-// 架构档 = .internal/arch/*.md + 头部 arch-cache 指纹块。这层的契约只有两条：新鲜度可机检、
-// 覆盖可机检——两者都是「让 agent 在动手前被引导读档、动手后被提示档过期」的前提。
+test('未知锚点的决策被明确记录为模型问题，而不是静默忽略', async (t) => {
+  const root = tmpRoot(t)
+  await appendEvents(root, [{ kind: 'decide', anchor: 'NOPE', reason: 'r', decision: 'd' }])
+  const m = buildModel(root)
+  assert.equal(m.decisions.length, 1)
+  assert.equal(m.decisions[0].anchorKey, 'nope')
+})
 
-/** Write an arch doc whose header stamps the CURRENT disk state of `files`. */
-function writeArchDoc(root, rel, { project = 'alpha', scope = 'overview', files = [] } = {}) {
-  const abs = join(root, rel)
-  mkdirSync(dirname(abs), { recursive: true })
-  const rows = files.map(f => {
-    const st = statSync(join(root, f))
-    return `  - path: ${f}\n    mtime: ${new Date(st.mtimeMs).toISOString()}\n    size: ${st.size}`
+// ============ scope 解析（F4） ============
+
+test('scope 解析三来源等权合并：索引键 ∪ 字面量 ∪ glob', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root, { files: ['src/a.js'] })
+  put(root, 'docs/readme.md')
+  put(root, 'lib/b.js')
+  const m = buildModel(root)
+  const r = resolveScope(root, m, { features: ['PN-F01'], files: ['docs/readme.md', 'lib/*.js'] })
+  assert.deepEqual(r.files, ['docs/readme.md', 'lib/b.js', 'src/a.js'])
+  assert.deepEqual(r.fromIndex, ['src/a.js'])
+  assert.deepEqual(r.fromLiteral, ['docs/readme.md'])
+  assert.deepEqual(r.fromGlob, ['lib/b.js'])
+})
+
+test('scope 不丢 root 相对键（F4：曾导致 12/18 功能指纹恒空）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root, { files: ['deepseek/app/src/host/index.js'] })
+  const m = buildModel(root)
+  const r = resolveScope(root, m, { modules: ['core'] })
+  assert.deepEqual(r.files, ['deepseek/app/src/host/index.js'], '模块解析必须穿透到功能的落点，不许为空')
+})
+
+test('scope 解析失败是显式的：missing / unresolved 不会被吞', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  const m = buildModel(root)
+  const r = resolveScope(root, m, { features: ['NOPE'], files: ['nowhere.js', 'nope/*.js', '../outside.js'] })
+  assert.deepEqual(r.files, ['nowhere.js'], '不存在的字面量仍登记（它会以 appeared 被收口），但必须报 missing')
+  assert.ok(r.unresolved.some((u) => u.includes('NOPE')))
+  assert.ok(r.missing.some((u) => u.includes('nowhere.js')), '不存在的字面量必须显式报出')
+  assert.ok(r.missing.some((u) => u.includes('nope/*.js')), 'glob 匹配为空必须显式报出')
+  assert.ok(r.missing.some((u) => u.includes('outside')), '越界路径必须显式报出，绝不静默纳入 scope')
+})
+
+test('证据比对分四类：modified / vanished / appeared / unchanged', () => {
+  const before = { 'a.js': { exists: true, size: 1, sha1: 'x' }, 'gone.js': { exists: true, size: 1, sha1: 'g' }, 'same.js': { exists: true, size: 2, sha1: 's' } }
+  const after = { 'a.js': { exists: true, size: 9, sha1: 'y' }, 'same.js': { exists: true, size: 2, sha1: 's' }, 'new.js': { exists: true, size: 1, sha1: 'n' } }
+  const d = diffEvidence(before, after)
+  assert.deepEqual(d.modified, ['a.js'])
+  assert.deepEqual(d.vanished, ['gone.js'])
+  assert.deepEqual(d.appeared, ['new.js'])
+  assert.deepEqual(d.unchanged, ['same.js'])
+  assert.equal(d.changed, true)
+})
+
+test('同样的证据 → changed=false（收口不能靠"我改了"的自述）', () => {
+  const e = { 'a.js': { exists: true, size: 1, sha1: 'x' } }
+  assert.equal(diffEvidence(e, e).changed, false)
+})
+
+test('glob → 正则支持 ** 与 *', () => {
+  assert.ok(globToRegExp('src/**/*.js').test('src/a/b/c.js'))
+  assert.ok(globToRegExp('src/*.js').test('src/a.js'))
+  assert.equal(globToRegExp('src/*.js').test('src/a/b.js'), false)
+  assert.ok(globToRegExp('**/*.md').test('a.md'))
+})
+
+test('不在磁盘上的落点记 exists:false，不算 vanished（也不清空 scope）', async (t) => {
+  const root = tmpRoot(t)
+  put(root, 'a.js')
+  const e1 = evidenceOf(root, ['a.js', 'ghost.js'])
+  assert.equal(e1['a.js'].exists, true)
+  assert.equal(e1['ghost.js'].exists, false)
+  const e2 = evidenceOf(root, ['a.js', 'ghost.js'])
+  assert.equal(diffEvidence(e1, e2).changed, false, '本来就不存在的文件不该每次都被报成漂移')
+})
+
+// ============ 六闸 ============
+
+test('闸门1 锚点闸：缺锚点 / 假锚点 → 拒；真节点 → 过', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  const m = buildModel(root)
+  assert.equal(anchorGate(m, '').severity, 'reject')
+  assert.equal(anchorGate(m, 'NOPE').severity, 'reject')
+  assert.equal(anchorGate(m, 'PN-F01').pass, true)
+  assert.equal(anchorGate(m, 'core').pass, true)
+  assert.equal(anchorGate(m, '.internal/arch/x.md').pass, true, '架构档是合法锚点')
+})
+
+test('闸门1 锚点闸：已退役节点不能当锚点', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  await appendEvents(root, [{ kind: 'node', op: 'retire', layer: 'feature', id: 'PN-F01' }])
+  const m = buildModel(root)
+  assert.equal(anchorGate(m, 'PN-F01').severity, 'reject')
+})
+
+test('闸门3 主线闸：低于主线告警，未设 doing 也告警', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  let m = buildModel(root)
+  assert.equal(mainlineGate(m, { scope: { modules: [] }, materialized: { files: ['src/a.js'] } }).pass, true)
+  await appendEvents(root, [{ kind: 'set', vector: { doing: 'other', next: '' } }])
+  m = buildModel(root)
+  const r = mainlineGate(m, { scope: { modules: [] }, materialized: { files: ['src/a.js'] } })
+  assert.equal(r.severity, 'warn')
+  assert.match(r.detail, /core/)
+})
+
+test('闸门4 计数闸：第 3 次补丁拒，第 2 次告警；决策重置', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  for (let i = 0; i < 2; i++) await appendEvents(root, [{ kind: 'commit', phase: 'closed', anchor: 'PN-F01', task: `p${i}`, scope: { files: [] } }])
+  let m = buildModel(root)
+  assert.equal(countGate(m, 'PN-F01').severity, 'warn')
+  await appendEvents(root, [{ kind: 'commit', phase: 'closed', anchor: 'PN-F01', task: 'p2', scope: { files: [] } }])
+  m = buildModel(root)
+  const blocked = countGate(m, 'PN-F01')
+  assert.equal(blocked.severity, 'reject')
+  assert.match(blocked.detail, /3 次补丁/)
+  // 决策重置计数闸
+  await appendEvents(root, [{ kind: 'decide', anchor: 'PN-F01', reason: 'r', decision: 'd' }])
+  m = buildModel(root)
+  assert.equal(countGate(m, 'PN-F01').pass, true, '决策登记必须重置该锚点补丁计数')
+  assert.equal(pressureFor(m, 'PN-F01').sinceDecisionCount, 0)
+})
+
+test('计数闸按**归一键**统计：功能码与节点 id 是同一个锚点（否则恒 0 且静默）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  await appendEvents(root, [{ kind: 'commit', phase: 'closed', anchor: 'PN-F01', task: 'a', scope: { files: [] } }])
+  await appendEvents(root, [{ kind: 'commit', phase: 'closed', anchor: 'feature:pn-f01', task: 'b', scope: { files: [] } }])
+  const m = buildModel(root)
+  assert.equal(pressureFor(m, 'PN-F01').sinceDecisionCount, 2)
+  assert.equal(pressureFor(m, 'feature:pn-f01').sinceDecisionCount, 2)
+})
+
+test('闸门2 范围闸：撞 notDoing → 拒；与在途 scope 重叠 → 告警', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  const m = buildModel(root)
+  const collide = scopeGate(m, { scope: { files: ['forbidden-thing.js'] }, materialized: { files: ['forbidden-thing.js'] } })
+  assert.equal(collide.severity, 'reject')
+  const overlap = scopeGate({ ...m, openCommits: [{ seq: 1, id: 'ACT-1', task: 'other', files: ['src/a.js'] }] },
+    { scope: { features: ['PN-F01'] }, materialized: { files: ['src/a.js'] } })
+  assert.equal(overlap.severity, 'warn')
+  assert.match(overlap.detail, /ACT-1/)
+})
+
+test('闸门5 决策闸：arch= 缺失只告警（不阻断工程），填写即过', () => {
+  assert.equal(decisionGate({}).severity, 'warn')
+  assert.equal(decisionGate({ arch: '架构不变，纯局部修复' }).pass, true)
+})
+
+test('runGates 汇总：blocked 与 warnings 分离', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  const m = buildModel(root)
+  const r = runGates(m, { anchor: 'NOPE', scope: {}, materialized: { files: ['src/a.js'] } })
+  assert.ok(r.blocked.length >= 1)
+  assert.ok(r.results.length === 6, '六闸一个不少')
+})
+
+// ============ 写入：意图登记与自动收口（A1） ============
+
+test('nav_commit 登记意图并落证据快照', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  const res = await commitIntent(root, {
+    task: '改 a.js', anchor: 'PN-F01', arch: '架构不变',
+    scope: { features: ['PN-F01'] }
   })
-  const header = [
-    '<!-- arch-cache',
-    `generated: ${new Date().toISOString()}`,
-    `project: ${project}`,
-    `scope: ${scope}`,
-    'files:',
-    ...rows,
-    '-->'
-  ].join('\n')
-  writeFileSync(abs, `${header}\n\n# ${scope}\n\nbody\n`)
-  return abs
+  assert.equal(res.status, 'ok')
+  assert.equal(res.commit.id, 'ACT-5')
+  const m = buildModel(root)
+  assert.equal(m.openCommits.length, 1)
+  assert.ok(m.openCommits[0].evidence['src/a.js'].sha1, '证据必须先落，收口才有判据')
+})
+
+test('A1 收口不依赖会话：证据一变，下一次任意调用自动收口', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  await commitIntent(root, { task: 't', anchor: 'PN-F01', arch: 'ok', scope: { features: ['PN-F01'] } })
+  let m = buildModel(root)
+  assert.equal(m.openCommits.length, 1)
+  assert.equal((await reconcile(root)).closed.length, 0, '证据没变 → 继续在途（不是孤儿，也不该被收掉）')
+  touch(root, 'src/a.js', 'changed-content')
+  const rec = await reconcile(root)
+  assert.equal(rec.closed.length, 1)
+  m = buildModel(root)
+  assert.equal(m.openCommits.length, 0, '证据已变 → 自动收口')
+  assert.equal(m.commits.find((c) => c.seq === 5).phase, 'closed')
+  assert.deepEqual(m.commits.find((c) => c.seq === 5).outcome.modified, ['src/a.js'])
+})
+
+test('收口事件记录三类变化（改 / 消失 / 新增）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root, { files: ['src/a.js', 'src/b.js'] })
+  // scope 用 glob 声明：这样"新落在 scope 内"的文件才算 appeared（语义边界要测准）
+  await commitIntent(root, { task: 't', anchor: 'PN-F01', arch: 'ok', scope: { files: ['src/*.js'] } })
+  touch(root, 'src/a.js', 'x2')
+  rmSync(join(root, 'src/b.js'))
+  put(root, 'src/c.js')
+  const rec = await reconcile(root)
+  assert.equal(rec.closed.length, 1)
+  const out = rec.closed[0].diff
+  assert.deepEqual(out.modified, ['src/a.js'])
+  assert.deepEqual(out.vanished, ['src/b.js'])
+  assert.deepEqual(out.appeared, ['src/c.js'])
+})
+
+test('在途意图按当前索引重解析：登记后新加进功能的文件会被收口', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root, { files: ['src/a.js'] })
+  await commitIntent(root, { task: 't', anchor: 'PN-F01', arch: 'ok', scope: { features: ['PN-F01'] } })
+  // 把一个新文件登记进同一功能（索引变了）→ 该文件进入在途 scope
+  put(root, 'src/added.js')
+  await appendEvents(root, [{ kind: 'node', op: 'upsert', layer: 'feature', id: 'PN-F01', fields: { files: ['src/a.js', 'src/added.js'] } }])
+  const rec = await reconcile(root)
+  assert.equal(rec.closed.length, 1)
+  assert.deepEqual(rec.closed[0].diff.appeared, ['src/added.js'])
+})
+
+test('空 scope 被拒：解析出 0 个文件 = 没有收口判据', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  const res = await commitIntent(root, { task: 't', anchor: 'PN-F01', arch: 'ok', scope: { files: ['assets/*.png'] } })
+  assert.equal(res.status, 'rejected')
+  assert.match(res.reason, /0 个文件/)
+})
+
+test('字面量文件尚不存在也允许登记（新文件会以 appeared 被收口）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  const res = await commitIntent(root, { task: 't', anchor: 'PN-F01', arch: 'ok', scope: { files: ['src/brand-new.js'] } })
+  assert.equal(res.status, 'ok')
+  assert.deepEqual(res.materialized.files, ['src/brand-new.js'])
+  put(root, 'src/brand-new.js')
+  const rec = await reconcile(root)
+  assert.deepEqual(rec.closed[0].diff.appeared, ['src/brand-new.js'])
+})
+
+test('闸门拒绝时**不写任何事件**（拒就是拒）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  const before = readEvents(root).events.length
+  const res = await commitIntent(root, { task: 't', anchor: 'NOPE', arch: 'ok', scope: { features: ['PN-F01'] } })
+  assert.equal(res.status, 'blocked')
+  assert.equal(readEvents(root).events.length, before, '被拒的意图不得留下半条记录')
+})
+
+test('archive 是唯一绕过证据的收口出口，且只对在途意图生效', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  const r1 = await commitIntent(root, { task: 't', anchor: 'PN-F01', arch: 'ok', scope: { files: ['src/a.js'] } })
+  assert.equal(r1.status, 'ok')
+  const a = await archiveIntent(root, r1.commit.id, '方向已废')
+  assert.equal(a.status, 'ok')
+  assert.equal(buildModel(root).openCommits.length, 0)
+  const again = await archiveIntent(root, r1.commit.id, '再来一次')
+  assert.equal(again.status, 'no-action', '已收口的不能再归档')
+})
+
+test('开新意图会先按证据收上一笔（完结闸 = 自动对账）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  await commitIntent(root, { task: '第一笔', anchor: 'PN-F01', arch: 'ok', scope: { files: ['src/a.js'] } })
+  touch(root, 'src/a.js', 'v2')
+  const res = await commitIntent(root, { task: '第二笔', anchor: 'PN-F01', arch: 'ok', scope: { files: ['src/a.js'] } })
+  assert.equal(res.reconcile.closed.length, 1, '开新笔时自动收上一笔')
+  assert.equal(buildModel(root).openCommits.length, 1)
+  assert.equal(buildModel(root).openCommits[0].task, '第二笔')
+})
+
+// ============ 迁移（一次性） ============
+
+test('迁移·真实索引形状：projects/modules/features 三表为空时，以 projectPaths/projectToModules/moduleToFeatures/descriptions 为准', async (t) => {
+  const root = tmpRoot(t)
+  mkdirSync(join(root, '.internal'), { recursive: true })
+  // 这是生产索引的真实形态（实测 D:\FF\.internal\nav-index.json）：三张"正表"是空的
+  writeFileSync(join(root, '.internal', 'nav-index.json'), JSON.stringify({
+    projectPaths: { alpha: 'deepseek/alpha' },
+    projects: {}, modules: {}, features: {},
+    descriptions: { 'A-F01': { name: '编辑', userView: '用户视角', systemView: '系统视角' } },
+    indexes: {
+      projectToModules: { alpha: ['editor'] },
+      moduleToFeatures: { editor: ['A-F01'] },
+      featureToFiles: { 'A-F01': ['src/e.js'] },
+      fileToFeature: { 'src/e.js': ['A-F01'] }
+    }
+  }), 'utf-8')
+  const { drafts } = legacyToDrafts(root)
+  const mods = drafts.filter((d) => d.layer === 'module')
+  const feats = drafts.filter((d) => d.layer === 'feature')
+  assert.equal(mods.length, 1, '模块必须从 moduleToFeatures/projectToModules 推出（只读三表会一个模块都没有）')
+  assert.deepEqual(mods[0].fields.features, ['A-F01'], '模块→功能的挂载关系必须保留')
+  assert.equal(mods[0].fields.project, 'alpha', '模块归属必须从 projectToModules 反查')
+  assert.equal(feats.length, 1)
+  assert.equal(feats[0].fields.module, 'editor', '功能必须挂在模块上，否则地图被拆散')
+  assert.equal(feats[0].fields.name, '编辑', '描述必须从 descriptions 取（不在 features 表里）')
+  assert.equal(feats[0].fields.userView, '用户视角')
+})
+
+test('迁移·落点口径对齐：项目相对路径补项目前缀，已是 root 相对的不动', async (t) => {
+  const root = tmpRoot(t)
+  mkdirSync(join(root, '.internal'), { recursive: true })
+  // 磁盘：项目相对的文件确实位于项目目录下；root 相对的确实位于根下
+  put(root, 'deepseek/alpha/src/rel.js')
+  put(root, 'deepseek/alpha/src/abs.js')
+  put(root, 'src/at-root.js')
+  writeFileSync(join(root, '.internal', 'nav-index.json'), JSON.stringify({
+    projectPaths: { alpha: 'deepseek/alpha' },
+    projects: {}, modules: {}, features: {},
+    indexes: {
+      projectToModules: { alpha: ['editor'] },
+      moduleToFeatures: { editor: ['A-F01'] },
+      // 一个功能里混着两种口径：rel.js 是项目相对，abs.js 是 root 相对
+      featureToFiles: { 'A-F01': ['src/rel.js', 'deepseek/alpha/src/abs.js'] },
+      fileToFeature: {}
+    }
+  }), 'utf-8')
+  const { drafts, warnings } = legacyToDrafts(root)
+  const f = drafts.find((d) => d.layer === 'feature')
+  assert.deepEqual(f.fields.files, ['deepseek/alpha/src/abs.js', 'deepseek/alpha/src/rel.js'],
+    '项目相对的要补前缀、root 相对的要原样保留 —— 不做对齐会得到全量假 STALE')
+  assert.ok(warnings.some((w) => w.includes('补了路径前缀')), '补前缀这件事必须进警告（可审计）')
+})
+
+test('迁移·无证据的在途动作不迁移为在途意图（否则是永久孤儿）', async (t) => {
+  const root = tmpRoot(t)
+  mkdirSync(join(root, '.internal'), { recursive: true })
+  mkdirSync(join(root, '.internal', 'legacy'), { recursive: true })
+  writeFileSync(join(root, '.internal', 'nav-actions.json'), JSON.stringify({
+    actions: [
+      { id: 'ACT-001', status: 'in_progress', task: '旧版在途（无 scopeFiles/scopeState）', anchor: 'A-F01', scope: { features: ['A-F01'] } },
+      { id: 'ACT-002', status: 'in_progress', task: '新版在途（有证据）', anchor: 'A-F01', scope: { features: ['A-F01'] }, scopeFiles: ['src/e.js'], scopeState: { 'src/e.js': { exists: true, size: 1, sha1: 'x' } } },
+      { id: 'ACT-003', status: 'done', task: '已完成', anchor: 'A-F01', scope: { features: ['A-F01'] } }
+    ]
+  }), 'utf-8')
+  const { drafts, warnings } = legacyToDrafts(root)
+  const open = drafts.filter((d) => d.kind === 'commit' && d.phase === 'open')
+  assert.equal(open.length, 1, '只有带证据的那笔才成为在途意图')
+  assert.equal(open[0].task, '新版在途（有证据）')
+  assert.equal(drafts.filter((d) => d.kind === 'commit' && d.phase === 'closed').length, 1, '已完成动作照常迁移')
+  assert.ok(warnings.some((w) => w.includes('没有任何 scope 证据')), '丢弃必须报数，不能静默')
+})
+
+test('旧账本折叠成事件：索引/向量/动作/决策/文档一条不丢', async (t) => {
+  const root = tmpRoot(t)
+  mkdirSync(join(root, '.internal'), { recursive: true })
+  put(root, 'alpha/e.js')   // 落点必须真实存在：迁移会核对（不存在的会进警告，不是静默）
+  writeFileSync(join(root, '.internal', 'nav-index.json'), JSON.stringify({
+    projectPaths: { alpha: 'alpha' },
+    projects: { alpha: { name: 'Alpha' } },
+    modules: { editor: { name: 'Editor', project: 'alpha', features: ['A-F01'] } },
+    features: { 'A-F01': { name: 'Edit', files: ['alpha/e.js'], module: 'editor', userView: 'edit' } },
+    indexes: { fileToFeature: { 'alpha/e.js': ['A-F01'] }, featureToFiles: { 'A-F01': ['alpha/e.js'] } }
+  }), 'utf-8')
+  writeFileSync(join(root, '.internal', 'vector.json'), JSON.stringify({ doing: 'alpha', next: 'n', notDoing: 'x', exitCondition: 'e' }), 'utf-8')
+  writeFileSync(join(root, '.internal', 'nav-actions.json'), JSON.stringify({
+    actions: [
+      { id: 'ACT-001', status: 'done', task: 'done one', anchor: 'A-F01', scope: { features: ['A-F01'] }, scopeFiles: ['alpha/e.js'] },
+      { id: 'ACT-002', status: 'in_progress', task: 'live one', anchor: 'A-F01', scope: { features: ['A-F01'] }, scopeFiles: ['alpha/e.js'], scopeState: { 'alpha/e.js': { exists: true, size: 1, sha1: 's' } } }
+    ]
+  }), 'utf-8')
+  writeFileSync(join(root, '.internal', 'nav-arch.json'), JSON.stringify({ decisions: [{ anchor: 'A-F01', reason: 'r', decision: 'd', impact: 'i' }] }), 'utf-8')
+  writeFileSync(join(root, '.internal', 'nav-docs.json'), JSON.stringify({ docs: [{ id: 'DOC-1', title: 'T', path: 'p.md', when: 'w', tags: ['t'] }] }), 'utf-8')
+
+  const info = inspectLegacy(root)
+  assert.equal(info.alreadyMigrated, false)
+  const { drafts, warnings } = legacyToDrafts(root)
+  assert.ok(drafts.some((d) => d.kind === 'node' && d.layer === 'feature' && d.id === 'A-F01'))
+  assert.ok(drafts.some((d) => d.kind === 'set'))
+  assert.ok(drafts.some((d) => d.kind === 'decide'))
+  assert.ok(drafts.some((d) => d.kind === 'commit' && d.phase === 'open'))
+  assert.ok(drafts.some((d) => d.kind === 'commit' && d.phase === 'closed'))
+  assert.equal(warnings.length, 0)
+
+  const r = await migrateLegacy(root)
+  assert.equal(r.status, 'migrated')
+  const m = buildModel(root)
+  assert.equal(m.nodes.get('feature:a-f01').files.length, 1)
+  assert.equal(m.vector.doing, 'alpha')
+  assert.equal(m.decisions.length, 1)
+  assert.equal(m.openCommits.length, 1, 'in_progress 的动作迁移为在途意图')
+  assert.equal([...m.nodes.values()].filter((n) => n.layer === 'artifact').length, 1)
+})
+
+test('迁移把旧账本归档为只读快照，且不再有第二个真相', async (t) => {
+  const root = tmpRoot(t)
+  mkdirSync(join(root, '.internal'), { recursive: true })
+  writeFileSync(join(root, '.internal', 'vector.json'), JSON.stringify({ doing: 'x' }), 'utf-8')
+  await migrateLegacy(root)
+  assert.equal(existsSync(join(root, '.internal', 'vector.json')), false, '旧账本必须离开原位')
+  assert.equal(existsSync(join(root, '.internal', 'legacy', 'vector.json')), true)
+  assert.equal(existsSync(join(root, '.internal', 'legacy', 'migrated.json')), true)
+  const again = await migrateLegacy(root)
+  assert.equal(again.status, 'already-migrated', '迁移只跑一次')
+})
+
+test('迁移后旧账本不再被任何读路径读取（改了它，模型不变）', async (t) => {
+  const root = tmpRoot(t)
+  mkdirSync(join(root, '.internal'), { recursive: true })
+  writeFileSync(join(root, '.internal', 'vector.json'), JSON.stringify({ doing: 'x' }), 'utf-8')
+  await migrateLegacy(root)
+  const before = buildModel(root).vector.doing
+  writeFileSync(join(root, '.internal', 'legacy', 'vector.json'), JSON.stringify({ doing: 'HACKED' }), 'utf-8')
+  assert.equal(buildModel(root).vector.doing, before)
+})
+
+// ============ 边界（事故事实保留） ============
+
+function modelWith(projects) {
+  const nodes = new Map()
+  for (const [name, path] of projects) {
+    nodes.set(nodeId('project', name), { id: nodeId('project', name), layer: 'project', name, status: 'active', meta: { path } })
+  }
+  return { nodes }
 }
 
-test('parseArchCache reads the fingerprint header contract', (t) => {
-  const root = tmpRoot(t)
-  writeFileSync(join(root, 'a.js'), 'x')
-  const rel = '.internal/arch/proj-overview.md'
-  writeArchDoc(root, rel, { project: 'PN-P01（project-nav）', scope: 'overview', files: ['a.js'] })
-  const cache = parseArchCache(readFileSync(join(root, rel), 'utf-8'))
-  assert.equal(cache.project, 'PN-P01（project-nav）')
-  assert.equal(cache.scope, 'overview')
-  assert.deepEqual(cache.files.map(f => f.path), ['a.js'])
-  assert.equal(cache.files[0].size, 1)
-  assert.equal(parseArchCache('# 没有指纹块'), null, 'a doc without the block is "unmanaged", not a crash')
+test('工作区边界是 opt-in：空白名单什么都不绑', () => {
+  const m = modelWith([['PN-P01', 'project-nav'], ['alpha', 'deepseek/alpha']])
+  assert.equal(governedWorkspaceOf(m, 'D:\\FF', 'D:\\FF\\project-nav', ''), '')
+  assert.equal(governedWorkspaceOf(m, 'D:\\FF', 'D:\\FF\\project-nav', []), '')
 })
 
-test('archDocStatus: fresh while declared stamps hold, stale once a file moves', (t) => {
-  const root = tmpRoot(t)
-  writeFileSync(join(root, 'a.js'), 'x')
-  writeArchDoc(root, '.internal/arch/d.md', { files: ['a.js'] })
-  assert.equal(archDocStatus(root, '.internal/arch/d.md').ok, true)
-  writeFileSync(join(root, 'a.js'), 'xx')   // size + mtime differ → the doc describes an older reality
-  const stale = archDocStatus(root, '.internal/arch/d.md')
-  assert.equal(stale.ok, false)
-  assert.match(stale.drifted.join(' '), /a\.js/)
-  const gone = archDocStatus(root, '.internal/arch/nope.md')
-  assert.equal(gone.missing, true)
+test('工作区边界：三种写法都命中，且只命中被登记的项目', () => {
+  const m = modelWith([['PN-P01', 'project-nav'], ['alpha', 'deepseek/alpha']])
+  const norm = (s) => String(s).replace(/\\/g, '/')
+  assert.equal(norm(governedWorkspaceOf(m, 'D:\\FF', 'D:\\FF\\project-nav\\host', ['project-nav'])), 'D:/FF/project-nav')
+  assert.equal(norm(governedWorkspaceOf(m, 'D:\\FF', 'D:/FF/project-nav', ['PN-P01'])), 'D:/FF/project-nav')
+  assert.equal(norm(governedWorkspaceOf(m, 'D:\\FF', 'D:/FF/deepseek/alpha', ['deepseek/alpha'])), 'D:/FF/deepseek/alpha')
 })
 
-test('listArchDocs walks .internal/arch recursively and skips the render/ projection dir', (t) => {
-  const root = tmpRoot(t)
-  writeFileSync(join(root, 'a.js'), 'x')
-  writeArchDoc(root, '.internal/arch/x.md', { files: ['a.js'] })
-  writeArchDoc(root, '.internal/arch/sub/y.md', { files: ['a.js'] })
-  mkdirSync(join(root, '.internal', 'arch', 'render'), { recursive: true })
-  writeFileSync(join(root, '.internal', 'arch', 'render', 'shot.md'), '# projection artefact, not a doc')
-  const docs = listArchDocs(root).map(d => d.path)
-  assert.deepEqual(docs, ['.internal/arch/sub/y.md', '.internal/arch/x.md'])
+test('工作区边界：root 自身永不治理；未登记目录；越界；兄弟前缀；缺输入', () => {
+  const m = modelWith([['PN-P01', 'project-nav']])
+  assert.equal(governedWorkspaceOf(m, 'D:\\FF', 'D:\\FF', ['project-nav', 'FF', 'D:/FF']), '')
+  assert.equal(governedWorkspaceOf(m, 'D:\\FF', 'D:\\FF\\scratch', ['project-nav', 'scratch']), '')
+  assert.equal(governedWorkspaceOf(m, 'D:\\FF', 'C:\\Users\\lk\\elsewhere', ['project-nav']), '')
+  assert.equal(governedWorkspaceOf(m, 'D:\\FF', 'D:\\FFx', ['project-nav']), '')
+  assert.equal(governedWorkspaceOf(null, 'D:\\FF', 'D:\\FF', ['project-nav']), '')
+  assert.equal(governedWorkspaceOf(m, 'D:\\FF', '', ['project-nav']), '')
+  assert.equal(governedWorkspaceOf({ nodes: new Map() }, 'D:\\FF', 'D:\\FF\\project-nav', ['project-nav']), '')
 })
-
-test('archDocsFor matches by scope equality and by declared-file intersection', (t) => {
-  const root = tmpRoot(t)
-  const idx = seededIndex(root)                       // PE-F01 → src/main.js, module editor, project alpha
-  writeFileSync(join(root, 'a.js'), 'x')
-  mkdirSync(join(root, 'src'), { recursive: true })
-  writeFileSync(join(root, 'src', 'main.js'), 'x')
-  writeArchDoc(root, '.internal/arch/by-scope.md', { scope: 'PE-F01', files: ['a.js'] })
-  writeArchDoc(root, '.internal/arch/by-file.md', { scope: 'overview', files: ['src/main.js'] })
-  writeArchDoc(root, '.internal/arch/unrelated.md', { scope: 'other', files: ['a.js'] })
-  const forFeature = archDocsFor(idx, root, 'PE-F01').map(d => d.path).sort()
-  assert.deepEqual(forFeature, ['.internal/arch/by-file.md', '.internal/arch/by-scope.md'])
-  // overview 档按 project 字段回退命中（档没声明该文件时仍算覆盖这个项目）
-  assert.ok(archDocsFor(idx, root, 'editor').some(d => d.path === '.internal/arch/by-file.md'))
-  // scope 混写 → 并集，按档去重
-  const scoped = archDocsForScope(idx, root, { features: ['PE-F01'], modules: ['editor'], files: ['a.js'] })
-  assert.deepEqual(scoped.map(d => d.path).sort(), ['.internal/arch/by-file.md', '.internal/arch/by-scope.md', '.internal/arch/unrelated.md'])
-})
-
-test('stampArchDoc refreshes the header from the declared list, refusing a broken declaration', (t) => {
-  const root = tmpRoot(t)
-  writeFileSync(join(root, 'a.js'), 'x')
-  writeArchDoc(root, '.internal/arch/d.md', { files: ['a.js'] })
-  writeFileSync(join(root, 'a.js'), 'xxxx')
-  assert.equal(archDocStatus(root, '.internal/arch/d.md').ok, false)
-  const res = stampArchDoc(root, '.internal/arch/d.md')
-  assert.equal(res.ok, true)
-  assert.equal(res.files, 1)
-  assert.equal(archDocStatus(root, '.internal/arch/d.md').ok, true, 'after stamp the doc is fresh again')
-  assert.match(readFileSync(join(root, '.internal/arch/d.md'), 'utf-8'), /# overview[\s\S]*body/, 'the body must survive the rewrite')
-  rmSync(join(root, 'a.js'))
-  const refused = stampArchDoc(root, '.internal/arch/d.md')
-  assert.equal(refused.ok, false)
-  assert.match(refused.reason, /不存在/, 'a fingerprint pointing at air is worse than a loud failure')
-})
-
-test('stampArchDoc refuses a doc with no arch-cache header', (t) => {
-  const root = tmpRoot(t)
-  mkdirSync(join(root, '.internal', 'arch'), { recursive: true })
-  writeFileSync(join(root, '.internal', 'arch', 'plain.md'), '# 没指纹块\n')
-  const res = stampArchDoc(root, '.internal/arch/plain.md')
-  assert.equal(res.ok, false)
-  assert.match(res.reason, /arch-cache/)
-})
-
-test('renderArchPointer states freshness, staleness and the no-doc soft hint', (t) => {
-  const root = tmpRoot(t)
-  writeFileSync(join(root, 'a.js'), 'x')
-  writeArchDoc(root, '.internal/arch/d.md', { files: ['a.js'] })
-  const fresh = renderArchPointer([archDocStatus(root, '.internal/arch/d.md')])
-  assert.match(fresh, /新鲜/)
-  writeFileSync(join(root, 'a.js'), 'xxxx')
-  const stale = renderArchPointer([archDocStatus(root, '.internal/arch/d.md')])
-  assert.match(stale, /过期/)
-  assert.match(stale, /nav_arch mode="stamp"/, 'a stale doc must come with the one command that fixes the fingerprint')
-  assert.match(renderArchPointer([]), /暂无架构档/, 'no arch doc is a soft hint, never a hard block')
-})
-
-test('arch-cache mtime accepts both UTC and local-wall-clock renderings of one instant', (t) => {
-  const root = tmpRoot(t)
-  writeFileSync(join(root, 'a.js'), 'x')
-  writeArchDoc(root, '.internal/arch/d.md', { files: ['a.js'] })
-  const abs = join(root, '.internal', 'arch', 'd.md')
-  const st = statSync(join(root, 'a.js'))
-  const utc = new Date(st.mtimeMs).toISOString()
-  const local = new Date(st.mtimeMs - new Date(st.mtimeMs).getTimezoneOffset() * 60000).toISOString()
-  // 库里两种写法都在（project-nav 各档 = UTC 带毫秒；shoucang 各档 = 本地墙上时间且截到秒）——
-  // 指纹记的是瞬时，不是字符串：两种渲染都必须算命中，否则一半的档会永久假过期。
-  writeFileSync(abs, readFileSync(abs, 'utf-8').replace(utc, local.slice(0, 19) + 'Z'))
-  const asLocal = archDocStatus(root, '.internal/arch/d.md')
-  assert.equal(asLocal.ok, true, 'the local rendering of the same instant is not drift')
-  if (local !== utc) {
-    assert.equal(asLocal.localForm, true)
-    assert.equal(asLocal.truncated, true, 'second-precision stamps are the same instant, not drift')
-  }
-  // 第三种偏移（既非 UTC 也非本机本地）= 写法不符：只报不静默放行，且指明 stamp 校正
-  const offHours = -new Date().getTimezoneOffset() / 60
-  const odd = offHours === -3 ? -4 : -3
-  writeFileSync(abs, readFileSync(abs, 'utf-8').replace(local.slice(0, 19) + 'Z', new Date(st.mtimeMs + odd * 3600000).toISOString()))
-  const oddStatus = archDocStatus(root, '.internal/arch/d.md')
-  assert.equal(oddStatus.ok, false, 'an alien offset is still not fresh')
-  assert.equal(oddStatus.tzOnly, true)
-  assert.match(renderArchPointer([oddStatus]), /写法不符/)
-  // 真正的代码漂移（size 变了）不得被降级成写法问题
-  writeFileSync(join(root, 'a.js'), 'xxxxx')
-  assert.equal(archDocStatus(root, '.internal/arch/d.md').tzOnly, false)
-})
-
-

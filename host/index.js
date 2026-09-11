@@ -1,312 +1,73 @@
-// @dsh-external/project-nav — anti-drift governance for agent-maintained projects
-// Design core: governance-first transaction loop (HANDOFF §14):
-//   nav_query (scope) → nav_plan (register action) → nav_mark begin → change → nav_mark done
-// 11 tools. Core logic lives in ../shared/index.js (single source, no duplication).
-// v0.8.0 (ADR-011): the architecture layer (.internal/arch/*.md + arch-cache fingerprint header)
-// is wired into the read face — nav_query prints the arch pointer, nav_plan records archBasis,
-// nav_mark done reports docs the change made stale, nav_status summarizes freshness, and the new
-// nav_arch tool owns list/check/stamp. Rendering stays a projection outside the plugin.
+// @dsh-external/project-nav — 从架构出发的项目治理
+//
+// 核心理念（唯一上位约束）：
+//   所有开发动作必须从架构出发。架构不出错，局部问题只是小问题；
+//   架构错了，局部补得再好也是在错误骨架上堆砌。
+//
+// 架构（见 ARCHITECTURE.md）：
+//   ① 事件流 .internal/events.jsonl  —— 唯一事实源（append-only）
+//   ② 模型   .internal/runtime/…     —— 事件流的折叠（可丢弃，I3）
+//   ③ 投影   PROJECT.md / ARCH-MODEL.md / 地图 / 架构档指针 —— 全部渲染（I2）
+//   闸门 = 对模型的查询（六闸，全部在 nav_commit 内）
+//
+// 工具面 6：nav_graph / nav_commit / nav_decide / nav_node / nav_render / nav_set
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 import { writeFileSync, mkdirSync, readFileSync, existsSync, renameSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import {
-  loadIndex, getIndexAge,
-  loadVector,
-  loadActions, loadActionsReconciled, mutateActions, reconcileActions,
-  mutateIndex, mutateVector, mutateDocs, mutateArch, withFileLock, retireEntry, indexEntryKind,
-  nextActionId, selfOwner, DEFAULT_LEASE_TTL_MS,
-  isLeaseExpired, canonPath, scopeOwnModules, sessionLabel, sessionBusyWith, checkScopeConflicts, queuePosition, actorLabel, describeConflicts,
-  loadDocs, nextDocId, suggestDocs,
-  queryIndex, partialSearch, normalizePath,
-  renderTreeText, renderMapHtml, renderProjectDocSection,
-  findStaleFiles, scopeTargetsOfOpenActions,
-  snapshotScopeFiles, verifyScopeFingerprint, resolveScopeFile, indexedOwnersOf, governedWorkspaceOf,
-  loadArch, nextDecisionId, checkAnchor, repeatPressure, REPEAT_PATCH_THRESHOLD, lastDecisionFor,
-  listArchDocs, archDocsFor, archDocsForScope, archDocStatus, renderArchPointer, stampArchDoc, parseArchCache
-} from '../shared/index.js'
-
-// ---- Plugin metadata (Cordis contract) ----
-
+  PLANE, paths, nowIso, normSlashes, key
+} from '../core/paths.js'
+import { loadModel, normalizeAnchor, pressureFor, coverage, REPEAT_PATCH_THRESHOLD } from '../core/model.js'
+import { appendEvents, verifyLog, readEvents } from '../core/log.js'
+import { reconcile, commitIntent, archiveIntent, inflightView, materialize } from '../core/commit.js'
+import { locate, resolveScope, evidenceOf } from '../core/scope.js'
+import { listArchDocs, archDocsFor, stampArchDoc, renderAll, renderMapHtml, renderTreeText, archDocState } from '../core/render.js'
+import { listLocks } from '../core/lock.js'
+import { inspectLegacy, migrateLegacy } from '../core/legacy.js'
+import {
+  splitList, parseKv, truncate, renderHealth, renderScopeTarget, renderGaps,
+  renderDocs, renderAdrs, renderArchDocs, renderMap, renderCommitResult
+} from '../core/format.js'
+import { governedWorkspaceOf } from '../core/boundary.js' // 本地绑定（:155 直接调用；末尾 :523 的 re-export 不建立本地绑定）
 export const name = '@dsh-external/project-nav'
-// `shell` is a REAL hard dependency, not a convenience: the workspace-boundary readiness
-// probe (ADR-016) runs through the shell seam, and reading it optionally let the plugin
-// apply BEFORE the pwsh executor registered the service. The probe then saw no `shell`,
-// reported nothing, cached `false` for the whole process — and the boundary stayed inert
-// while every visible signal (config, mount, allow-list, matching) looked correct.
-// Declaring it makes Cordis defer apply until the seam exists, and reactivate the plugin
-// if it ever disappears.
+// `shell` 是真实硬依赖：工作区边界的可执行性探针走 shell 缝，且必须等它注册后再探。
 export const inject = ['tools', 'shell']
 
 export const Config = z.object({
-  // Workspace root governed by this plugin — the folder whose .internal/
-  // holds the nav index/vector/actions/docs data (usually the PROJECT.md root).
-  // No machine-specific default: leave empty to fall back to the process
-  // working directory at load time (a boot log reports the resolved root).
-  // Set config.root to govern a specific workspace explicitly.
   root: z.string().default(''),
-  // Multi-session leases: how long an in_progress action keeps its scope lock
-  // without a heartbeat before another session may claim the same scope.
-  leaseTtlMs: z.number().default(0),
-  // Workspace boundary (ADR-014): bind a session whose cwd belongs to a selected workspace
-  // to the native `workspace-write` sandbox, so its write actions cannot leave that
-  // workspace while reads stay unrestricted everywhere. The boundary itself is the
-  // harness's — this plugin only decides which sessions get it.
-  //
-  // `boundaryWorkspaces` is the real selector and it is an ALLOW-LIST: comma-separated
-  // project keys / relative paths / directory names (e.g. "PN-P01" or "project-nav").
-  // EMPTY (the default) GOVERNS NOTHING. That default is deliberate: the native mode has
-  // exactly one writable root — the session cwd — so a session whose work reaches into
-  // ~/.dsh (memory library, skills, profile deployment) would be stopped rather than
-  // protected. Opt in only workspaces whose work is self-contained.
   boundaryWorkspaces: z.string().default(''),
-  // Master switch, kept for a clean migration off the pre-allow-list behaviour (where the
-  // mere presence of a governed workspace was enough to bind). false leaves every session
-  // untouched regardless of the allow-list.
   autoBindWorkspace: z.boolean().default(true)
 })
-
-// ---- helpers ----
-
-function err(e) {
-  return `ERROR: ${e.message}`
-}
-
-function splitList(s) {
-  return s ? String(s).split(',').map(x => x.trim()).filter(Boolean) : []
-}
-
-/**
- * Resolve a nav_query target into the form the index is keyed by.
- *
- * Index keys are ROOT-RELATIVE (`project-nav/host/index.js`), but a model naturally hands
- * over the ABSOLUTE path it is already working with. An absolute path missed every key, so
- * nav_query answered "No mapping found … register it via nav_update" for a file that was
- * registered all along — a false negative that invites a duplicate registration (observed
- * 2026-09-11: it manufactured a phantom governance action). A silent wrong answer is worse
- * than a miss, so this both normalizes and reports the two cases the caller must name
- * explicitly (the root itself, and paths outside the governed root).
- *
- * @returns {{target: string, outside?: boolean, atRoot?: boolean, resolved?: string}}
- */
-function relativizeQueryTarget(rootPath, target) {
-  const raw = String(target ?? '').trim()
-  if (!raw) return { target: raw }
-  const isAbsolute = /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith('\\\\') || raw.startsWith('/')
-  if (!isAbsolute) return { target: raw }
-  const norm = (p) => normalizePath(p).replace(/\/+$/, '').toLowerCase()
-  const rootNorm = norm(rootPath)
-  const targetNorm = norm(raw)
-  if (targetNorm === rootNorm) return { target: raw, atRoot: true }
-  if (!targetNorm.startsWith(rootNorm + '/')) return { target: raw, outside: true }
-  const rel = normalizePath(raw).slice(normalizePath(rootPath).replace(/\/+$/, '').length).replace(/^\/+/, '')
-  return { target: rel, resolved: rel }
-}
-
-/**
- * Session identity of the caller. The governed workspace is shared by every DSH
- * session, so this is what tells two concurrent sessions apart; `exec.agent.id`
- * is the agent's SessionId. Returns null outside a session (tests, CLI), which
- * makes the gates fall back to the legacy global-single-lock behaviour.
- */
-function sidOf(exec) {
-  return exec?.agent?.id ? String(exec.agent.id) : null
-}
-
-/** Lease TTL: config override wins, otherwise the shared default. */
-function ttlOf(config) {
-  return Number(config?.leaseTtlMs) > 0 ? Number(config.leaseTtlMs) : DEFAULT_LEASE_TTL_MS
-}
-/** Names of known project directories (used to fold workspace-relative paths). */
-function dirNamesOf(index) {
-  const out = new Set();
-  for (const p of Object.values(index?.projectPaths || {})) {
-    const parts = String(p).replace(/\\/g, '/').split('/').filter(Boolean);
-    if (parts.length) out.add(parts[parts.length - 1].toLowerCase());
-  }
-  return out;
-}
-
-/**
- * Does a query target fall inside an action's scope?
- * Canonical paths only (so "project-nav/host/index.js" and "host/index.js" are
- * the SAME file). A target that IS a feature code or module name matches
- * literally; a target that is a FILE matches scope files exactly (or inside a
- * scope directory) — bare filenames match only exactly, so a scope "index.js"
- * cannot claim every index.js in the repo.
- */
-function targetInScope(target, scope, index = null) {
-  const dirs = dirNamesOf(index);
-  const t = canonPath(target, dirs);
-  if (!t) return false;
-  for (const f of (scope.features || [])) if (f.toLowerCase() === t) return true;
-  for (const m of (scope.modules || [])) if (m.toLowerCase() === t) return true;
-  for (const f of (scope.files || [])) {
-    const nf = canonPath(f, dirs);
-    if (!nf) continue;
-    // exact match, or target inside a scope DIRECTORY, or scope path expressed
-    // relative to the query's directory.
-    if (t === nf) return true;
-    if (nf.includes('/') && t.startsWith(nf + '/')) return true;
-    if (t.includes('/') && nf.startsWith(t + '/')) return true;
-  }
-  return false
-}
-
-/**
- * The live action holding this target, if any: matches by literal path scope OR
- * by feature — a file that the index maps to a feature the other action holds is
- * an overlap even though the two scopes name different things.
- */
-function occupyingAction(ledger, target, index = null) {
-  const dirs = dirNamesOf(index)
-  const targetFeatures = featuresOfTarget(index, target, dirs)
-  return (ledger.actions || []).find(a => {
-    if (a.status !== 'in_progress' || isLeaseExpired(a)) return false
-    const scope = a.scope || {}
-    return targetInScope(target, scope, index) || featureTouch(scope, targetFeatures)
-  }) || null
-}
-
-/**
- * Scope gate for nav_query: answers the question a parallel session actually has
- * — "is somebody else on this file right now?". A live action held by ANOTHER
- * session is reported as OCCUPIED (and nav_mark begin will queue behind it); the
- * caller's own open actions keep the original plan-first gate, and other
- * sessions' unrelated actions are reported as free-to-work context instead of noise.
- */
-/** Does this scope name (or own, through the index) any of these feature codes? */
-function featureTouch(scope, featureCodes) {
-  if (!featureCodes || featureCodes.size === 0) return false
-  return (scope?.features || []).some(c => featureCodes.has(c))
-}
-
-function featuresOfTarget(index, target, dirs) {
-  const f2f = index?.indexes?.fileToFeature || {};
-  const t = canonPath(target, dirs);
-  const out = new Set();
-  for (const [file, codes] of Object.entries(f2f)) {
-    if (canonPath(file, dirs) === t) for (const c of codes) out.add(c);
-  }
-  return out;
-}
-
-function scopeGate(ledger, target, sessionId = null, index = null) {
-  const sid = sessionId ? String(sessionId) : ''
-  const dirs = dirNamesOf(index)
-  const targetFeatures = featuresOfTarget(index, target, dirs)
-  const actions = ledger.actions || []
-  const covers = a => {
-    const scope = a.scope || {}
-    return targetInScope(target, scope, index) || featureTouch(scope, targetFeatures)
-  }
-  // 1. Somebody else's live lock on this target → the parallel-session warning.
-  const occupier = actions.find(a => a.status === 'in_progress' && !isLeaseExpired(a) && covers(a)) || null
-  if (occupier && (!sid || occupier.owner?.sessionId !== sid)) {
-    return `\n⚠ OCCUPIED: ${actorLabel(occupier)} is changing this target right now.\n  A live action from another session holds it. Options: wait for it (your own nav_mark begin with wait=true blocks until it is released), pick a different target, or re-scope so the two do not overlap (nav_plan).`
-  }
-  // 2. The caller's own open action covers it → plan-first reminder.
-  const mine = actions.find(a => (a.status === 'planned' || a.status === 'in_progress') && (!sid || a.owner?.sessionId === sid) && covers(a))
-  if (mine) {
-    return `Gate: this target belongs to your OPEN action ${mine.id} (${mine.status}) "${mine.task}". Changes here must run under that action.`
-  }
-  const open = actions.filter(a => a.status === 'planned' || a.status === 'in_progress')
-  if (open.length === 0) return ''
-  const others = open.filter(a => !sid || a.owner?.sessionId !== sid)
-  // 3. The caller's own open actions cover nothing here → plan-first reminder.
-  if (others.length === 0) {
-    const list = open.map(a => `${a.id} [${a.status}] ${a.task}`).join('; ')
-    return `⚠ Gate: ${open.length} open action(s) exist (${list}) and this target is NOT in their scope. Plan first (nav_plan) or finish them (nav_mark).`
-  }
-  // 4. Others are working somewhere inside the module this query names → partial occupancy.
-  const modulesOfTarget = new Set()
-  for (const [mod, feats] of Object.entries(index?.indexes?.moduleToFeatures || {})) {
-    if ((feats || []).some(c => targetFeatures.has(c))) modulesOfTarget.add(mod)
-  }
-  if (modulesOfTarget.size) {
-    const busyModules = []
-    for (const a of others) {
-      for (const m of scopeOwnModules(index, a.scope || {})) {
-        if (modulesOfTarget.has(m)) busyModules.push(`${a.id} holds ${m}`)
-      }
-    }
-    if (busyModules.length) {
-      return `\n⚠ PARTIALLY OCCUPIED: this target sits in module(s) ${[...modulesOfTarget].join(', ')} and other sessions are live inside them (${busyModules.join('; ')}).\n  Their scopes are narrower than the whole module, so check the overlap before touching anything: ${others.map(actorLabel).join('; ')}`
-    }
-  }
-  // 5. Others' unrelated open actions → context, not a blocker.
-  const list = others.map(actorLabel).join('; ')
-  return `⚠ Gate: ${others.length} open action(s) belong to OTHER sessions (${list}) and this target is not in their scope — free to work, but register your own scope (nav_plan) so the two cannot drift into each other.`
-}
-
-/** Mainline gate heuristic: are the query hits referenced in doing/next text? */
-function mainlineGate(vector, result) {
-  const mainline = `${vector.doing || ''} ${vector.next || ''}`.toLowerCase().trim()
-  // Only gate on module names — feature codes never appear in prose mainline
-  // text, so matching them would warn on every query (noise → gate gets ignored).
-  if (!mainline || result.modules.length === 0) return ''
-  const referenced = result.modules.some(m => m.length >= 3 && mainline.includes(m.toLowerCase()))
-  if (referenced) return ''
-  return `⚠ Mainline: module(s) ${result.modules.join(', ')} not referenced in the mainline vector (doing/next). Confirm this is on-mainline, or update the vector (nav_set_vector).`
-}
 
 const OUTPUT = {
   schema: { type: 'string' },
   render: (_a, v) => [{ type: 'text', text: String(v) }]
 }
 
-// ---- plugin entry ----
+function err(e) { return `ERROR: ${e.message}` }
+function sidOf(exec) { return exec?.agent?.id ? String(exec.agent.id) : null }
+function j(v) { return JSON.stringify(v, null, 2) }
 
 export function apply(ctx, config) {
-  // Resolve the governed root at load time: explicit config.root wins;
-  // otherwise fall back to the process cwd and say so loudly at boot, so the
-  // plugin never silently targets a hardcoded machine-specific path.
   const root = config?.root ? resolve(config.root) : process.cwd()
   if (ctx.logger?.warn && !config?.root) {
-    ctx.logger.warn(`[project-nav] root config unset — governing process.cwd() (${root}). Set config.root to the workspace you want governed (see README "配置").`)
+    ctx.logger.warn(`[project-nav] root config unset — governing process.cwd() (${root}). Set config.root to the workspace you want governed.`)
   } else if (ctx.logger?.info) {
     ctx.logger.info(`[project-nav] governing root: ${root} (config.root)`)
   }
 
-  // G3 (HANDOFF §33): every read/write in this plugin goes through node:fs.
-  // Some deployments expose a sandboxed fs capability (ctx.fs) that fences
-  // mutations by workspace policy. When it is present, say so loudly instead of
-  // silently bypassing the fence. The async fs-port swap is deliberately deferred
-  // until a confined deployment actually exists (complexity budget, v0.6.0).
-  let fsCapability = null
-  try { fsCapability = ctx.get?.('fs') ?? ctx.fs ?? null } catch { fsCapability = null }
-  if (fsCapability && ctx.logger?.warn) {
-    ctx.logger.warn('[project-nav] a sandboxed fs capability (ctx.fs) is present, but this plugin reads/writes .internal/ through node:fs directly. If this deployment confines plugin fs access, governance data may bypass the fence — see HANDOFF §33 (G3).')
+  // ---- 自动收口（A1）：每一次工具调用都按证据对账，与会话无关 ----
+  let lastReconcile = { closed: [], stillOpen: [], at: 0 }
+  async function refresh(now = Date.now()) {
+    // 先按证据收口（会写事件），再用收口后的真相建模型。
+    lastReconcile = { ...(await reconcile(root, { now })), at: now }
+    return loadModel(root, { now })
   }
 
-  // ---- workspace boundary (ADR-014, ADR-016) ----
-  // The harness owns the boundary: a session's cwd IS its workspace, and `workspace-write`
-  // confines every write (files, shell, subprocesses, third-party plugins) to it while
-  // leaving reads unrestricted everywhere. The plugin contributes the two facts the harness
-  // cannot know — whether THIS deployment chooses to govern that workspace, and whether this
-  // host can actually enforce it — by binding matching sessions once, at session start.
-  // Enforcement, the approval path, and projecting the policy into the model's context are
-  // all native; nothing is re-implemented here.
-  //
-  // Enforceability is an INPUT, not a deployment note (ADR-016). A host whose sandbox backend
-  // cannot start fails CLOSED on every confined shell call, so binding a session there would
-  // not protect it — it would take the session's shell away (observed: every governed session
-  // lost pwsh). The probe mirrors upstream's own readiness probe — `read-only`, zero grants,
-  // no ACL mutation — so it detects the token-side failure without side effects, and a
-  // `workspace-write` probe is deliberately NOT used because its eager workspace ACE
-  // propagation would be far too heavy to run per boot.
+  // ================= 工作区边界（ADR-014/016 的事故事实保留） =================
   const boundaryOn = config?.autoBindWorkspace !== false
-  // Probe verdict: null = never probed, true = usable, false = the last attempt failed.
-  // v0.8.5 — the verdict is no longer cached for the process lifetime, and no branch is
-  // silent. v0.8.4 cached the FIRST attempt forever (`boundaryUsable !== null → return`)
-  // and its early returns logged nothing, so a boot-time failure left the boundary
-  // permanently inert with ZERO trace: config correct, plugin mounted, allow-list
-  // matching, and not one session bound (observed 2026-09-11 on this host — the identical
-  // probe PASSES when run after boot, from a plugin context that applied later). Now a
-  // non-true verdict is retried on the next session start (throttled), and every decision
-  // is journaled to `<root>/.internal/boundary-diag.json` so the next failure is
-  // diagnosable instead of invisible.
   let boundaryUsable = null
   let boundaryReason = 'not probed yet'
   let boundaryInFlight = false
@@ -316,50 +77,28 @@ export function apply(ctx, config) {
   const boundarySessions = []
 
   function boundaryDiagPath() { return resolve(root, '.internal', 'boundary-diag.json') }
-  /** Write the boundary decision journal. NEVER throws: diagnostics must not break a session. */
   function writeBoundaryDiag() {
     try {
       const payload = {
-        updatedAt: new Date().toISOString(),
-        root,
-        enabled: boundaryOn,
-        allow: String(config?.boundaryWorkspaces || ''),
-        probe: {
-          verdict: boundaryUsable,
-          reason: boundaryReason,
-          attempts: boundaryAttempts,
-          lastAttemptAt: boundaryLastAttemptAt ? new Date(boundaryLastAttemptAt).toISOString() : null
-        },
+        updatedAt: nowIso(), root, enabled: boundaryOn, allow: String(config?.boundaryWorkspaces || ''),
+        probe: { verdict: boundaryUsable, reason: boundaryReason, attempts: boundaryAttempts, lastAttemptAt: boundaryLastAttemptAt ? nowIso(boundaryLastAttemptAt) : null },
         sessions: boundarySessions.slice(-25)
       }
       const file = boundaryDiagPath()
-      const dir = dirname(file)
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+      if (!existsSync(dirname(file))) mkdirSync(dirname(file), { recursive: true })
       const tmp = `${file}.tmp-${process.pid}`
       writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf-8')
       renameSync(tmp, file)
-    } catch { /* diagnostics are best-effort by design */ }
+    } catch { /* 诊断 best-effort：绝不因为日志失败而影响会话 */ }
   }
   function recordSession(cwd, zone, decision, detail) {
-    boundarySessions.push({
-      at: new Date().toISOString(),
-      cwd: String(cwd || ''),
-      zone: String(zone || ''),
-      decision: String(decision),
-      detail: String(detail || '')
-    })
+    boundarySessions.push({ at: nowIso(), cwd: String(cwd || ''), zone: String(zone || ''), decision: String(decision), detail: String(detail || '') })
     writeBoundaryDiag()
   }
-
-  /** Probe host enforceability through the public shell seam (read-only, zero grants). */
   function probeBoundary(trigger) {
     const why = trigger || 'boot'
     if (boundaryInFlight || boundaryUsable === true) return
     const now = Date.now()
-    // The FIRST failure may be a boot-time race (the seam is registered but its executor or
-    // sandbox backend is not live yet), so the next session start retries immediately; only
-    // after that is retrying throttled, so a genuinely broken host does not probe on every
-    // session start.
     if (boundaryAttempts >= 2 && now - boundaryLastAttemptAt < BOUNDARY_RETRY_MS) return
     boundaryInFlight = true
     boundaryAttempts += 1
@@ -368,24 +107,19 @@ export function apply(ctx, config) {
     if (!shell || typeof shell.resolve !== 'function' || typeof shell.run !== 'function') {
       boundaryInFlight = false
       boundaryUsable = false
-      boundaryReason = `shell seam unavailable (shell=${typeof shell}, resolve=${typeof shell?.resolve}, run=${typeof shell?.run}, trigger=${why})`
+      boundaryReason = `shell seam unavailable (resolve=${typeof shell?.resolve}, run=${typeof shell?.run}, trigger=${why})`
       ctx.logger?.warn?.(`[project-nav] workspace boundary: ${boundaryReason}; sessions will NOT be bound`)
       writeBoundaryDiag()
       return
     }
     try {
-      const spec = shell.resolve({
-        command: 'exit 0',
-        workdir: root,
-        timeoutMs: 20000,
-        sandboxPolicy: { mode: 'read-only', workspaceRoot: root }
-      })
+      const spec = shell.resolve({ command: 'exit 0', workdir: root, timeoutMs: 20000, sandboxPolicy: { mode: 'read-only', workspaceRoot: root } })
       Promise.resolve(shell.run(spec)).then((res) => {
         boundaryInFlight = false
         const sb = res && res.sandbox
         const runnerFailed = !!(sb && sb.runnerFailed)
         boundaryUsable = !runnerFailed && !!res && res.exitCode === 0
-        boundaryReason = `probe ${boundaryUsable ? 'PASS' : 'FAIL'} (attempt ${boundaryAttempts}, trigger=${why}, exitCode=${res ? res.exitCode : 'n/a'}, runnerFailed=${runnerFailed}, enforcement=${sb && sb.enforcement ? sb.enforcement : 'n/a'})`
+        boundaryReason = `probe ${boundaryUsable ? 'PASS' : 'FAIL'} (attempt ${boundaryAttempts}, trigger=${why}, exitCode=${res ? res.exitCode : 'n/a'}, runnerFailed=${runnerFailed})`
         if (boundaryUsable) ctx.logger?.info?.(`[project-nav] workspace boundary: ${boundaryReason}`)
         else ctx.logger?.warn?.(`[project-nav] workspace boundary: ${boundaryReason}; sessions will NOT be bound`)
         writeBoundaryDiag()
@@ -405,10 +139,7 @@ export function apply(ctx, config) {
     }
   }
   if (boundaryOn && String(config?.boundaryWorkspaces || '').trim() && typeof ctx.on === 'function') probeBoundary('boot')
-
   if (boundaryOn && typeof ctx.on !== 'function') {
-    // Fail VISIBLE: a context without ctx.on would silently leave every session unbound,
-    // and a boundary that reports nothing is worse than one that reports it is missing.
     ctx.logger?.warn?.('[project-nav] workspace boundary: this context exposes no ctx.on — sessions will NOT be bound to their workspace. Set autoBindWorkspace=false to silence.')
   }
   if (boundaryOn && typeof ctx.on === 'function') {
@@ -420,13 +151,8 @@ export function apply(ctx, config) {
           recordSession(cwd, '', 'skipped-no-session-or-append', `session=${!!session} cwd=${cwd || ''}`)
           return
         }
-        // Not governed → leave the session completely alone. The boundary is opt-in
-        // per workspace: an empty allow-list governs nothing (see Config.boundaryWorkspaces).
-        const zone = governedWorkspaceOf(loadIndex(root), root, cwd, config?.boundaryWorkspaces)
+        const zone = governedWorkspaceOf(loadModel(root), root, cwd, config?.boundaryWorkspaces)
         if (!zone) { recordSession(cwd, '', 'not-governed', ''); return }
-        // Never bind a session into a mode this host cannot enforce — see the probe above.
-        // A non-true verdict also lands here: the session stays unbound and the probe is
-        // RETRIED (throttled) instead of the plugin instance staying inert forever.
         if (boundaryUsable !== true) {
           probeBoundary('session-start')
           recordSession(cwd, zone, 'deferred-probe', boundaryReason)
@@ -437,16 +163,7 @@ export function apply(ctx, config) {
           recordSession(cwd, zone, 'skipped-no-sandboxPolicy', `policy=${typeof policy}`)
           return
         }
-        // A session is already stamped with a mode before this hook runs — the permission-preset
-        // initializer fills it at `session/created` — so "is there an override?" is NOT the
-        // question, and asking it made the boundary silently inert (the v0.8.1 defect: every
-        // session was skipped, forever). The real question is what the mode IS:
-        //   workspace-write → already at the boundary (idempotent, including a resumed bind)
-        //   read-only       → stricter than what we would set, so adopting our value would
-        //                     LOOSEN the session; leave that choice alone
-        //   anything else   → assert the boundary (undefined, or the initializer's own stamp)
-        // An explicit switch inside a session still wins for that session: it appends a later
-        // event. `autoBindWorkspace: false` is the deployment-level escape.
+        // 会话在 hook 之前就已被盖上模式 → 问的不是"有没有 override"，而是"模式是什么"。
         const current = policy.overrideOf(session)
         if (current === 'workspace-write' || current === 'read-only') {
           recordSession(cwd, zone, `already-${current}`, '')
@@ -454,994 +171,376 @@ export function apply(ctx, config) {
         }
         session.append('sandbox/mode', { mode: 'workspace-write' })
         recordSession(cwd, zone, 'bound', `previous=${current === undefined ? 'undefined' : current}`)
-        ctx.logger?.info?.(`[project-nav] workspace boundary: session ${sessionLabel(payload?.agent?.id)} bound to workspace-write (${zone})`)
+        ctx.logger?.info?.(`[project-nav] workspace boundary: session ${String(payload?.agent?.id || '').slice(0, 8)} bound to workspace-write (${zone})`)
       } catch (e) {
-        // Fail-safe: a boundary that cannot be set must never break session establishment.
         recordSession('', '', 'error', (e && e.message) || String(e))
         ctx.logger?.warn?.(`[project-nav] workspace boundary: left session untouched (${e.message})`)
       }
     })
   }
+  // ================= 边界结束 =================
 
-  // ---- 1. nav_query — bidirectional mapping + gates ----
+  // ---- 1. nav_graph — 读：模型查询 ----
   ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_query',
-    description: 'Understand the scope of a change target BEFORE touching anything: query by file path or feature code to expand features/modules/projects, with open-action and mainline drift gates.',
+    name: 'nav_graph',
+    description: 'Query the architecture model (the single source of truth folded from the event log). Modes: task (expand a target into features/modules/projects + gates), gaps (unregistered files + STALE落点), coverage, docs (reference docs / rank by task), adrs, arch (arch doc freshness), map (text tree), health (snapshot: coverage + in-flight + pressure + arch freshness + log integrity), legacy (old ledger to migrate), json. Read-only.',
     parameters: {
-      target: { type: 'string', required: true, description: 'File path or feature code (e.g., PE-F01)' },
-      format: { type: 'string', description: 'Output format: text (default) or json' }
+      mode: { type: 'string', description: 'task (default) | gaps | coverage | docs | adrs | arch | map | health | legacy | json' },
+      target: { type: 'string', description: 'task/map: file path, feature code, module or project name; docs: task description to rank; adrs: anchor' },
+      format: { type: 'string', description: 'text (default) | json' }
     },
     output: OUTPUT,
-    async execute(args, exec) {
-      const sid = sidOf(exec)
-      const ttl = ttlOf(config)
+    async execute(args) {
       try {
-        // Index keys are root-relative while a model hands over absolute paths — normalize
-        // BEFORE the lookup (see relativizeQueryTarget for the false negative this removes).
-        const q = relativizeQueryTarget(root, args.target)
-        if (q.atRoot) {
-          return `"${args.target}" is the governed root itself — nav_query maps files INSIDE it. Pass a root-relative path (e.g. "project-nav/host/index.js") or a feature code.`
-        }
-        if (q.outside) {
-          return `"${args.target}" is an absolute path OUTSIDE the governed root (${root}), so nothing here can map it. Pass a root-relative path or a feature code; if that file belongs to another governed root, query it from a session rooted there.`
-        }
-        const index = loadIndex(root)
-        const result = queryIndex(index, q.target)
-        if (!result || (result.features.length === 0 && result.files.length === 0 && result.modules.length === 0)) {
-          const from = q.resolved ? ` (resolved from "${args.target}")` : ''
-          const partials = partialSearch(index, q.target)
-          if (partials.length > 0) {
-            return `No exact match for "${q.target}"${from}. Did you mean:\n${partials.map(m => `  - ${m}`).join('\n')}`
+        const model = await refresh()
+        const mode = String(args.mode || (args.target ? 'task' : 'health')).toLowerCase()
+        const asJson = String(args.format || '').toLowerCase() === 'json'
+
+        if (asJson && mode !== 'json') return j(snapshotOf(model, root, lastReconcile, mode, args.target))
+
+        if (mode === 'task') {
+          const loc = locate(root, model, args.target)
+          const out = [renderScopeTarget(model, loc)]
+          if (loc.kind !== 'empty' && loc.kind !== 'unknown') {
+            const files = loc.kind === 'file' ? [loc.file] : (loc.node?.files || [])
+            const owners = files.flatMap((f) => model.fileOwners.get(key(f)) || [])
+            const docs = archDocsFor(root, model, loc.kind === 'file' ? loc.file : (loc.node?.name || args.target))
+            out.push('')
+            out.push('架构档指针:')
+            if (!docs.length) out.push('  (无覆盖此目标的架构档 — 若这是架构级改动，先出/更新 .internal/arch/*.md)')
+            for (const d of docs) out.push(`  ${d.fresh ? '✓' : '⛔'} ${d.path} — ${d.reason}`)
+            const open = model.openCommits.filter((c) => (c.files || []).some((f) => files.includes(f)))
+            if (open.length) { out.push(''); for (const c of open) out.push(`🔴 在途: ${c.id} ${c.task}（${c.actor ? `by ${String(c.actor).slice(0, 8)}` : 'actor=?'}）`) }
+            const pressure = model.patchPressure.get(key(loc.kind === 'file' ? loc.file : loc.node?.id))
+            if (pressure && pressure.sinceDecisionCount >= 2) out.push(`⚠ 计数闸: ${pressure.anchor} ${pressure.sinceDecisionCount}/${REPEAT_PATCH_THRESHOLD}`)
+            out.push('')
+            out.push('下一步: 改前先 nav_commit（锚点 + scope + arch= 一句话），它跑六闸。')
           }
-          return `No mapping found for "${q.target}"${from}. Register it via nav_update (upsert: a feature with files=, a module with features=/project=).`
+          return out.join('\n')
         }
-        const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
-        const notices = [scopeGate(ledger, args.target, sid, index), mainlineGate(loadVector(root), result)].filter(Boolean)
-        // 架构档指针：这是「开发前必读架构档」落到读取面的那一行——agent 不必记得去查，
-        // 查询目标的影响面时顺手就知道本目标的架构档在哪、还新不新鲜（ADR-011 接线①）。
-        let archStates = []
-        try { archStates = archDocsFor(index, root, args.target) } catch { archStates = [] }
-        if (args.format === 'json') return JSON.stringify({ ...result, ...(q.resolved ? { resolvedFrom: args.target } : {}), notices, archDocs: archStates }, null, 2)
-        const lines = [
-          `Query: ${result.query} (${result.type})${q.resolved ? `  [resolved from: ${args.target}]` : ''}`,
-          `Features: ${result.features.join(', ') || 'none'}`,
-          `Modules: ${result.modules.join(', ') || 'none'}`,
-          `Projects: ${result.projects.join(', ') || 'none'}`,
-          `Files:\n${result.files.map(f => `  → ${f}`).join('\n') || '  (none registered)'}`
-        ]
-        const vector = loadVector(root)
-        if (vector.doing || vector.next) {
-          lines.push('', 'Mainline Vector:')
-          if (vector.doing) lines.push(`  Doing: ${vector.doing}`)
-          if (vector.next) lines.push(`  Next: ${vector.next}`)
+        if (mode === 'gaps') return renderGaps(model)
+        if (mode === 'coverage') {
+          const cv = coverage(model)
+          return [`Coverage:`, `  项目 ${cv.projects} · 模块 ${cv.modules} · 功能 ${cv.features} · 文档工件 ${cv.artifacts} · 已退役 ${cv.retired}`, `  登记文件 ${cv.registeredFiles} · 未登记 ${cv.unregisteredFiles} · STALE ${model.stale.length}`].join('\n')
         }
-        lines.push('', renderArchPointer(archStates))
-        if (notices.length) lines.push('', ...notices)
-        return lines.join('\n')
+        if (mode === 'docs') return renderDocs(model, { task: args.target || '' })
+        if (mode === 'adrs') return renderAdrs(model, { anchor: args.target || '' })
+        if (mode === 'arch') {
+          const all = listArchDocs(root)
+          const docs = args.target ? archDocsFor(root, model, args.target) : all
+          return renderArchDocs(docs, { target: args.target, model })
+        }
+        if (mode === 'map') return renderMap(model, { target: args.target || '' })
+        if (mode === 'legacy') {
+          const info = inspectLegacy(root)
+          return [`Legacy ledgers (.internal/):`, ...Object.entries(info.files).map(([f, v]) => `  ${v === null ? '· (absent)' : v.corrupt ? `⛔ ${f} (corrupt)` : `· ${f}: ${JSON.stringify(v)}`}`), info.alreadyMigrated ? `\n已迁移: ${info.marker?.at}（${info.marker?.events} 事件）` : '\n未迁移 → 用 nav_graph mode=legacy json 看全貌，迁移动作用 nav_node layer=migrate'].join('\n')
+        }
+        if (mode === 'json') return j(snapshotOf(model, root, lastReconcile, 'health'))
+        return renderHealth(model, { rootPath: root, opens: model.openCommits, inflight: inflightView(root), locks: listLocks(root), archDocs: listArchDocs(root), logCheck: verifyLog(root), boundary: { enabled: boundaryOn, probe: { verdict: boundaryUsable, reason: boundaryReason } } })
       } catch (e) { return err(e) }
     }
-  })), 'project-nav: query')
+  })), 'project-nav: nav_graph')
 
-  // ---- 2. nav_plan — governance-first: register an action BEFORE changing anything ----
+  // ---- 2. nav_commit — 写：登记改动意图（自动对账 + 六闸） ----
   ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_plan',
-    description: 'Governance-first gate: register a change action (task + plan + scope) BEFORE executing any project change. Returns an ACT-id to begin/done with nav_mark. Refuses scope that collides with the mainline anti-goals (notDoing).',
+    name: 'nav_commit',
+    description: 'Record a change intent BEFORE touching anything: anchor (architecture node) + scope + a one-line architecture reflection (arch=). Runs six gates (anchor/count/scope/mainline/decision/completion). Closure needs no second call: when the scope evidence changes, the next tool call on any session closes it automatically (evidence-based, session-independent). mode=archive voids a stale intent explicitly.',
     parameters: {
       task: { type: 'string', required: true, description: 'One-line task description' },
-      plan: { type: 'string', description: 'Change plan summary derived from governance info' },
+      anchor: { type: 'string', required: true, description: 'Architecture node this task belongs to: feature code / module / project / file path / .internal/arch/*.md' },
+      arch: { type: 'string', description: 'One-line architecture reflection: does this task need an architecture change, or is the architecture sound and the change local?' },
       features: { type: 'string', description: 'Comma-separated feature codes in scope' },
       modules: { type: 'string', description: 'Comma-separated module names in scope' },
-      files: { type: 'string', description: 'Comma-separated file paths in scope' },
-      anchor: { type: 'string', description: 'Architecture-first protocol: the architecture node this task belongs to (feature code / module / file / .internal/arch/*.md). Required — an action with no architecture anchor is a local patch in the making.' },
-      arch: { type: 'string', description: 'One-line architecture reflection: does this task need an architecture change, or is the architecture sound and the change local?' }
+      files: { type: 'string', description: 'Comma-separated file paths / globs in scope' },
+      plan: { type: 'string', description: 'Optional plan summary' },
+      mode: { type: 'string', description: 'open (default) | archive (void an existing intent; needs id + reason)' },
+      id: { type: 'string', description: 'archive mode: ACT-N to void' },
+      reason: { type: 'string', description: 'archive mode: why it is void' }
     },
     output: OUTPUT,
     async execute(args, exec) {
-      const sid = sidOf(exec)
-      const ttl = ttlOf(config)
       try {
-        const scope = {
-          features: splitList(args.features),
-          modules: splitList(args.modules),
-          files: splitList(args.files)
+        const actor = sidOf(exec)
+        if (String(args.mode || '').toLowerCase() === 'archive') {
+          if (!args.id) return 'ERROR: archive 模式需要 id=ACT-N。'
+          const r = await archiveIntent(root, args.id, args.reason, { actor })
+          if (r.status !== 'ok') return r.reason
+          return `✓ 已归档 ${r.archived.id}（${truncate(r.archived.task, 70)}）—— 这是唯一绕过证据的出口：空 scope / 误建 / 方向已废。`
         }
-        if (!scope.features.length && !scope.modules.length && !scope.files.length) {
-          return 'ERROR: scope is empty — provide at least one of features/modules/files so the action has a checkable scope.'
+        if (!args.task) return 'ERROR: nav_commit requires task=.'
+        const res = await commitIntent(root, {
+          task: args.task, anchor: args.anchor, arch: args.arch,
+          plan: args.plan,
+          scope: { features: splitList(args.features), modules: splitList(args.modules), files: splitList(args.files) }
+        }, { actor })
+        const model = loadModel(root)
+        const files = res.materialized?.files || []
+        const docs = archDocsFor(root, model, args.anchor)
+        res.archNote = docs.length
+          ? docs.map((d) => `${d.fresh ? '✓' : '⛔'} ${d.path}`).join(' / ')
+          : '无覆盖此锚点的架构档'
+        const text = renderCommitResult(res, model)
+        if (res.status === 'ok' && files.length) {
+          return `${text}\n\n改动完成后无需再调用本工具收口。若这属于架构级改动，记得 nav_decide。`
         }
-        const vector = loadVector(root)
-        // Mainline gate: refuse if scope collides with explicit anti-goals.
-        const notDoing = (vector.notDoing || '').toLowerCase()
-        if (notDoing) {
-          const tokens = [...scope.features, ...scope.modules].map(x => x.toLowerCase()).filter(x => x.length >= 4)
-          const collide = tokens.find(x => notDoing.includes(x))
-          if (collide) {
-            return `ERROR: scope collides with mainline anti-goal (notDoing: "${vector.notDoing}") via "${collide}". Re-scope the plan or update the vector first (nav_set_vector).`
-          }
+        return text
+      } catch (e) { return err(e) }
+    }
+  })), 'project-nav: nav_commit')
+
+  // ---- 3. nav_decide — 写：架构决策（挂节点，重置计数闸） ----
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 'nav_decide',
+    description: 'Record an architecture decision (ADR) for one anchor. Required whenever a task changes the ARCHITECTURE, and mandatory once the same anchor accumulated three patches — recording it resets that anchor patch counter (the first-principles trigger). Decisions are events, so they travel with the repository.',
+    parameters: {
+      anchor: { type: 'string', required: true, description: 'The architecture node: feature code, module name, project, file path, or .internal/arch/*.md' },
+      reason: { type: 'string', required: true, description: 'Why the architecture must change now (the root need, not the symptom)' },
+      decision: { type: 'string', required: true, description: 'What the architecture becomes after this decision' },
+      impact: { type: 'string', description: 'Affected features/modules/files or cross-project impact' },
+      action: { type: 'string', description: 'Related commit id, e.g. ACT-004 (optional)' }
+    },
+    output: OUTPUT,
+    async execute(args) {
+      try {
+        const model = await refresh()
+        const n = normalizeAnchor(model, args.anchor)
+        if (!n) {
+          return `ERROR: anchor "${args.anchor}" 不是真实架构节点 —— 决策必须挂到节点上（决策天然归属项目，D5）。\n  先 nav_node 登记节点，或锚定 .internal/arch/*.md；用 nav_graph <目标> 确认。`
         }
-        const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
-        const index = loadIndex(root)
-        // ---- 架构先行协议：锚点闸 + 计数闸（scope 无歧义时自动取锚——强限制只留给真正需要架构思考的地方） ----
-        let anchor = normalizePath(String(args.anchor || '').trim())
-        let autoAnchor = ''
-        if (!anchor) {
-          if (scope.features.length === 1) { anchor = scope.features[0]; autoAnchor = '自动取自 scope 的唯一功能 ' + anchor }
-          else if (!scope.features.length && scope.modules.length === 1) { anchor = scope.modules[0]; autoAnchor = '自动取自 scope 的唯一模块 ' + anchor }
-          else if (!scope.features.length && !scope.modules.length && scope.files.length === 1) { anchor = scope.files[0]; autoAnchor = '自动取自 scope 的唯一文件 ' + anchor }
-        }
-        if (!anchor) {
+        const p = pressureFor(model, n.id)
+        const [w] = await appendEvents(root, [{
+          kind: 'decide', anchor: n.id, reason: args.reason, decision: args.decision,
+          impact: args.impact || '', action: args.action || null
+        }])
+        const L = [`✓ ${`ADR-${w.seq}`} 已登记 @ ${w.at}`, `  锚点: ${n.id}`, `  为什么必须改: ${args.reason}`, `  架构变成什么: ${args.decision}`]
+        if (args.impact) L.push(`  影响面: ${args.impact}`)
+        L.push('')
+        L.push(`  该锚点补丁计数已重置（此前 ${p.sinceDecisionCount}/${REPEAT_PATCH_THRESHOLD}${p.sinceDecision ? `，上次决策 ${p.sinceDecision}` : ''}）。`)
+        L.push('  决策是事件 ⇒ 随仓库传播（新 clone 可读全部 ADR，A3）。')
+        return L.join('\n')
+      } catch (e) { return err(e) }
+    }
+  })), 'project-nav: nav_decide')
+
+  // ---- 4. nav_node — 写：节点 upsert / 退役 / 文档工件 / 迁移 ----
+  ctx.effect(() => ctx.tools.register(defineTool({
+    name: 'nav_node',
+    description: 'Create-or-update an architecture node (upsert), register a reference-doc artifact, retire a node with cascade, or run the one-time legacy migration. Existing target = field update; absent target + creation fields = create. Arbitrary fields via set=k=v pairs. layer=migrate folds the legacy .internal ledgers into the event log once.',
+    parameters: {
+      target: { type: 'string', description: 'Feature code / module name / project name / artifact id' },
+      layer: { type: 'string', description: 'project | module | feature | artifact | migrate' },
+      name: { type: 'string', description: 'Human-readable name' },
+      files: { type: 'string', description: 'Feature/artifact: comma-separated file paths (REPLACES the file list)' },
+      features: { type: 'string', description: 'Module: comma-separated feature codes (REPLACES the list; empty = module shell)' },
+      project: { type: 'string', description: 'Module/project attachment (empty string detaches)' },
+      userView: { type: 'string', description: 'Feature: user-perspective description' },
+      systemView: { type: 'string', description: 'Feature: system-perspective description' },
+      path: { type: 'string', description: 'Artifact: file path / directory / URL' },
+      when: { type: 'string', description: 'Artifact: routing rule — which kinds of tasks must consult it' },
+      tags: { type: 'string', description: 'Artifact: comma-separated tags' },
+      set: { type: 'string', description: 'Any extra fields as comma-separated k=v pairs (e.g. set=maturity=live,owner=lk)' },
+      retire: { type: 'boolean', description: 'RETIRE (inverse of upsert) with cascade: feature drops its file mappings + module membership; module drops its project attachment (its features survive); project detaches its modules (they survive unattached). Refused while an in-flight commit references the target.' }
+    },
+    output: OUTPUT,
+    async execute(args) {
+      try {
+        if (String(args.layer || '').toLowerCase() === 'migrate') {
+          const info = inspectLegacy(root)
+          if (!info.files || Object.values(info.files).every((v) => v === null)) return 'Legacy ledgers absent — nothing to migrate.'
+          const r = await migrateLegacy(root)
+          if (r.status === 'already-migrated') return `Already migrated at ${r.marker?.at} (${r.marker?.events} events, seq ${JSON.stringify(r.marker?.seqRange)}).`
+          if (r.status === 'nothing-to-migrate') return 'Legacy ledgers present but contained no entries — nothing migrated.'
           return [
-            'ERROR: nav_plan requires anchor=<架构节点> —— 所有开发动作必须从架构出发。',
-            '  改哪个功能就锚功能码（PN-F01），动哪个模块就锚模块名（PN-M02），修哪个文件就锚文件路径；架构层改动锚 .internal/arch/*.md。',
-            '  先跑 nav_query <目标> 拿到锚点，再登记动作。无锚点的动作 = 还没有架构思考，十有八九会变成局部补丁。',
-            '  arch=<一句话架构判断> 可选但强烈建议：本任务是否需要调整架构？',
-            '  若某目标在架构上**找不到锚点**（nav_query 展不开、对应架构档不存在，或档已过期且与实际差异大），它就不是普通工程任务而是**架构修订任务**：先出整体架构方案（改 .internal/arch/*.md），lk 确认后再派生工程动作。'
-          ].join('\n')
-        }
-        const anchorChk = checkAnchor(index, root, anchor)
-        if (!anchorChk.ok) {
-          return `ERROR: anchor "${anchor}" 不是真实架构节点（${anchorChk.hint}）。先 nav_query 确认，或用 nav_update 直接补登记（upsert：新功能给 files=，新模块给 features=/project=）。`
-        }
-        const archLedger = loadArch(root)
-        const pressure = repeatPressure(archLedger, ledger.actions, anchor)
-        const archNote = []
-        if (!String(args.arch || '').trim()) {
-          archNote.push('⚠ 架构反思缺失（arch= 未填）：动手前请用一句话回答「本任务是否需要调整架构」——需要则先出架构决策（nav_adr），不需要则说明架构为何仍然成立。')
-        }
-        if (pressure.exceeded) {
-          archNote.push(`⛔ 计数闸触发：锚点 ${anchor} 自 ${pressure.sinceDecision || '项目开始'} 以来已有 ${pressure.count} 次补丁（阈值 ${pressure.threshold}）——按第一性原理，先出架构决策（nav_adr anchor="${anchor}"），再判断这次改动是不是又一个局部补丁。`)
-        } else if (pressure.count > 0) {
-          archNote.push(`ℹ 该锚点已有 ${pressure.count} 次补丁（阈值 ${pressure.threshold}）${pressure.sinceDecision ? `，最近架构决策 ${pressure.sinceDecision}` : '，尚无架构决策'}。`)
-        }
-        // B4: scope-vs-index pre-validation at plan time — every scope item must either exist in the
-        // index or be explicitly new. Silent unknowns are how a plan quietly points at the wrong target.
-        // File resolution goes through the index-aware resolvers: a scope written from inside a project
-        // directory (`host/index.js`) resolves to the indexed `project-nav/host/index.js` and must NOT
-        // be reported as unknown — a false alarm here trains the agent to ignore real ones.
-        const unknown = {
-          features: scope.features.filter(f => !index.indexes?.featureToFiles?.[f] && !index.descriptions?.[f]),
-          modules: scope.modules.filter(mod => !index.indexes?.moduleToFeatures?.[mod]),
-          files: scope.files.filter(f => !indexedOwnersOf(root, f, index) && !resolveScopeFile(root, f, index))
-        }
-        const unknownNote = (unknown.features.length || unknown.modules.length || unknown.files.length)
-          ? `\n  ⚠ Scope items not found in index: features=[${unknown.features.join(', ')}] modules=[${unknown.modules.join(', ')}] files=[${unknown.files.join(', ')}]\n    If this task CREATES them, ignore. If it should MODIFY existing ones, the identifier is likely wrong — re-check with nav_query.`
-          : ''
-        // Multi-session gate: the old global "one in_progress action at a time" rule is gone —
-        // a workspace runs as many actions at once as it has DISJOINT scopes. The plan-time job
-        // is to warn the session up front whether its scope will collide at begin time, so it can
-        // split the scope instead of queueing behind another session.
-        const plannedAction = { scope, owner: { sessionId: sid || '' }, createdAt: new Date().toISOString() }
-        const conflicts = checkScopeConflicts(ledger, plannedAction, { index })
-        const conflictNote = conflicts.length
-          ? ['', `⚠ ${conflicts.length} live action(s) overlap YOUR planned scope — nav_mark begin will QUEUE behind them:`, ...describeConflicts(conflicts),
-             '  Better fix: narrow/split the scope (disjoint files ⇒ real parallelism), or wait for the holder to finish with nav_mark done.']
-          : []
-        const busy = sid ? sessionBusyWith(ledger, sid) : null
-        const busyNote = busy
-          ? [`⚠ Your session already holds ${actorLabel(busy)} — finish it (nav_mark done) or abort it (nav_mark abort) before beginning a new one. (Other sessions are unaffected: it is one in_progress per session, not one per workspace.)`]
-          : []
-        // 架构对照（ADR-011 接线②）：本动作的落点/波及对应哪些架构档、还新不新鲜。随 plan 一起
-        // 留痕（archBasis），方案确认时就能看见「这次改动会不会让某一档架构描述失效」。
-        let archStates = []
-        try { archStates = archDocsForScope(index, root, scope) } catch { archStates = [] }
-        const archBasis = {
-          node: anchor,
-          kind: anchorChk.kind,
-          docs: archStates.map(d => ({ path: d.path, scope: d.scope || '', fresh: !!d.ok, drifted: (d.drifted || []).length }))
-        }
-        const action = {
-          id: null,   // assigned INSIDE the ledger lock: concurrent planners must not collide
-          task: args.task,
-          plan: args.plan || '',
-          scope,
-          status: 'planned',
-          anchor,
-          anchorKind: anchorChk.kind,
-          archNote: String(args.arch || '').trim(),
-          archBasis,
-          owner: selfOwner(sid, { cwd: process.cwd() }),
-          lease: null,
-          createdAt: new Date().toISOString(),
-          startedAt: null,
-          completedAt: null
-        }
-        await mutateActions(root, { sessionId: sid, ttlMs: ttl }, (lg) => {
-          lg.actions = lg.actions || []
-          action.id = nextActionId(lg)   // id from the RECONCILED ledger, under the lock
-          lg.actions.push(action)
-        })
-        const warns = []
-        if (!vector.doing) warns.push('⚠ Mainline vector "doing" is empty — set it (nav_set_vector) so drift can be detected.')
-        warns.push(...busyNote, ...conflictNote)
-        // Reference-doc suggestions: consult BEFORE finalizing the plan (方案确认参考).
-        const suggestions = suggestDocs(loadDocs(root), {
-          taskText: `${args.task} ${args.plan || ''}`,
-          projects: Object.keys(index.indexes?.projectToModules || {}),
-          modules: scope.modules
-        }).slice(0, 5)
-        return [
-          `✓ Action ${action.id} registered (planned): ${action.task}`,
-          `  Anchor: ${anchor} (${anchorChk.kind})${autoAnchor ? ` · ${autoAnchor}` : ''}${action.archNote ? ` · arch: ${action.archNote}` : ''}`,
-          ...(archNote.length ? ['', ...archNote] : []),
-          `  Scope: features=[${scope.features.join(', ')}] modules=[${scope.modules.join(', ')}] files=[${scope.files.join(', ')}]`,
-          `  架构对照: 落点 ${anchor} (${anchorChk.kind}) · 波及 ${scope.features.length + scope.modules.length + scope.files.length} 项`,
-          ...renderArchPointer(archStates).split('\n').map(l => '  ' + l),
-          ...(unknownNote ? [unknownNote] : []),
-          ...(suggestions.length ? [
+            `✓ 迁移完成：${r.events} 事件（seq ${r.seqRange[0]}…${r.seqRange[1]}）`,
+            `  归档: ${r.archived.map((a) => a.to).join(', ') || '(none)'}`,
+            ...(r.warnings.length ? ['', '⚠ 警告:', ...r.warnings.map((w) => `  - ${w}`)] : []),
             '',
-            'Reference docs to consult at 方案确认 (read/fetch these before finalizing the plan):',
-            ...suggestions.map(d => `  ${d.id} ${d.title}\n    → ${d.path}\n    when: ${d.when}`)
-          ] : []),
-          ...(warns.length ? ['', ...warns] : []),
-          'Next: consult suggested docs, finalize plan, then nav_mark id="' + action.id + '" action=begin before touching files.'
-        ].join('\n')
-      } catch (e) { return err(e) }
-    }
-  })), 'project-nav: plan')
-
-  // ---- 3. nav_mark — action lifecycle: begin / done / abort ----
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_mark',
-    description: 'Mark an action lifecycle transition: begin (planned→in_progress, BEFORE changes), done (in_progress→done, AFTER changes), abort (give up). The open-action list is the drift signal — never leave actions unfinished. An action whose lease lapsed is "expired": its owner can still begin (re-acquire the lease + retake the fingerprint), done (late close-out) or abort it, so finished work is never stranded.',
-    parameters: {
-      id: { type: 'string', required: true, description: 'Action id from nav_plan (e.g., ACT-001)' },
-      action: { type: 'string', required: true, description: 'One of: begin, done, abort' }
-    },
-    output: OUTPUT,
-    async execute(args, exec) {
-      const sid = sidOf(exec)
-      const ttl = ttlOf(config)
-      try {
-        const index = loadIndex(root)
-        if (args.action === 'begin') {
-          // Multi-session gate: BEGIN is the moment a scope turns into a live lock.
-          // Disjoint scopes start immediately and in parallel; overlapping ones wait
-          // for the holder (or queue behind it). Leases self-heal, so a crashed
-          // session can never wedge the workspace.
-          let waited = 0
-          let result = null
-          for (;;) {
-            result = await mutateActions(root, { sessionId: sid, ttlMs: ttl }, (ledger) => {
-              const a = (ledger.actions || []).find(x => x.id === args.id)
-              if (!a) return { kind: 'no-action' }
-              if (a.owner?.sessionId && sid && a.owner.sessionId !== sid) {
-                return { kind: 'foreign', action: a }
-              }
-              if (a.status === 'in_progress') return { kind: 'reenter', action: a }
-              // A lapsed lease turns the action into "expired" (reconcileActions). Before this,
-              // "expired" was a terminal state with NO entry: such an action could be neither
-              // begun, done nor aborted, so an agent that finished a long task could never record
-              // it. Its owner may re-acquire — the lease is retaken and the fingerprint re-snapshotted.
-              const reacquire = a.status === 'expired'
-              if (a.status !== 'planned' && !reacquire) return { kind: 'bad-state', action: a }
-              const busy = sid ? sessionBusyWith(ledger, sid) : null
-              if (busy) return { kind: 'session-busy', action: a, busy }
-              const conflicts = checkScopeConflicts(ledger, a, { index })
-              if (conflicts.length) {
-                const q = queuePosition(ledger, a, { index })
-                return { kind: 'blocked', action: a, conflicts, q }
-              }
-              a.status = 'in_progress'
-              a.startedAt = new Date().toISOString()
-              a.owner = a.owner && a.owner.sessionId ? a.owner : selfOwner(sid, { cwd: process.cwd() })
-              // Fingerprint the scope now, so `done` can tell whether these files were
-              // touched by somebody else while this action was running.
-              const scopeNow = snapshotScopeFiles(root, index, a.scope || {})
-              a.scopeState = Object.keys(scopeNow).length ? { takenAt: a.startedAt, scope: a.scope || {}, files: scopeNow } : null
-              a.lease = { acquiredAt: a.startedAt, renewedAt: a.startedAt, ttlMs: ttl }
-              return { kind: 'begun', action: a, reacquired: reacquire }
-            })
-            if (result.kind !== 'blocked' || !args.wait) break
-            const budget = args.waitMs === undefined ? 120000 : Number(args.waitMs)
-            if (!(budget > 0) || waited >= budget) break
-            await new Promise(r => setTimeout(r, 2000))
-            waited += 2000
-          }
-          if (result.kind === 'no-action') return `ERROR: no action "${args.id}". Use nav_plan to create one.`
-          if (result.kind === 'foreign') return `ERROR: ${result.action.id} is held by ${actorLabel(result.action)} — a session can only drive its own actions. Create your own action (nav_plan) and begin that one.`
-          if (result.kind === 'reenter') return `✓ ${result.action.id} already in_progress (held by you) — go ahead and change the files.`
-          if (result.kind === 'bad-state') return `ERROR: ${result.action.id} is "${result.action.status}", only "planned" actions can begin.`
-          if (result.kind === 'session-busy') {
-            return [
-              `ERROR: your session already holds ${actorLabel(result.busy)}.`,
-              '  One in_progress action per session: finish it (nav_mark done) or abort it (nav_mark abort) before beginning another.',
-              '  (Other SESSIONS may work in parallel — the lock is per scope, not global.)'
-            ].join('\n')
-          }
-          if (result.kind === 'blocked') {
-            const q = result.q
-            return [
-              `⛔ BLOCKED: ${result.action.id} overlaps ${result.conflicts.length} live action(s)${q.ahead ? ` — queue position ${q.ahead}` : ''}:`,
-              ...describeConflicts(result.conflicts),
-              '',
-              `Your scope: features=[${(result.action.scope?.features || []).join(', ')}] modules=[${(result.action.scope?.modules || []).join(', ')}] files=[${(result.action.scope?.files || []).join(', ')}]`,
-              args.wait
-                ? `  Waited ${Math.round(waited / 1000)}s, still held. Ask again with a longer waitMs, or split/disjoint your scope (nav_plan) so the two can run in parallel.`
-                : '  Retry with wait=true (optionally waitMs=<ms>) to queue until the holder finishes with nav_mark done / abort.',
-              '  Do NOT edit overlapping files while the holder is live — that is exactly how two sessions drift into each other.'
-            ].join('\n')
-          }
-          return [
-            `✓ ${result.action.id} → in_progress (scope locked for session ${sid ? sessionLabel(sid) : 'unknown'})`,
-            ...(result.reacquired ? ['  Re-acquired after a lapsed lease — the scope fingerprint was retaken just now.'] : []),
-            `  Scope: features=[${(result.action.scope?.features || []).join(', ')}] modules=[${(result.action.scope?.modules || []).join(', ')}] files=[${(result.action.scope?.files || []).join(', ')}]`,
-            `  Disjoint from every other live action${waited ? ` (queued ${Math.round(waited / 1000)}s)` : ''} — other sessions keep working in parallel.`,
-            '  Ready: change the files, then nav_mark action=done to close out (and release the scope).'
+            '旧账本已成为只读快照（.internal/legacy/）。之后所有治理数据只写 .internal/events.jsonl。',
+            '下一步: nav_render 重建全部投影。'
           ].join('\n')
         }
-
-        if (args.action === 'done') {
-          let deltaLines = []
-          var scopeDrift = null
-          const res = await mutateActions(root, { sessionId: sid, ttlMs: ttl }, (ledger) => {
-            const a = (ledger.actions || []).find(x => x.id === args.id)
-            if (!a) return { kind: 'no-action' }
-            if (a.owner?.sessionId && sid && a.owner.sessionId !== sid) return { kind: 'foreign', action: a }
-            // "expired" is closable by its owner — a lapsed lease must not strand finished work
-            // (the state machine otherwise had no exit from "expired"). It is recorded as a late
-            // close-out so the ledger stays honest about the gap.
-            const late = a.status === 'expired'
-            if (a.status !== 'in_progress' && !late) return { kind: 'bad-state', action: a }
-            // Did anything move under us? Compare the begin-time snapshot against disk now.
-            if (a.scopeState) {
-              try { scopeDrift = verifyScopeFingerprint(root, index, a.scopeState, a.scope) } catch { scopeDrift = null }
-            }
-            a.status = 'done'
-            a.completedAt = new Date().toISOString()
-            if (late) a.lateCompletion = true
-            a.lease = null
-            if (scopeDrift && !scopeDrift.ok) a.drift = { at: a.completedAt, changed: scopeDrift.changed, removed: scopeDrift.removed, added: scopeDrift.added }
-            // Positive evidence that this action patched NOTHING: the fingerprint proved the scope
-            // is byte-identical. The repeat-patch gate counts *patches*, so a bookkeeping action
-            // (a verification pass) must not push its anchor toward the threshold — false pressure
-            // ends in hollow ADRs, and a diluted decision ledger is the same "alarm fatigue" failure
-            // as a permanent false STALE. No scopeState = no proof, so it keeps counting.
-            if (scopeDrift && a.scopeState
-              && scopeDrift.changed.length === 0 && scopeDrift.removed.length === 0 && scopeDrift.added.length === 0
-              && Object.values(a.scopeState.files || {}).some(v => v && typeof v === 'object')) {
-              // …and at least ONE scoped file must have actually EXISTED at begin. A snapshot whose
-              // every entry is "missing" proves nothing about the work (stale or mistyped scope),
-              // so it stays "no evidence" and keeps counting — the gate prefers over-counting.
-              a.noChange = true
-            }
-            // Delta close-out (OpenSpec archive semantics): surface index deltas the
-            // agent must merge before this change counts as synced.
-            const f2files = index.indexes?.featureToFiles || {}
-            const missingFeatures = (a.scope?.features || []).filter(c => !f2files[c])
-            // Same index-aware resolution as the fingerprint path and the plan-time pre-check:
-            // a literal map lookup here reported already-registered files as "outside the index".
-            const unregisteredFiles = (a.scope?.files || []).filter(f => !indexedOwnersOf(root, f, index))
-            if (missingFeatures.length) deltaLines.push(`  - 未登记功能（需 nav_update 创建）: ${missingFeatures.join(', ')}`)
-            if (unregisteredFiles.length) deltaLines.push(`  - 索引外文件（需登记到所属功能，nav_update field="files" value="..."）: ${unregisteredFiles.join(', ')}`)
-            // Releasing a scope is what unblocks the sessions queued behind it.
-            // 架构先行协议：完结动作按锚点记入补丁账本 + 计数闸复查（结果随返回值带出，不依赖跨作用域副作用）
-            const waiters = (ledger.actions || []).filter(o => o.status === 'planned' && o.id !== a.id && checkScopeConflicts(ledger, o, { index }).length === 0)
-            let pressureNote = ''
-            if (a.anchor) {
-              try {
-                const pr = repeatPressure(loadArch(root), ledger.actions, a.anchor)
-                if (pr.exceeded) {
-                  pressureNote = '  [计数闸] ' + a.anchor + ' 已有 ' + pr.count + ' 次补丁（阈值 ' + pr.threshold + '），最近架构决策 ' + (pr.sinceDecision || '无') + '：这是「同一死胡同反复打补丁」的信号——下次改动前先 nav_adr 出架构决策。'
-                } else if (pr.count >= pr.threshold - 1) {
-                  pressureNote = '  [计数闸] ' + a.anchor + ' 补丁计数 ' + pr.count + '/' + pr.threshold + '，接近升格阈值：先想根因，别拆东墙补西墙。'
-                }
-              } catch (e) { pressureNote = '  ⚠ 架构补丁账本写入失败：' + e.message }
-            } else {
-              pressureNote = '  ⚠ 本动作无锚点（未走锚点闸）——无法计入架构补丁账本。'
-            }
-            return { kind: 'done', action: a, waiters: waiters.map(w => w.id), pressureNote, late }
-          })
-          if (res.kind === 'no-action') return `ERROR: no action "${args.id}". Use nav_plan to create one.`
-          if (res.kind === 'foreign') return `ERROR: ${res.action.id} is held by ${actorLabel(res.action)} — only the holding session can close it. Ask that session to nav_mark done / abort, or let its lease expire (self-heals).`
-          if (res.kind === 'bad-state') return `ERROR: ${res.action.id} is "${res.action.status}", only "in_progress" actions can be done.`
-          const lines = [`✓ ${res.action.id} → done: ${res.action.task}`, 'Delta close-out（合并进索引后本次变更才算同步完成）:']
-          if (res.late) lines.push('  ⚠ Late close-out: this action\'s lease had already expired (another session may have taken the scope meanwhile) — the fingerprint below is informational only.')
-          if (deltaLines.length) {
-            lines.push(...deltaLines, '  修完后跑 nav_sync_docs 对齐 PROJECT.md 功能地图。')
-          } else {
-            lines.push('  ✓ scope 与索引一致，无缺口。跑 nav_sync_docs 对齐 PROJECT.md 功能地图。')
-          }
-          if (scopeDrift && !scopeDrift.ok) {
-            lines.push('  ⚠ Scope drift since begin (files moved under this action — possibly another session):')
-            if (scopeDrift.changed.length) lines.push('    modified: ' + scopeDrift.changed.join(', '))
-            if (scopeDrift.removed.length) lines.push('    vanished: ' + scopeDrift.removed.join(', '))
-            if (scopeDrift.added.length) lines.push('    appeared: ' + scopeDrift.added.join(', '))
-            lines.push('    Review those files before trusting this close-out (recorded on the action as `drift`).')
-          } else if (scopeDrift) {
-            lines.push('  ✓ Scope fingerprint verified: none of the scoped files changed during this action.')
-          }
-          if (res.pressureNote) lines.push(res.pressureNote)
-          // 架构档过期提示（ADR-011 接线③）：本动作改的就是这些档声明覆盖的文件，所以收口这一刻
-          // 正是「架构描述已被代码甩下」的判定点——提示重生成 + 用 nav_arch stamp 刷新指纹。
-          try {
-            const archAfter = archDocsForScope(index, root, res.action.scope || {})
-            if (archAfter.length) {
-              const stale = archAfter.filter(d => !d.ok)
-              lines.push(stale.length
-                ? `  架构档: 本次改动使 ${stale.length}/${archAfter.length} 档过期 → 重生成内容后跑 nav_arch mode="stamp" path="<档>" 刷新指纹：${stale.map(d => d.path).join(', ')}`
-                : `  架构档: ${archAfter.length} 档覆盖本 scope，指纹仍新鲜（本次改动未触及档内声明文件）。`)
-            }
-          } catch { /* 架构档提示永不阻断收口 */ }
-          if (res.waiters.length) lines.push(`  Scope released — ${res.waiters.length} queued action(s) can now begin: ${res.waiters.join(', ')}`)
-          return lines.join('\n')
-        }
-
-        if (args.action === 'abort') {
-          const res = await mutateActions(root, { sessionId: sid, ttlMs: ttl }, (ledger) => {
-            const a = (ledger.actions || []).find(x => x.id === args.id)
-            if (!a) return { kind: 'no-action' }
-            if (a.owner?.sessionId && sid && a.owner.sessionId !== sid) return { kind: 'foreign', action: a }
-            if (a.status !== 'planned' && a.status !== 'in_progress' && a.status !== 'expired') return { kind: 'bad-state', action: a }
-            a.status = 'aborted'
-            a.completedAt = new Date().toISOString()
-            a.lease = null
-            return { kind: 'aborted', action: a }
-          })
-          if (res.kind === 'no-action') return `ERROR: no action "${args.id}". Use nav_plan to create one.`
-          if (res.kind === 'foreign') return `ERROR: ${res.action.id} is held by ${actorLabel(res.action)} — only the holding session can abort it.`
-          if (res.kind === 'bad-state') return `ERROR: ${res.action.id} is already "${res.action.status}".`
-          return `✓ ${res.action.id} → aborted: ${res.action.task}`
-        }
-
-        return 'ERROR: action must be one of: begin, done, abort.'
-      } catch (e) { return err(e) }
-    }
-  })), 'project-nav: mark')
-
-  // ---- 4. nav_update — sync descriptions / file lists ----
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_update',
-    description: 'Create-or-update any index entry (upsert): features, modules, and their fields — the single registration tool. Existing target = update the field; absent target + creation fields = create. Keeps the model-facing registration surface at one tool.',
-    parameters: {
-      target: { type: 'string', required: true, description: 'Feature code or module name' },
-      field: { type: 'string', description: 'UPDATE only: field to set on an existing entry — name, userView, systemView, files (feature only), status, or any custom field' },
-      value: { type: 'string', description: 'UPDATE only: new value (for "files": comma-separated paths)' },
-      name: { type: 'string', description: 'CREATE only: human-readable name' },
-      userView: { type: 'string', description: 'CREATE feature: user perspective description' },
-      systemView: { type: 'string', description: 'CREATE feature: system perspective description' },
-      files: { type: 'string', description: 'CREATE feature: comma-separated file paths' },
-      features: { type: 'string', description: 'CREATE module: comma-separated feature codes belonging to it (empty = module shell); also replaces an existing module list' },
-      project: { type: 'string', description: 'Module: the project to attach it to — for an EXISTING module this re-homes it (the old attachment is removed), and project="" detaches it (unattached modules still appear on the map). CREATE feature/module: the project to attach it to.' },
-      retire: { type: 'boolean', description: 'RETIRE (inverse of upsert): remove this entry from the index and cascade — feature drops its file mappings + module membership, module drops its project attachments (its features survive), project detaches its modules (they survive as unattached). Use when something is genuinely gone from the workspace, so it stops being reported as false STALE. Refused while an open action still references the target. If a module and a project share a name, one call retires one layer — repeat for the next (the reply names what was retired).' }
-    },
-    output: OUTPUT,
-    async execute(args) {
-      try {
-        // RETIRE — the inverse of upsert. The index is the source of truth for what
-        // EXISTS, so a deletion must be expressible; otherwise the entry stays mapped
-        // forever and nav_status reports permanent false STALE (alarm fatigue erodes
-        // the drift signal this plugin exists for).
         if (args.retire) {
-          const idx0 = loadIndex(root)
-          // Single source of truth for "what is this node" — a fileless feature lives
-          // only in a module's membership list, so a forward-only check would call it unknown.
-          if (indexEntryKind(idx0, args.target) === null) {
-            return `ERROR: nothing to retire for "${args.target}" — not a known feature, module or project.\n  Run nav_query ${args.target} to check the identifier (retire never invents an entry).`
+          const model = await refresh()
+          const layer = args.layer ? String(args.layer).toLowerCase() : null
+          const layers = layer ? [layer] : ['feature', 'module', 'project', 'artifact']
+          let hit = null
+          for (const l of layers) {
+            const n = model.nodes.get(`${l}:${key(args.target)}`)
+            if (n && n.status === 'active') { hit = n; break }
           }
-          // Integrity gate: an entry with work in flight must not vanish under it.
-          const targetPath = normalizePath(String(args.target))
-          // Reconcile first: a lapsed lease is not "work in flight". Reading the raw file let a
-          // dead session block retirement until some other tool happened to reconcile the ledger.
-          const ledgerNow = loadActions(root)
-          reconcileActions(ledgerNow, {})
-          const openNow = (ledgerNow.actions || []).filter(a => a.status === 'planned' || a.status === 'in_progress')
-          const blocker = openNow.find(a => {
-            const sc = a.scope || {}
-            return (sc.features || []).includes(args.target)
-              || (sc.modules || []).includes(args.target)
-              || (sc.files || []).map(normalizePath).includes(targetPath)
-          })
-          if (blocker) {
-            return [
-              `ERROR: "${args.target}" is still referenced by open action ${blocker.id} ("${blocker.task}", ${blocker.status}).`,
-              `  Close it first — nav_mark id=${blocker.id} action=done (or abort). Retiring an entry under a live action would orphan that action's scope.`
-            ].join('\n')
-          }
-          const r = await mutateIndex(root, (index) => retireEntry(index, args.target))
-          if (!r) {
-            return `ERROR: "${args.target}" vanished between the check and the retirement — re-run nav_query ${args.target} and retry.`
-          }
-          if (r.kind === 'feature') {
-            return [
-              `✓ Retired feature ${args.target}`,
-              `  file mappings removed: ${r.files.length}${r.files.length ? ' (' + r.files.join(', ') + ')' : ''}`,
-              ...(r.modules.length ? [`  detached from module(s): ${r.modules.join(', ')}`] : [])
-            ].join('\n')
-          }
-          if (r.kind === 'module') {
-            return [
-              `✓ Retired module ${args.target}`,
-              `  project attachments removed: ${r.projects.length ? r.projects.join(', ') : '(none)'}`,
-              `  its ${r.features.length} feature(s) survive — they may belong to another module: ${r.features.length ? r.features.join(', ') : '(none)'}`,
-              '  (to move a surviving module under another project: nav_update target=<module> project=<project>; project="" detaches it)'
-            ].join('\n')
-          }
-          return [
-            `✓ Retired project ${args.target}`,
-            `  its ${r.modules.length} module(s) were detached, NOT deleted: ${r.modules.length ? r.modules.join(', ') : '(none)'}`,
-            '  ⚠ they now surface as "(unattached modules)" on the map — retire or re-home each one so the map stays truthful.'
-          ].join('\n')
+          if (!hit) return `ERROR: nothing to retire for "${args.target}" — 未找到现行节点。\n  用 nav_graph ${args.target} 确认标识；retire 从不凭空造条目。`
+          const ref = model.openCommits.find((c) => (c.scope?.features || []).includes(args.target)
+            || (c.scope?.modules || []).includes(args.target)
+            || (c.files || []).map(key).includes(key(args.target)))
+          if (ref) return `ERROR: "${args.target}" 仍被在途改动 ${ref.id}（${ref.task}）引用。\n  改完文件后它会按证据自动收口；或 nav_commit mode=archive id=${ref.id} 归档后再 retired。`
+          const [w] = await appendEvents(root, [{ kind: 'node', op: 'retire', layer: hit.layer, id: hit.name }])
+          const after = loadModel(root)
+          const casc = hit.layer === 'feature' ? `文件映射 ${(hit.files || []).length} 条随之消失${hit.module ? `，从模块 ${hit.module} 摘除` : ''}`
+            : hit.layer === 'module' ? `项目归属 ${hit.project || '(none)'} 摘除；其 ${(hit.features || []).length} 个功能存活（失去模块）`
+              : `其模块被摘除而非删除（变为 unattached，会在地图上暴露出来）`
+          return [`✓ 已退役 ${hit.layer} ${hit.name}（事件 seq ${w.seq}）`, `  级联: ${casc}`, `  现在 active 节点 ${[...after.nodes.values()].filter((n) => n.status === 'active').length} 个。`, '  退役语义保留是 F3/F8 的要求：能删才不会永远留假 STALE。'].join('\n')
         }
-        return await mutateIndex(root, (index) => {
-        if (index.indexes?.featureToFiles?.[args.target]) {
-          if (args.field === 'files') {
-            const newList = splitList(args.value).map(normalizePath)
-            for (const old of index.indexes.featureToFiles[args.target]) {
-              const arr = index.indexes.fileToFeature[old]
-              if (arr) index.indexes.fileToFeature[old] = arr.filter(c => c !== args.target)
-            }
-            index.indexes.featureToFiles[args.target] = newList
-            for (const f of newList) {
-              if (!index.indexes.fileToFeature[f]) index.indexes.fileToFeature[f] = []
-              if (!index.indexes.fileToFeature[f].includes(args.target)) index.indexes.fileToFeature[f].push(args.target)
-            }
-            return `✓ Feature ${args.target} files replaced: ${newList.length} file(s), mappings rebuilt.`
-          }
-          if (!args.field || args.value === undefined) return 'ERROR: updating an existing entry requires field + value.'
-          if (!index.descriptions) index.descriptions = {}
-          index.descriptions[args.target] = index.descriptions[args.target] || {}
-          index.descriptions[args.target][args.field] = args.value
-          index.descriptions[args.target].lastModified = now_()
-          return `✓ Updated feature ${args.target}: ${args.field} = "${args.value}"`
+
+        // upsert
+        const extra = parseKv(String(args.set || '').split(',').filter(Boolean))
+        const hasArtifactFields = args.path !== undefined || args.when !== undefined || args.tags !== undefined
+        const hasFeatureFields = args.files !== undefined || args.userView !== undefined || args.systemView !== undefined
+        const hasModuleFields = args.features !== undefined || args.project !== undefined
+        let layer = args.layer ? String(args.layer).toLowerCase() : null
+        if (!layer) {
+          const model = loadModel(root)
+          if (model.nodes.get(`module:${key(args.target)}`)) layer = 'module'
+          else if (model.nodes.get(`feature:${key(args.target)}`)) layer = 'feature'
+          else if (model.nodes.get(`artifact:${key(args.target)}`)) layer = 'artifact'
+          else if (model.nodes.get(`project:${key(args.target)}`)) layer = 'project'
+          else if (hasModuleFields) layer = 'module'
+          else if (hasArtifactFields && !hasFeatureFields) layer = 'artifact'
+          else layer = 'feature'
         }
-        if (index.indexes?.moduleToFeatures?.[args.target]) {
-          const notes = []
-          if (args.features !== undefined) {
-            index.indexes.moduleToFeatures[args.target] = splitList(args.features)
-            notes.push(`feature list replaced (${index.indexes.moduleToFeatures[args.target].length} feature(s))`)
-          }
-          // Re-home / detach. Module→project attachment used to be write-once (only the create
-          // branch accepted project=), so retiring a project left its modules unattached with no
-          // way back onto the map — the retire close-out's advice "re-home each one" was
-          // unactionable. project= now MOVES the module, and project="" detaches it.
-          if (args.project !== undefined) {
-            const dest = String(args.project || '').trim()
-            if (!index.indexes.projectToModules) index.indexes.projectToModules = {}
-            const from = Object.keys(index.indexes.projectToModules)
-              .filter(p => (index.indexes.projectToModules[p] || []).includes(args.target))
-            for (const p of from) {
-              index.indexes.projectToModules[p] = index.indexes.projectToModules[p].filter(m => m !== args.target)
-            }
-            if (dest) {
-              if (!index.indexes.projectToModules[dest]) index.indexes.projectToModules[dest] = []
-              if (!index.indexes.projectToModules[dest].includes(args.target)) index.indexes.projectToModules[dest].push(args.target)
-              notes.push(from.length ? `re-homed from ${from.join(', ')} to ${dest}` : `attached to project ${dest}`)
-            } else {
-              notes.push(from.length ? `detached from project ${from.join(', ')} (now unattached)` : 'already unattached')
-            }
-          }
-          if (notes.length) return `✓ Module ${args.target}: ${notes.join('; ')}.`
-          if (!args.field || args.value === undefined) return 'ERROR: updating an existing entry requires field + value (or features= for modules).'
-          if (!index.moduleMeta) index.moduleMeta = {}
-          index.moduleMeta[args.target] = index.moduleMeta[args.target] || {}
-          index.moduleMeta[args.target][args.field] = args.value
-          index.moduleMeta[args.target].lastModified = now_()
-          return `✓ Updated module ${args.target}: ${args.field} = "${args.value}"`
+        if (!args.target) return 'ERROR: nav_node requires target=.'
+        const fields = { ...extra }
+        if (args.name !== undefined) fields.name = args.name
+        if (layer === 'feature') {
+          if (args.files !== undefined) fields.files = splitList(args.files).map(normSlashes)
+          if (args.userView !== undefined) fields.userView = args.userView
+          if (args.systemView !== undefined) fields.systemView = args.systemView
+          if (args.project !== undefined) fields.project = args.project
         }
-        const wantsModule = args.features !== undefined || args.project !== undefined
-        if (wantsModule) {
-          const feats = splitList(args.features)
-          let attachNote = ''
-          if (args.project) {
-            const prevOwner = Object.entries(index.indexes.projectToModules || {})
-              .find(([proj, mods]) => Array.isArray(mods) && mods.includes(args.target) && proj !== args.project)
-            if (prevOwner) attachNote = `\n  ⚠ Module "${args.target}" was already attached to project "${prevOwner[0]}" — it now appears on BOTH projects' maps.`
-            if (!index.indexes.projectToModules[args.project]) index.indexes.projectToModules[args.project] = []
-            if (!index.indexes.projectToModules[args.project].includes(args.target)) index.indexes.projectToModules[args.project].push(args.target)
-          }
-          index.indexes.moduleToFeatures[args.target] = feats
-          if (!index.moduleMeta) index.moduleMeta = {}
-          index.moduleMeta[args.target] = { ...(index.moduleMeta[args.target] || {}), name: args.name || '' }
-          return `✓ Module ${args.target} created: ${feats.length} feature(s)` + (args.project ? `, attached to project ${args.project}` : '') + attachNote
+        if (layer === 'module') {
+          if (args.features !== undefined) fields.features = splitList(args.features)
+          if (args.project !== undefined) fields.project = args.project
         }
-        const fileList = splitList(args.files).map(normalizePath)
-        index.indexes.featureToFiles[args.target] = fileList
-        for (const f of fileList) {
-          if (!index.indexes.fileToFeature[f]) index.indexes.fileToFeature[f] = []
-          if (!index.indexes.fileToFeature[f].includes(args.target)) index.indexes.fileToFeature[f].push(args.target)
+        if (layer === 'artifact') {
+          if (args.path !== undefined) fields.path = args.path
+          if (args.when !== undefined) fields.when = args.when
+          if (args.tags !== undefined) fields.tags = splitList(args.tags)
+          if (args.project !== undefined) fields.project = args.project
         }
-        if (!index.descriptions) index.descriptions = {}
-        index.descriptions[args.target] = {
-          name: args.name || '',
-          userView: args.userView || '',
-          systemView: args.systemView || '',
-          createdAt: now_()
+        if (layer === 'project' && args.path !== undefined) fields.path = args.path
+        if (!Object.keys(fields).length) return 'ERROR: 没有任何字段可写（给 name/files/features/project/path/when/tags 或 set=k=v）。'
+
+        const before = loadModel(root)
+        const prev = before.nodes.get(`${layer}:${key(args.target)}`)
+        const [w] = await appendEvents(root, [{ kind: 'node', op: 'upsert', layer, id: args.target, fields }])
+        const after = loadModel(root)
+        const now = after.nodes.get(`${layer}:${key(args.target)}`)
+        const L = [`✓ ${prev ? 'updated' : 'created'} ${layer} "${args.target}"（事件 seq ${w.seq}）`]
+        L.push(`  字段: ${Object.keys(fields).map((k) => `${k}=${truncate(Array.isArray(fields[k]) ? fields[k].join(',') : fields[k], 80)}`).join(' | ')}`)
+        if (layer === 'feature') {
+          L.push(`  落点: ${(now.files || []).length} 文件${(now.files || []).length ? ` (${now.files.slice(0, 5).join(', ')}${now.files.length > 5 ? '…' : ''})` : ''}`)
+          const unreg = (now.files || []).filter((f) => before.stale.some((s) => s.file === f))
+          if (unreg.length) L.push(`  ⚠ 这些落点在磁盘上不存在（会算作 STALE）: ${unreg.join(', ')}`)
+          if (now.module) L.push(`  模块: ${now.module}`)
         }
-        return `✓ Feature ${args.target} created with ${fileList.length} file(s)\n  ⚠ Not attached to any module yet — nav_update again with target=<module>, features=<codes>, project=<name> to place it on the map.`
-        })
+        if (layer === 'module' && now.project) L.push(`  项目: ${now.project}`)
+        L.push('')
+        L.push('下一步: nav_render 重生成投影（PROJECT.md 标记区 / ARCH-MODEL.md / 地图）。')
+        return L.join('\n')
       } catch (e) { return err(e) }
     }
-  })), 'project-nav: update')
+  })), 'project-nav: nav_node')
 
-  // ---- nav_add_feature / nav_add_module / nav_add_doc were merged into nav_update (upsert)
-  //      and nav_docs in v0.6.0 — the tool face is 10 tools, not 13. ----
-
-  // ---- 5. nav_docs — reference docs: query AND register in one tool ----
+  // ---- 5. nav_render — 写：重生成全部投影（I2） ----
   ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_docs',
-    description: 'Reference docs in one tool: give title+path+when to REGISTER a document (when = routing rule: which kinds of tasks must consult it); otherwise list the registry, or pass task to rank docs for that task. Read/fetch returned paths yourself.',
+    name: 'nav_render',
+    description: 'Regenerate every projection from the model: PROJECT.md marker section (outside the markers is never touched), .internal/ARCH-MODEL.md (the human-readable model snapshot), the HTML map, and optionally an arch doc fingerprint stamp. Renderings are never hand-written — hand edits are overwritten by the next render.',
     parameters: {
-      title: { type: 'string', description: 'REGISTER: document title' },
-      path: { type: 'string', description: 'REGISTER: file path, directory, or URL of the doc' },
-      when: { type: 'string', description: 'REGISTER: task routing rule keywords/phrases' },
-      project: { type: 'string', description: 'REGISTER: project the doc belongs to / QUERY: filter by project code' },
-      tags: { type: 'string', description: 'REGISTER: comma-separated tags' },
-      task: { type: 'string', description: 'QUERY: task description to rank relevant docs for' },
-      tag: { type: 'string', description: 'QUERY: filter by tag' }
+      target: { type: 'string', description: 'Optional: an arch doc path (.internal/arch/*.md) to stamp after you regenerated its content' },
+      path: { type: 'string', description: 'Optional: PROJECT.md path override (default PROJECT.md at the governed root)' }
     },
     output: OUTPUT,
     async execute(args) {
       try {
-        if (args.path || args.title || args.when) {
-          if (!args.path || !args.title || !args.when) return 'ERROR: registering requires title + path + when (when is the task routing rule).'
-          const isUrl = /^https?:\/\//i.test(args.path)
-          // Resolve against the GOVERNED ROOT, not process.cwd(): config.root may point at a
-          // workspace other than the directory the daemon happens to run in, and a root-relative
-          // doc path then failed with a bogus "does not exist".
-          const docFile = isUrl ? args.path : (existsSync(args.path) ? args.path : resolve(root, args.path))
-          if (!isUrl && !existsSync(docFile)) {
-            return `✗ Path does not exist on disk: ${args.path}${docFile === args.path ? '' : ` (also tried ${docFile})`}\n  Doc NOT registered (dead links are rejected).`
-          }
-          return await mutateDocs(root, (registry) => {
-            const dup = (registry.docs || []).find(d => d.path === docFile || d.path === args.path)
-            if (dup) return `Doc already registered: ${dup.id} (${dup.path}).`
-            const doc = { id: nextDocId(registry), title: args.title, path: docFile, when: args.when, project: args.project || '', tags: splitList(args.tags), addedAt: new Date().toISOString() }
-            registry.docs.push(doc)
-            return `✓ Registered ${doc.id} "${doc.title}"\n  → ${doc.path}\n  when: ${doc.when}`
-          })
-        }
-        const registry = loadDocs(root)
-        let docs = registry.docs || []
-        if (args.project) docs = docs.filter(d => d.project === args.project)
-        if (args.tag) docs = docs.filter(d => (d.tags || []).includes(args.tag))
-        if (docs.length === 0) {
-          return 'No reference docs registered. Register one with nav_docs title=... path=... when=... (docs may live anywhere: absolute path, directory or URL).'
-        }
-        if (args.task) {
-          const ranked = suggestDocs(registry, { taskText: args.task, projects: args.project ? [args.project] : [], modules: [] })
-            .filter(d => docs.includes(d))
-          if (ranked.length) {
-            return [`Docs ranked for task "${args.task}":`, ...ranked.map(d => `  ${d.id} ${d.title}\n    → ${d.path}\n    when: ${d.when}`)].join('\n')
-          }
-        }
-        return [`Reference docs (${docs.length}):`, ...docs.map(d => `  ${d.id} ${d.title}${d.project ? ` [${d.project}]` : ''}\n    → ${d.path}\n    when: ${d.when}`)].join('\n')
-      } catch (e) { return err(e) }
-    }
-  })), 'project-nav: docs')
-
-  // ---- 6. nav_map — governance map for humans & agents (text tree / HTML mindmap) ----
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_map',
-    description: 'Render the governance map. format=text: indented project→module→feature→file tree (agent orientation). format=html: self-contained progressive-expansion mindmap file written to disk (human view; open actions marked red, vector in header). `target` narrows BOTH renderers to projects/modules whose name matches. Read-only, generated from the index — never hand-edited.',
-    parameters: {
-      target: { type: 'string', description: 'Narrow the map to projects/modules whose name matches this substring (applies to text and html)' },
-      format: { type: 'string', description: 'text (default) or html' }
-    },
-    output: OUTPUT,
-    async execute(args, exec) {
-      try {
-        const index = loadIndex(root)
-        // Reconcile in memory before rendering (no write from a read-only renderer): an action
-        // whose lease lapsed is NOT a live hold, so it must not paint its scope red while
-        // nav_status — which does reconcile — reports zero live actions. One truth, two views.
-        const ledgerForMap = loadActions(root)
-        reconcileActions(ledgerForMap, { sessionId: sidOf(exec), ttlMs: ttlOf(config) })
-        const S = scopeTargetsOfOpenActions(ledgerForMap)
-        const target = args.target || ''
-        if (args.format === 'html') {
-          const vector = loadVector(root)
-          const safe = String(target || 'workspace').replace(/[^A-Za-z0-9_-]+/g, '_')
-          const outPath = resolve(root, '.internal', `map-${safe}.html`)
-          const html = renderMapHtml(index, {
-            title: `Project Nav Map${target ? ` — ${target}` : ''}`,
-            vector, openActions: S, target
-          })
-          mkdirSync(dirname(outPath), { recursive: true })
-          writeFileSync(outPath, html, 'utf-8')
-          return `✓ Map generated: ${outPath}\nOpen it in a browser to view the progressive-expansion mindmap. Open actions: ${S.ids.length ? S.ids.join('; ') : 'none'}`
-        }
-        return renderTreeText(index, { target, openActions: S })
-      } catch (e) { return err(e) }
-    }
-  })), 'project-nav: map')
-
-  // ---- 7. nav_sync_docs — auto-align PROJECT.md feature map from the index ----
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_sync_docs',
-    description: 'Once-Only alignment: regenerate the auto section (between <!-- nav:auto:start/end --> markers) of PROJECT.md from the index. Hand-written narrative outside the markers is never touched. Run after any index change; the marker section must never be hand-edited.',
-    parameters: {
-      path: { type: 'string', description: 'Target markdown file (default: PROJECT.md at the governed root)' }
-    },
-    output: OUTPUT,
-    async execute(args) {
-      try {
-        // A relative path is resolved against the governed root, not process.cwd() (same rule as nav_docs).
-        const relTarget = args.path || ''
-        const docPath = relTarget
-          ? (existsSync(resolve(relTarget)) ? resolve(relTarget) : resolve(root, relTarget))
-          : resolve(root, 'PROJECT.md')
-        const index = loadIndex(root)
-        const vector = loadVector(root)
-        const section = renderProjectDocSection(index, { vector, arch: loadArch(root) })
-        // The marker replacement is a read-modify-write of a workspace file: two
-        // sessions syncing at once would interleave and corrupt the auto section.
-        return await withFileLock(root, 'PROJECT.md', () => {
-          let content = ''
-          if (existsSync(docPath)) content = readFileSync(docPath, 'utf-8')
-          const START = '<!-- nav:auto:start -->'
-          const END = '<!-- nav:auto:end -->'
-          const s = content.indexOf(START)
-          const e = content.indexOf(END)
-          if (s !== -1 && e !== -1 && e > s) {
-            content = content.slice(0, s) + section + content.slice(e + END.length)
-          } else {
-            content = (content ? content.replace(/\s*$/, '\n\n') : '') + section + '\n'
-          }
-          const tmp = docPath + '.tmp'
-          writeFileSync(tmp, content, 'utf-8')
-          renameSync(tmp, docPath)
-          const nProjects = Object.keys(index.indexes?.projectToModules || {}).length
-          const nFeatures = Object.keys(index.indexes?.featureToFiles || {}).length
-          return `✓ ${docPath} auto-section aligned (source of truth: .internal/nav-index.json)\n  Coverage: ${nProjects} projects, ${nFeatures} features. Narrative content outside markers untouched.`
-        })
-      } catch (e) { return err(e) }
-    }
-  })), 'project-nav: sync-docs')
-
-  // ---- 8. nav_status — health + open actions + cross-session concurrency ----
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_status',
-    description: 'Health snapshot: index totals/coverage, mainline vector, cross-session concurrency (who holds which scope), and the OPEN action list — unfinished actions are the project drift signal. Call this before starting any task.',
-    parameters: {},
-    output: OUTPUT,
-    async execute(_args, exec) {
-      const sid = sidOf(exec)
-      const ttl = ttlOf(config)
-      try {
-        const index = loadIndex(root)
-        const m = index.metadata || {}
-        const vector = loadVector(root)
-        const { ledger } = await loadActionsReconciled(root, { sessionId: sid, ttlMs: ttl })
-        const registry = loadDocs(root)
-        const arch = loadArch(root)
-        // 架构档新鲜度汇总（ADR-011 接线④）：架构层是核心，健康快照就必须报它——此前 4 档里
-        // 过期 2 档而无人知，正是因为「档的状态」不在任何读取面上。
-        let archDocStates = []
-        try { archDocStates = listArchDocs(root) } catch { archDocStates = [] }
-        const staleDocs = archDocStates.filter(d => !d.ok)
-        const decisions = arch.decisions || []
-        const lastDecision = decisions.length ? decisions[decisions.length - 1] : null
-        // The architecture layer is this plugin's core, so the health snapshot has to show it:
-        // how many decisions exist, and which anchors sit at/over the repeat-patch threshold.
-        const hotAnchors = [...new Set((ledger.actions || []).filter(a => a.status === 'done' && a.anchor).map(a => a.anchor))]
-          .map(anchor => ({ anchor, ...repeatPressure(arch, ledger.actions, anchor) }))
-          .filter(p => p.count > 0 && p.count >= p.threshold - 1)
-        const open = (ledger.actions || []).filter(a => a.status === 'planned' || a.status === 'in_progress')
-        const live = open.filter(a => a.status === 'in_progress')
-        const queued = open.filter(a => a.status === 'planned')
-        const recent = (ledger.actions || []).slice(-5)
-        // B1: real disk-drift detection — previously staleEntries/unmappedFiles were dead fields,
-        // so files deleted/renamed on disk were invisible. Now actually probe the filesystem.
-        let stale = []
-        try { stale = findStaleFiles(index, root) } catch { /* drift probe must never break status */ }
-        const age = iso => {
-          const t = Date.parse(iso || '')
-          if (Number.isNaN(t)) return '?'
-          const min = Math.round((Date.now() - t) / 60000)
-          return min < 1 ? 'just started' : (min < 60 ? `${min}min` : `${Math.floor(min / 60)}h${min % 60}min`)
-        }
-        const scopeOf = a => [
-          (a.scope?.features || []).length ? `features=${a.scope.features.join(',')}` : '',
-          (a.scope?.modules || []).length ? `modules=${a.scope.modules.join(',')}` : '',
-          (a.scope?.files || []).length ? `files=${a.scope.files.join(',')}` : ''
-        ].filter(Boolean).join(' ')
-        // Live scope drift: has anything under a running action changed since its begin snapshot?
-        const driftNote = a => {
-          if (!a.scopeState) return ''
+        const model = await refresh()
+        const res = renderAll(root, model)
+        const L = ['✓ 投影已重生成（全部来自模型，零手写）:']
+        L.push(`  PROJECT.md 标记区: ${res.project.markerMissing ? '⛔ 找不到 nav:auto 标记（未写入，Once-Only：绝不猜位置）' : res.project.changed ? `已更新${res.project.created ? '（新建）' : ''}` : '无变化'}`)
+        L.push(`  模型文档: ${res.modelDoc.path}`)
+        L.push(`  地图: ${res.map.path}`)
+        if (args.target) {
           try {
-            const d = verifyScopeFingerprint(root, index, a.scopeState)
-            if (d.ok) return ''
-            const bits = []
-            if (d.changed.length) bits.push('modified: ' + d.changed.join(','))
-            if (d.removed.length) bits.push('vanished: ' + d.removed.join(','))
-            if (d.added.length) bits.push('appeared: ' + d.added.join(','))
-            return '\n    DRIFT since begin -> ' + bits.join(' | ')
-          } catch { return '' }
+            const s = stampArchDoc(root, args.target)
+            L.push(`  架构档指纹: ${s.path} ${s.changed ? `已刷新（声明 ${s.declared} 文件）` : '无变化'}`)
+          } catch (e) {
+            L.push(`  ⛔ 架构档指纹刷新失败: ${e.message}`)
+          }
+        } else {
+          const stale = listArchDocs(root).filter((d) => !d.fresh)
+          if (stale.length) L.push(`  ⚠ ${stale.length} 个架构档过期（重生成内容后 nav_render target=<档> 刷新指纹）: ${stale.map((d) => d.path).join(', ')}`)
         }
-        const concurrency = [
-          `Concurrency: ${live.length} live action(s) holding scope locks`,
-          ...live.map(a => `  ${actorLabel(a)}\n    running ${age(a.lease?.renewedAt || a.startedAt)}${sid && a.owner?.sessionId === sid ? ' (yours)' : ''} · scope: ${scopeOf(a) || '(empty)'}\n    lease until ${a.lease?.renewedAt ? new Date(Date.parse(a.lease.renewedAt) + (a.lease.ttlMs || ttl)).toISOString() : '(none — will expire on next read)'}` + driftNote(a)),
-          ...(queued.length ? [`  queued (planned, holding nothing yet): ${queued.map(a => `${a.id}${a.owner?.label ? ` by ${a.owner.label}` : ''}`).join('; ')}`] : [])
-        ]
-        const lines = [
-          'Project Nav Status',
-          `Root: ${root}`,
-          `Index age: ${getIndexAge(root) || 'unknown'}`,
-          `Coverage: ${m.coverage || 'unknown'}`,
-          `Totals: ${m.totalFeatures ?? '?'} features, ${m.totalFiles ?? '?'} files, ${m.totalModules ?? '?'} modules, ${m.totalProjects ?? '?'} projects`,
-          '',
-          'Mainline Vector:',
-          vector.doing ? `  Doing: ${vector.doing}` : '  Doing: (empty)',
-          vector.next ? `  Next: ${vector.next}` : '  Next: (empty)',
-          vector.notDoing ? `  Not Doing: ${vector.notDoing}` : '',
-          vector.exitCondition ? `  Exit: ${vector.exitCondition}` : '',
-          '',
-          'Concurrency (multi-session):',
-          ...concurrency,
-          '',
-          open.length
-            ? `OPEN Actions (${open.length}) — drift signal, finish or abort:\n${open.map(a => `  ${a.id} [${a.status}] ${a.task}${a.owner?.label ? ` — ${a.owner.label}` : ''}`).join('\n')}`
-            : 'Open Actions: none',
-          stale.length
-            ? `STALE Files (${stale.length}) — in index but missing on disk, update or re-register:\n${stale.map(s => `  ${s}`).join('\n')}`
-            : 'Stale files: none (index matches disk)',
-          `Architecture: ${decisions.length} decision(s)${lastDecision ? `, last ${lastDecision.id} on ${lastDecision.anchor}` : ' (none recorded yet)'}${hotAnchors.length ? ` — ⚠ near/over the repeat-patch gate: ${hotAnchors.map(p => `${p.anchor} ${p.count}/${p.threshold}`).join(', ')}` : ''}`,
-          `Reference docs: ${(registry.docs || []).length} registered (nav_docs to list or register)`,
-          archDocStates.length
-            ? `Arch Docs: ${archDocStates.length} 档（新鲜 ${archDocStates.length - staleDocs.length} / 过期 ${staleDocs.length}）${staleDocs.length ? ' — 重生成后 nav_arch mode="stamp" 刷新: ' + staleDocs.map(d => d.path).join(', ') : ''}`
-            : 'Arch Docs: 无（.internal/arch/ 为空 — 建议先出 L1 总览，再谈按指纹重生成）',
-          '',
-          recent.length ? `Recent actions:\n${recent.map(a => `  ${a.id} [${a.status}] ${a.task}`).join('\n')}` : ''
-        ].filter(Boolean)
-        return lines.join('\n')
+        if (res.project.markerMissing) L.push('  → 目标 md 里加上 <!-- nav:auto:start --> / <!-- nav:auto:end --> 两个标记后重跑。')
+        return L.join('\n')
       } catch (e) { return err(e) }
     }
-  })), 'project-nav: status')
+  })), 'project-nav: nav_render')
 
-  // ---- 9. nav_set_vector — mainline vector (vector.json is the source of truth) ----
+  // ---- 6. nav_set — 写：根元数据 / 主线向量 ----
   ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_set_vector',
-    description: 'Set the mainline navigation vector (doing / next / notDoing / exitCondition). Omitted fields keep current values. Read fresh from disk by every tool call, so changes take effect immediately.',
+    name: 'nav_set',
+    description: 'Set the mainline vector (doing / next / notDoing / exitCondition). Omitted fields keep their current value. The vector is an event, so it is versioned with the repository and read fresh by every tool call.',
     parameters: {
       doing: { type: 'string', description: 'Current focus' },
       next: { type: 'string', description: 'Next action' },
-      notDoing: { type: 'string', description: 'Explicit anti-goals' },
+      notDoing: { type: 'string', description: 'Explicit anti-goals (nav_commit rejects scope that collides with this)' },
       exit: { type: 'string', description: 'Completion criteria' }
     },
     output: OUTPUT,
     async execute(args) {
       try {
-        const next = await mutateVector(root, (v) => ({
-          doing: args.doing ?? v.doing ?? '',
-          next: args.next ?? v.next ?? '',
-          notDoing: args.notDoing ?? v.notDoing ?? '',
-          exitCondition: args.exit ?? v.exitCondition ?? ''
-        }))
-        return [
-          '✓ Mainline vector updated:',
-          `  Doing: ${next.doing}`,
-          `  Next: ${next.next}`,
-          `  Not Doing: ${next.notDoing}`,
-          `  Exit: ${next.exitCondition}`
-        ].join('\n')
-      } catch (e) { return err(e) }
-    }
-  })), 'project-nav: set-vector')
-  // ---- 10. nav_adr — 架构层改动留痕（架构先行协议的第 3 个闸门） ----
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_adr',
-    description: 'Architecture-first protocol: record an architecture decision for one anchor (feature / module / file / arch-doc). Required whenever a task changes the ARCHITECTURE (new module, scope move, interface change) and mandatory once the same anchor has accumulated three patches without one — otherwise local patches keep curing symptoms inside the same dead end. Recording a decision resets that anchor patch counter (the first-principles trigger).',
-    parameters: {
-      anchor: { type: 'string', required: true, description: 'The architecture node this decision belongs to: feature code, module name, file path, or .internal/arch/*.md doc' },
-      reason: { type: 'string', required: true, description: 'Why the architecture must change now (the root need, not the symptom)' },
-      decision: { type: 'string', required: true, description: 'What the architecture becomes after this decision' },
-      impact: { type: 'string', description: 'Affected features/modules/files or cross-project impact' },
-      action: { type: 'string', description: 'Related ledger action id, e.g. ACT-004 (optional)' }
-    },
-    output: OUTPUT,
-    async execute(args, exec) {
-      const sid = sidOf(exec)
-      try {
-        const index = loadIndex(root)
-        const chk = checkAnchor(index, root, args.anchor)
-        if (!chk.ok) {
-          return [
-            `ERROR: anchor "${args.anchor}" is not an architecture node (${chk.hint}).`,
-            '  Register the node first with nav_update (upsert), or anchor to an arch doc under .internal/arch/ — an unanchored ADR is not traceable.'
-          ].join('\n')
+        const model = await refresh()
+        const prev = model.vector || {}
+        const vector = {
+          doing: args.doing !== undefined ? args.doing : (prev.doing || ''),
+          next: args.next !== undefined ? args.next : (prev.next || ''),
+          notDoing: args.notDoing !== undefined ? args.notDoing : (prev.notDoing || ''),
+          exitCondition: args.exit !== undefined ? args.exit : (prev.exitCondition || '')
         }
-        const archBefore = loadArch(root)
-        const pressure = repeatPressure(archBefore, (loadActions(root).actions || []), args.anchor)
-        // "First decision" must mean FIRST DECISION, not "no patches had piled up":
-        // pressure.count === 0 with prior ADRs on this anchor used to print the former.
-        const prior = lastDecisionFor(archBefore, args.anchor)
-        // Allocate the ADR id INSIDE the lock: two concurrent decisions must not
-        // both read ADR-007 and both write ADR-007 (same class of bug as ACT ids).
-        const d = await mutateArch(root, (arch) => {
-          const decision = {
-            id: nextDecisionId(arch),
-            anchor: normalizePath(String(args.anchor)),
-            anchorKind: chk.kind,
-            reason: args.reason,
-            decision: args.decision,
-            impact: args.impact || '',
-            action: args.action || '',
-            session: sid || '',
-            createdAt: new Date().toISOString()
-          }
-          arch.decisions.push(decision)
-          return decision
-        })
+        const [w] = await appendEvents(root, [{ kind: 'set', vector }])
+        const after = loadModel(root)
+        const changed = Object.keys(vector).filter((k) => String(vector[k]) !== String(prev[k] ?? '') && !(k === 'exitCondition' && args.exit === undefined))
         return [
-          `✓ ${d.id} recorded for anchor ${d.anchor} (${d.anchorKind})`,
-          `  reason:   ${d.reason}`,
-          `  decision: ${d.decision}`,
-          ...(d.impact ? [`  impact:   ${d.impact}`] : []),
-          pressure.count > 0
-            ? `  Patch counter reset: ${pressure.count} patch(es) had accumulated on this anchor — those were local fixes; this is the architecture-level answer.`
-            : (prior
-              ? `  No patches had accumulated since ${prior.id} — recorded deliberately, not forced by the gate.`
-              : '  First decision on this anchor.')
-        ].join('\n')
+          `✓ 主线向量已更新（事件 seq ${w.seq}）`,
+          `  doing: ${vector.doing || '(unset)'}`,
+          `  next: ${vector.next || '(unset)'}`,
+          `  notDoing: ${vector.notDoing || '(unset)'}`,
+          `  exitCondition: ${vector.exitCondition || '(unset)'}`,
+          changed.length ? '' : '  (无字段变化)',
+          changed.length ? '下一步: nav_render 把它写进 PROJECT.md 自动区。' : ''
+        ].filter(Boolean).join('\n')
       } catch (e) { return err(e) }
     }
-  })), 'project-nav: adr')
+  })), 'project-nav: nav_set')
 
-  // ---- 11. nav_arch — 架构文档层：过期管理 / 覆盖校验 / 指纹刷新 ----
-  // 架构档（.internal/arch/*.md + 头部 arch-cache 指纹块）是项目的核心维护文档，也是 agent 开发前
-  // 的主地图。这个工具把「档在哪、还新鲜吗、覆盖不覆盖这个目标」从手工 mtime 比对变成一次调用；
-  // 除 stamp 外全程只读，且从不改写正文（正文 = arch-view 的 L2 读码提炼产出）。
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_arch',
-    description: 'Architecture document layer: list = every .internal/arch doc with fingerprint freshness (expiry management) | check = which docs cover one target (feature/module/file) and whether they are fresh | stamp = refresh one doc\'s arch-cache header from its declared file list AFTER you regenerate its content. Read-only except stamp; rendering stays a projection outside the plugin.',
-    parameters: {
-      mode: { type: 'string', description: 'list (default) | check | stamp' },
-      target: { type: 'string', description: 'check mode: feature code / module / file path / arch doc path' },
-      path: { type: 'string', description: 'stamp mode: arch doc path, e.g. .internal/arch/project-nav-overview.md' }
-    },
-    output: OUTPUT,
-    async execute(args) {
-      try {
-        const mode = String(args.mode || 'list').trim().toLowerCase()
-        if (mode === 'stamp') {
-          if (!args.path) return 'ERROR: stamp 需要 path=<架构档路径>（如 .internal/arch/project-nav-overview.md）。'
-          const rel = normalizePath(String(args.path).trim())
-          const res = await withFileLock(root, 'arch-doc:' + rel, () => stampArchDoc(root, rel))
-          if (!res.ok) return `ERROR: stamp 失败 —— ${res.reason}`
-          return [
-            `✓ 指纹已刷新: ${res.path}`,
-            `  generated: ${res.generated}`,
-            `  files: ${res.files} 项（按档内已声明的列表重取 mtime/size；正文未改动）`,
-            ...res.rows.map(r => `    - ${r.path}  ${r.size}B  ${r.mtime}`)
-          ].join('\n')
-        }
-        if (mode === 'check') {
-          if (!args.target) return 'ERROR: check 需要 target=<功能码/模块/文件/档路径>。'
-          const t = String(args.target).trim()
-          let states = []
-          try { states = archDocsFor(loadIndex(root), root, t) } catch (e) { return `ERROR: 覆盖判定失败 —— ${e.message}` }
-          const stale = states.filter(s => !s.ok)
-          const lines = [`架构覆盖检查: ${t}`, '  ' + renderArchPointer(states).replace(/\n\s*/g, '\n  ')]
-          if (!states.length) lines.push('  → 无覆盖档：这个目标目前无法从架构层解释——要么补 L1（模块级总览），要么它本身就是架构修订任务。')
-          else if (stale.length) lines.push('  → ⛔ 过期/未纳管的档视为设计已漂移，不可当现行事实读：重生成内容 → nav_arch mode="stamp" 刷新指纹，再据此开发。')
-          else lines.push('  → 可用：档与它所描述的文件一致，可据此开工。')
-          return lines.join('\n')
-        }
-        if (mode !== 'list') return `ERROR: mode 只支持 list / check / stamp（收到 "${args.mode}"）。`
-        const docs = listArchDocs(root)
-        if (!docs.length) {
-          return '架构档: 0 档（.internal/arch/ 为空）——先出 L1 总览（arch-view 契约：arch-cache 指纹块 + 依赖图 + 索引外告警），此后每档按指纹过期重生成。'
-        }
-        const fresh = docs.filter(d => d.ok)
-        const stale = docs.filter(d => !d.ok)
-        const tzDocs = stale.filter(d => d.tzOnly)
-        const realStale = stale.filter(d => !d.tzOnly)
-        const flagOf = d => (d.ok ? '✓ 新鲜' : (d.noHeader ? '⚠ 无指纹头' : (d.tzOnly ? '⚠ 指纹写法不符' : '⛔ 过期')))
-        const fmt = d => [
-          `  ${flagOf(d)}  ${d.path}`,
-          `      project=${d.project || '?'} · scope=${d.scope || '?'} · generated=${d.generated || '?'} · files=${(d.files || []).length}`,
-          ...(d.ok ? [] : ((d.drifted || []).length ? d.drifted.slice(0, 5).map(x => `      漂移: ${x}`) : [`      ${d.reason || ''}`]))
-        ].join('\n')
-        return [
-          `架构档: ${docs.length} 档（新鲜 ${fresh.length} / 过期 ${realStale.length}${tzDocs.length ? ` / 写法不符 ${tzDocs.length}` : ''}）`,
-          ...docs.map(fmt),
-          ...(tzDocs.length ? ['', '只需校正指纹（内容与代码一致）: ' + tzDocs.map(d => `nav_arch mode="stamp" path="${d.path}"`).join(' | ')] : []),
-          ...(realStale.length ? ['', '需重生成内容后再刷新指纹: ' + realStale.map(d => `nav_arch mode="stamp" path="${d.path}"`).join(' | ')] : [])
-        ].join('\n')
-      } catch (e) { return err(e) }
-    }
-  })), 'project-nav: arch')
+  // 启动自检：事件流 seq 连续性看一眼，坏了就在日志里说（不阻塞装配）。
+  try {
+    const check = verifyLog(root)
+    if (!check.ok && ctx.logger?.warn) ctx.logger.warn(`[project-nav] event log has ${check.problems.length} problem(s): ${check.problems.slice(0, 3).join(' | ')}`)
+  } catch { /* 首次运行没有事件流是正常态 */ }
 }
 
-function now_() {
-  return new Date().toISOString()
+// ---- 边界判定：实现在 core/boundary.js（纯函数，可独立测试；host 只调用） ----
+export { governedWorkspaceOf } from '../core/boundary.js'
+
+
+// ---- nav_graph 的 JSON 快照（只取叶子字段，绝不序列化活对象） ----
+function snapshotOf(model, rootPath, rec, mode, target) {
+  const cv = coverage(model)
+  return {
+    root: rootPath,
+    builtAt: model.builtAt,
+    events: model.eventCount,
+    vector: {
+      doing: model.vector?.doing || '', next: model.vector?.next || '',
+      notDoing: model.vector?.notDoing || '', exitCondition: model.vector?.exitCondition || ''
+    },
+    coverage: cv,
+    openCommits: model.openCommits.map((c) => ({ id: c.id, task: c.task, anchor: c.anchor, files: (c.files || []).length, at: c.at })),
+    stale: model.stale.slice(0, 50),
+    unregistered: model.unregistered.slice(0, 50),
+    decisions: model.decisions.map((d) => ({ id: d.id, anchor: d.anchor, at: d.at, decision: truncate(d.decision, 200) })),
+    pressure: [...model.patchPressure.values()].filter((p) => p.sinceDecisionCount >= 1),
+    lastReconcile: { closed: rec.closed.map((c) => c.commit.id), stillOpen: rec.stillOpen.map((c) => c.id) },
+    logProblems: model.log.slice(0, 20),
+    mode, target: target || null
+  }
 }

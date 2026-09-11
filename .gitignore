@@ -1,7 +1,25 @@
+# 三层数据面（ARCHITECTURE.md §2）
+# 唯一事实源：必须进版本控制，否则 A3「决策与落点随仓库传播」不成立
+!.internal/
+.internal/*
+!.internal/events.jsonl
+# 人类可读的模型快照（渲染物，进仓以便 git diff 审查）
+!.internal/ARCH-MODEL.md
+
+# 运行时面：可丢弃、不进版本控制（I3：删掉它治理零损失）
+.internal/runtime/
+# 旧账本只读快照：迁移后不再读写，随仓库留档
+.internal/legacy/
+
 node_modules/
 *.tgz
 .workbuddy/
 .internal-bak*/
-.internal/
 .dsh-vision-toolkit/
 *.tgz.superseded*
+# 本仓自举/临时产物
+.npm-cache/
+.migrate-sim/
+.install-sim/
+.verify-tmp/
+.git-commit-msg.tmp

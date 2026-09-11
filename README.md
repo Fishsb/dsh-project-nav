@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.8.0-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.9.0-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-%3E%3D0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -17,136 +17,158 @@
 
 ---
 
-## 为什么需要
+> **核心理念（唯一上位约束）**
+>
+> **所有开发动作必须从架构出发。**
+> 架构不出错，开发过程中出现一点问题也只是局部小问题；反之，架构错了，局部补得再好也是在错误的骨架上堆砌。
 
-AI coding 的长期项目会漂移：文件越堆越多却没有功能映射、方案失去范围约束、文档烂尾、模型在架构空白处反复打补丁。
+**v0.9.0 是从架构出发的一次性重写**：设计契约见 [`ARCHITECTURE.md`](./ARCHITECTURE.md)。
+旧的补丁式演进（11 个工具 / 5 个并列账本 / begin·done 生命周期）整体放弃——不是收敛，是换骨架。
+**决策可丢弃，事实（F1–F9）不可丢弃**：它们全部变成新架构的需求。
 
-**project-nav** 在 DSH 内闭合这个循环：agent 自己维护一套工作区级治理层——改任何东西之前先过架构门与范围门，改完之后收口、对齐、不留悬空状态。
+---
 
-## 🧭 设计原则：以架构为核心，其余为辅助（v0.6.0 收敛）
+## 1. 一句话架构
 
-- **核心（不可省）**：索引（架构真相）+ **锚点闸**（动手前先做架构思考）+ **ADR**（架构决策留痕）+ **计数闸**（同一锚点反复补丁 → 强制回架构层）。
-- **辅助（够用即止）**：并发租约与排队、scope 文件指纹、文档自动派生、参考文档路由、地图渲染——它们服务核心，不另立门槛。
-- **复杂度预算（唯一裁剪标准：模型是否必须多读/多记/多遵循）**：
-  - 能推导的**不另建账本** —— 补丁 = 带锚点的 `done` 动作，`nav-patches.json` 已废除；
-  - 能合并的**不另开工具** —— 功能/模块注册与字段更新合并为 `nav_update`（upsert），参考文档注册与检索合并为 `nav_docs`；
-  - 能推断的**不强制参数** —— 单目标 scope 自动取锚，只有多目标/歧义时才要求 `anchor=`。
-- **为什么**：治理插件本身也是被模型读的代码。太复杂 → 不聪明的模型读不了也遵循不了；聪明的模型不需要过多强限制。
+> **一条 append-only 事件流（唯一事实源）+ 一个由它折叠出的架构模型（可丢弃缓存）+ 一层渲染投影；闸门是对模型的查询，产出是模型的重渲染。**
 
-## ✨ 核心能力
-
-- 🗺️ **双向治理地图**：项目→模块→功能→文件 四维交叉索引，单一数据真身，一张图看清全部结构
-- 🏛️ **架构文档层接入治理循环（v0.8.0）**：架构档（`.internal/arch/*.md`，头部带 `arch-cache` 指纹块：声明本档读的是哪些文件的哪一版）不再只靠 agent 自觉——`nav_query` 查询目标时附**架构档指针行**（新鲜 / 过期 / 无档软提示）、`nav_plan` 记 `archBasis` 并输出**架构对照**段（落点 / 波及 / 状态）、`nav_mark done` 报**本次改动使哪几档过期**、`nav_status` 汇总全档新鲜度、`nav_arch` 负责列出 / 覆盖校验 / 指纹刷新。**渲染（SVG/HTML 投影）不进插件**：投影零维护，仍由配套 arch-view 技能侧脚本产出；本仓库只负责「档在哪、还新鲜吗、覆盖不覆盖这个目标」三件可机检的事
-- 🏛️ **架构先行协议（v0.5.0 起）**：任务必须锚定架构节点才入账——单目标 scope 自动取锚，多目标必须显式 `anchor=`；同锚点自最近架构决策以来 ≥3 次**补丁** → **计数闸**强制回架构层；`nav_adr` 记录架构决策并重置计数。**「补丁」只认真的动过东西**（v0.7.3）：done 时指纹证明 scope 内文件一个都没变的验证/记账动作不计入——否则会逼出没有架构内容的 ADR，ADR 通胀后核心决策账本就成噪音
-- 🎯 **治理事务环**：`nav_plan` → `begin` → 改动 → `done`（abort 兜底），未完成动作 = 漂移信号，地图标红；**每会话同时只允许一个 in_progress**
-- 🧵 **多会话并发（v0.3.0）**：锁的粒度是 **scope 而不是工作区**——不相交的会话真并行干活，只有 scope 相交（同功能 / 同模块 / 同文件 / 索引派生出的同一文件）才排队；`nav_mark begin wait=true` 可阻塞等待，崩溃会话的租约自动过期自愈，账本带跨进程文件锁（并发立项不再丢动作）
-- 🔍 **scope 文件指纹（v0.4.0）**：`begin` 记录 scope 内每个文件的 size/mtime/sha1，`done` 比对并报 `⚠ Scope drift`（被改/被删/新出现三类），运行中动作由 `nav_status` 实时显示漂移——租约防「同时开工」，指纹防「开工期间被别人动过」。**v0.7.4 修正**：按功能/模块声明 scope 时不再误删 workspace 相对的索引键（此前 12/18 个功能的指纹恒为空 = 静默失效），且「本来就不存在的文件」不再被误报 vanished
-- 🔒 **共享状态写入串行化（v0.7.0）**：索引 / 参考文档 / 向量 / 架构决策账本 / `PROJECT.md` 的每个读改写都在**按目标文件的互斥锁**下进行（锁目录 `.internal/locks/`）——两个会话同时写不再互相覆盖（这正是此前索引被反复回退的根因）；锁等待异步化（不再阻塞事件循环），持有者崩溃时按锁文件 mtime 破锁
-- 🗑️ **索引退役语义（v0.7.1）**：`nav_update retire=true` 是 upsert 的逆操作——被删除的功能/模块/项目可以从索引里**真正退役**（级联清理双向映射）。没有它，索引只能增不能删，任何删除都留下**永久假 STALE**，而假警报会让模型学会忽略漂移信号（本工作区实测：`nav_status` 从 7 条假警报回到 `Stale files: none`）
-- 🧭 **主线向量带牙齿**：doing / next / notDoing / exitCondition——方案撞上"不做什么"**直接拒绝立项**
-- 📚 **参考文档地基**：按 when 路由规则注册，方案确认时自动推荐该读什么
-- 🔄 **Once-Only / SSOT**：手写 `PROJECT.md` 叙事不动，`nav:auto` 标记区自动派生
-- 🌳 **渐进式导图**：自包含离线 HTML 思维导图，无 CDN、双击即开
-- 🩺 **磁盘漂移探测**：索引里有、磁盘上没有（STALE）一览无余，双路径形态兼容
-
-## 🔧 工具一览（11 个，单一职责）
-
-| 工具 | 作用 |
-|------|------|
-| `nav_query` | 查结构/模块/功能，改动前理解范围（范围门禁 + 主线告警 + **跨会话占用提示** + **架构档指针行**） |
-| `nav_plan` | 治理优先门禁：登记动作（**锚点闸** + 范围预校验 + 反目标硬拦截 + **计数闸** + **架构对照段与 archBasis**） |
-| `nav_mark` | 事务生命周期 begin / done / abort（begin 含 scope 冲突闸 + 租约 + 排队；done 报 scope 漂移、计数压力与**本次改动使哪几档架构档过期**）。**租约过期不是死路**（v0.7.4）：其 owner 仍可 `begin` 重取锁并重拍指纹、`done` 迟收口（记 `lateCompletion`）或 `abort` |
-| `nav_adr` | **架构决策记录**（锚点 + 触发原因 + 决策 + 影响面）；登记即重置该锚点补丁计数 |
-| `nav_arch` | **架构文档层**：`list`（全档新鲜度 / 过期管理）、`check`（某目标由哪些档覆盖、是否新鲜）、`stamp`（按档内已声明的 files 列表重取指纹——内容由 agent 重生成，指纹由工具写）。除 stamp 外全程只读，从不改写正文 |
-| `nav_update` | **唯一登记口（upsert 与退役）**：更新已存在条目，或直接创建功能/模块（新功能给 `files=`，新模块给 `features=`/`project=`）；条目真正从工作区消失时用 `retire=true` 退役并级联（功能清双向文件映射 + 模块成员；模块摘除项目挂载但保留其功能；项目摘除模块但保留之），在飞动作仍引用该目标时拒绝。**模块可迁移**（v0.7.4）：已有模块给 `project=` 即换挂载，`project=""` 摘除（退役项目后「re-home」不再是空话） |
-| `nav_docs` | 参考文档：给 `title`+`path`+`when` 即登记（`when` 是路由规则），否则列库 / 按 `task` 排序推荐。相对路径按**被治理 root** 解析（v0.7.4），不受进程 cwd 影响 |
-| `nav_map` | 治理地图：`text`（agent 导航）/ `html`（人看导图）；`target` 按名称收窄（v0.7.4 起 text 与 html 一致生效，原 `level` 死参数已移除） |
-| `nav_sync_docs` | 自动对齐 PROJECT.md（标记区派生：功能地图 + 主线向量 + **架构决策**） |
-| `nav_status` | 健康快照：覆盖度 + 未完成动作 + STALE 文件 + **跨会话并发视图** + **架构决策与计数闸压力** + **架构档新鲜度汇总**（v0.8.0） |
-| `nav_set_vector` | 设置主线向量 |
-
-## 🔄 治理循环
-
-```mermaid
-flowchart LR
-  Q[nav_query<br>影响面 + 门禁] --> P[nav_plan<br>登记 ACT-xxx]
-  P --> C((改代码))
-  C --> M[nav_mark done<br>收口]
-  M --> S[nav_sync_docs<br>文档对齐]
-  S --> Q
-  ST[nav_status<br>漂移探测] -.-> P
+```
+   ┌───────────────────────────────────────────────────────────────┐
+   │ ① 事件流  .internal/events.jsonl    ← 唯一事实源（append-only） │
+   │   commit{锚点,scope,arch=,phase} · decide{ADR} · node{} · set{}│
+   └───────────────────────────┬───────────────────────────────────┘
+                               │ 纯函数折叠（I1）
+   ┌───────────────────────────▼───────────────────────────────────┐
+   │ ② 模型  .internal/runtime/arch-model.json   ← 可丢弃（I3）      │
+   │   节点(项目/模块/功能/工件) + 边 + 证据 + 主线向量 + 决策 + 补丁计数│
+   └───────────────────────────┬───────────────────────────────────┘
+                               │ 全部派生（I2）
+   ┌───────────┬───────────────┼───────────────┬──────────────────┐
+   ▼           ▼               ▼               ▼                  ▼
+ nav_graph  PROJECT.md      ARCH-MODEL.md   地图 HTML        架构档指纹
+ （闸门=查询）（渲染）        （渲染）        （渲染）          （机检）
 ```
 
-## 🏛️ 三层模型
+**三条不变式（可机检）**
 
-| 层 | 载体 | 读者 |
-|----|------|------|
-| 索引层 | `<root>/.internal/nav-index.json`（四维映射 + 原子写） | 机器（工具查询） |
-| 架构文档层（生态配合） | `<root>/.internal/arch/*.md`（由配套 arch-view 技能维护，不在本包） | agent + 人 |
-| 渲染层 | nav_map HTML（本包生成） | 人（只看不写回） |
+| | 不变式 | 验法 |
+|---|---|---|
+| **I1** | 单源：模型每条属性都能由「事件流 + 磁盘实况」复算，无第二手写真相 | 复算 == 缓存 |
+| **I2** | 渲染：地图 / `PROJECT.md` 标记区 / `ARCH-MODEL.md` / 架构档指针全部由模型生成 | 手改渲染物 → 下次渲染覆盖它 |
+| **I3** | 可丢弃：删掉整个 `.internal/runtime/` → 治理零损失 | 删后跑全量查询，结果一致 |
 
-## 📦 安装
+## 2. 六个工具（11 → 6）
+
+工具数下降**不是目标**，是"闸门变查询、产出变渲染"的结果。
+
+| 工具 | 模型操作 | 典型用法 |
+|---|---|---|
+| `nav_graph` | **读**：影响面 / 缺口 / 覆盖度 / 文档路由 / 架构档新鲜度 / 健康快照 / 地图 | `nav_graph mode=task target=src/host/app.js` |
+| `nav_commit` | **写**：登记改动意图（锚点 + scope + `arch=` 一句话），跑六闸；**自动按证据收上一笔** | `nav_commit task="加一层校验" anchor=PN-F01 arch="架构不变" features=PN-F01` |
+| `nav_decide` | **写**：架构决策（挂节点，登记即重置该节点补丁计数） | `nav_decide anchor=PN-F01 reason=… decision=…` |
+| `nav_node` | **写**：节点 upsert / 退役并级联 / 参考文档工件 / 旧账本迁移 | `nav_node target=E-F01 name=编辑器 files=src/a.js` |
+| `nav_render` | **写**：重生成全部投影（+ 可选刷新架构档指纹） | `nav_render target=.internal/arch/overview.md` |
+| `nav_set` | **写**：主线向量（doing / next / notDoing / exit） | `nav_set doing="收口 shoucang" notDoing="pmg 融合"` |
+
+### 最重要的行为变化：**收口不需要第二个动作**
+
+- 登记一笔改动 = 一次 `nav_commit`，它记下 scope 内每个文件的 `{size, mtimeMs, sha1}` 作为**证据**。
+- 改完文件后，**下一次任意工具调用**（任意会话）发现证据变了 → 自动收口。
+- **收口不依赖会话**："只有自己的会话能驱动自己的动作"这条设计被删除：
+  会话死了，意图照旧被任意会话按证据收口。
+- 证据没变 ⇒ 意图继续**在途**（有人正在改 = 正常状态，不是孤儿）。
+- 唯一绕过证据的出口：`nav_commit mode=archive id=ACT-N reason=…`（空 scope / 误建 / 方向已废）。
+
+## 3. 六个闸门（全部是 `nav_commit` 内的模型查询）
+
+| 闸门 | 问题 | 判据 | 强度 |
+|---|---|---|---|
+| **锚点闸** | 架构节点真实存在吗？ | 节点在模型中，或锚定 `.internal/arch/*.md` | 拒 |
+| **范围闸** | 撞主线反面吗？撞别人在途 scope 吗？ | `notDoing` 命中 → 拒；与他在途重叠 → 告警 | 拒/告警 |
+| **主线闸** | scope 里的模块在主线上吗？ | 未被 `doing/next` 引用 → 告警 | 告警 |
+| **计数闸** | 同一锚点又在反复打补丁？ | 自上次决策以来 ≥ 3 次 → **强制先出决策** | 拒 |
+| **决策闸** | 这次改动需要架构变更吗？ | `arch=` 缺失 → 告警要求一句话回答 | 告警 |
+| **完结闸** | 有该收而未收的意图吗？ | 开新笔时按证据自动收旧；异常才报 | 自动 + 报异常 |
+
+闸门是**查询**而不是流程，因此它们不可能产生"孤儿状态"，也无法被"另开一条路"绕过——
+写入只有一个入口。
+
+## 4. 数据面：7 → 3
+
+| 层 | 路径 | 生命周期 | 版本控制 |
+|---|---|---|---|
+| **事件流** | `.internal/events.jsonl` | 永久 | **是**（唯一事实源） |
+| **运行时** | `.internal/runtime/`（模型缓存 · 在途 · 锁 · 诊断） | 短命 | **否**（gitignore，可丢弃可重建） |
+| **渲染投影** | `PROJECT.md` 标记区 · `.internal/ARCH-MODEL.md` · `runtime/map-*.html` · 架构档 `arch-cache` 头 | 可再生 | 投影本身可进仓 |
+
+> `.gitignore` 必须**只排除 runtime**，不能整目录排除 `.internal/`——
+> 否则事件流不进版本控制，新 clone 读不到任何决策，"决策可传播"就是一句空话。
+
+## 5. 安装
 
 ```bash
-pnpm pack
-dsh plugin --profile web add "@dsh-external/project-nav@file:<tgz 路径>"
+# 1) 打包（在插件仓根）
+npm pack
+
+# 2) 装进 profile：编辑 ~/.dsh/profiles/<profile>/package.json
+#      dependencies:  "@dsh-external/project-nav": "file:<本仓路径>/dsh-external-project-nav-0.9.0.tgz"
+#      dsh.profile.bundles 里已有 "@dsh-external/project-nav"（保持不变）
+
+# 3) 重启 dsh —— 装与重启是两条时间线，重启前线上仍是旧版
 ```
 
-依赖：`@deepseek-ai/dsh-tools`（peer，`>=0.1.2-rc.1 <0.2.0`——与生态其他插件同写区间而非精确锁，本机验证于 0.1.5-rc.1）；Node ≥ 18。
+**配置**（profile 里的插件项）：
 
-## ⚙️ 配置 root（重要）
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `root` | `''` → 进程 cwd | 被治理工作区根（其 `.internal/` 存事件流）。**建议显式设置** |
+| `boundaryWorkspaces` | `''` | 工作区边界白名单（逗号分隔的项目名/相对路径/目录名）。空 = 什么都不绑 |
+| `autoBindWorkspace` | `true` | 边界总开关 |
 
-插件治理哪个工作区由 `root` 决定——被治理目录下的 `.internal/` 存放全部数据。
-`root` **没有机器相关默认值**：未配置时回退到 DSH 进程的工作目录（cwd），启动日志会以 warn 打印实际生效的 root。
+## 6. 迁移（旧账本 → 事件流）
 
-在 profile 的 patch 层（如 `~/.dsh/profiles/<profile>/cordis.patch.yml`）给插件条目补 `config`：
+旧版有 5 个并列账本：`nav-index.json` / `vector.json` / `nav-actions.json` / `nav-docs.json` / `nav-arch.json`。
 
-```yaml
-- id: project-nav
-  config:
-    root: 'C:/path/to/your/workspace'   # 指向含 PROJECT.md 的被治理工作区
+```
+nav_graph mode=legacy        # 先看清旧账本全貌（只读）
+nav_node layer=migrate       # 一次性折叠成事件 + 归档为 .internal/legacy/ 只读快照
+nav_render                   # 重建全部投影
 ```
 
-配置后重启 profile 生效。启动日志中显示的 root 就是要被治理的目录——请确认它符合预期再开始用 `nav_*` 工具。
+迁移**只跑一次**（落下 `.internal/legacy/migrated.json` 标记）。迁移后旧文件离开原位、不再被任何读路径读取——
+不存在第二个真相。本轮不保留二段式侧车与回切；旧快照仅作取证材料。
 
-可选 `leaseTtlMs`（默认 30 分钟）：会话崩溃后其 scope 锁在此之前保持有效，超时自动过期释放。
-
-## 🔒 工作区边界（可选，默认关闭）
-
-让被选中的工作区会话写入不出界（读仍全域自由）。**机制全部由 harness 原生沙箱承担**，本插件只做两个判定：*哪些工作区要治理*、*这台宿主能不能真的强制*。
-
-```yaml
-- id: project-nav
-  config:
-    root: 'C:/path/to/your/workspace'
-    boundaryWorkspaces: 'project-nav'   # 白名单：逗号分隔，可用项目码/相对路径/目录名
-                                        # 留空 = 什么都不治理（默认）
-```
-
-- **opt-in 白名单，空名单即不治理**。这不是保守，而是机制事实：原生 `workspace-write` **只有一个可写根**（会话 cwd + 平台临时区），**不含 `~/.dsh`**。所以凡是工作会伸到 `~/.dsh` 的会话（记忆库、技能、profile 部署）会被**挡住工作**而不是挡住越界 —— 只把"工作自包含在工作区内"的工作区列进来。
-- `root` 本身**永不治理**：root 级边界等于允许写进每个项目，正是要防的那种漂移。
-- **宿主可强制性是前置条件**：绑定前插件会跑一次只读探针（`read-only`，零授权、无 ACL 变更），探针不过就**不绑定**。原因很硬：宿主沙箱后端起不来时，`workspace-write` 下**任何 shell 都 fail-closed**，把会话绑上去等于**夺走它的 shell**，不是保护它。探针结果每进程一次。
-- **不夺权**：会话内手动 `/permission danger-full-access` 后写者胜；已是 `read-only` 的会话不会被放松。
-- `autoBindWorkspace: false` 是总开关（默认 `true`）。它只管"要不要"，"管哪里"由 `boundaryWorkspaces` 决定。
-
-> Windows 宿主的前置条件：`dsh-sandbox-windows-acl` 的受限令牌**必须**带 logon SID（`[logon SID, Everyone]` 是 keep-alive 不变量），而 `LocalSystem` 的令牌没有 → 以服务方式运行 DSH 时该后端**起不来**。修法是让服务以真实用户账户运行。诊断与修复见 `docs/runbook-sandbox-backend-windows.md`。
-
-## 🗃️ 数据
-
-单一数据真身 `<root>/.internal/`（nav-index / vector / nav-actions / nav-docs / nav-arch），其余全部自动派生——**除 `root` 外零每项目配置**。索引与数据文件不进 git（`.gitignore`），数据手术一律先备份。`.internal/arch/*.md` 由配套 arch-view 技能维护，不在本包数据流内。
-
-## 🛠️ 开发
+## 7. 测试
 
 ```bash
-pnpm install
-pnpm test      # node --test test/core.test.mjs test/concurrency.test.mjs（74 项真实回归，全部在临时目录跑，不碰真实工作区）
-pnpm pack      # 构建发布包
+npm test                  # 四个套件：101 项
+npm run test:node-runner  # 同一批用例走 node --test
 ```
 
-发布循环：bump version → `pnpm pack` → `dsh plugin --profile web add "@dsh-external/project-nav@file:<tgz>"` → 重启 dsh-web（记得补 `config.root`，见上）。
+| 套件 | 覆盖 |
+|---|---|
+| `test/core.test.mjs` | 事件流 / 折叠 / scope 解析 / 六闸 / 收口 / 迁移（含真实索引形状与落点口径）（46） |
+| `test/architecture.test.mjs` | **不变量** I1·I2·I3·A1·A2·A4·A5·A6（22） |
+| `test/concurrency.test.mjs` | F1 并发追加不丢 / F2 破锁竞态 / token 校验 / 重入 / 无锁残留（12） |
+| `test/host.test.mjs` | 真 host 代码 + 桩 ctx：装配面 6 工具、闸门接线、端到端、归属归一回归（22） |
 
-工程日志见 [HANDOFF.md](./HANDOFF.md)（§1–§27：决策 / 数据手术 / 闭环审查全记录）。
+> 沙箱提示：`node --test` 会用管道 spawn 子进程，在某些受限沙箱下报 `spawn EPERM`。
+> `npm test` 直接执行测试文件（文件被直接运行时 `node:test` 同样执行），因此不受影响。
 
-## 📄 License
+## 8. 版本规则
 
-[BSD-3-Clause](./LICENSE) © 2026 Fishsb
+> **每次更新一律 +0.0.1**，不因"加功能"跳中间位（lk 2026-09-10 定调）。
+> **例外：架构换代**才允许跳位，且必须在变更日志里写明"换代"二字。
+
+本版 `0.8.6 → 0.9.0` 即该例外：不是加功能，是换骨架（决策丢弃、事实保留）。
+
+## 9. 开发纪律
+
+1. 改代码前先读 [`ARCHITECTURE.md`](./ARCHITECTURE.md)——它是本仓的架构契约，不是说明书。
+2. 改了架构先改契约；契约之外不新增文件（新增即架构变更）。
+3. 渲染物永不手写：手改 `PROJECT.md` 标记区 / `ARCH-MODEL.md` / 地图，下一次 `nav_render` 就覆盖它。
+4. 事故事实（F1–F9）不可丢弃：它们是需求，只有实现方式可以换。
+
+## License
+
+BSD-3-Clause © Fishsb (lk)
