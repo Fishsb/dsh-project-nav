@@ -110,6 +110,7 @@ SHA256 `9A7FAF772CD2FC44299746B0EEEBE007DB0E8D41D35CA5F01D420FAF57644385`
 
 | 版本 | 安装 | 校验（只读） |
 |---|---|---|
+| 0.9.2 | `install-0.9.2.ps1` | `verify-0.9.2-install.ps1` |
 | 0.9.1 | `install-0.9.1.ps1` | `verify-0.9.1-install.ps1` |
 | 0.9.0 | `install-0.9.0.ps1` | `verify-0.9.0-install.ps1` |
 
@@ -117,8 +118,8 @@ SHA256 `9A7FAF772CD2FC44299746B0EEEBE007DB0E8D41D35CA5F01D420FAF57644385`
 
 ```powershell
 npm pack --cache .npm-cache                                    # 出 tgz
-powershell -NoProfile -ExecutionPolicy Bypass -File install-0.9.1.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File verify-0.9.1-install.ps1   # 独立复验，10 项全绿
+powershell -NoProfile -ExecutionPolicy Bypass -File install-0.9.2.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File verify-0.9.2-install.ps1   # 独立复验，10 项全绿
 # 重启 dsh-web（只能你手动做）
 ```
 
