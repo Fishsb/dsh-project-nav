@@ -107,9 +107,9 @@ ARCHITECTURE.md      本文：架构契约（改架构先改它）
 AGENTS.md            本仓开发纪律：版本规则 / 发布链 / 已知边界 / 迁移纪律
 PROJECT.md           项目主档（标记区内是渲染物；标记外手写）
 bootstrap.mjs        自举：把本仓的架构折叠成事件并生成投影（一次性）
-install-0.9.0.ps1    运维件：把 0.9.0 装进 profile（改声明 + npm install；需用户执行）
-verify-0.9.0-install.ps1  运维件：独立校验安装面四件事（只读，可重启前跑）
-host/index.js        Cordis 装配：6 工具注册 + 工作区边界（唯一 host 面）
+install-0.9.1.ps1    运维件：把 0.9.1 装进 profile（摊开 tgz + 改声明；需用户执行）
+verify-0.9.1-install.ps1  运维件：独立校验安装面四件事（只读，可重启前跑）
+host/index.js        Cordis 装配：6 工具注册（唯一 host 面）
 core/paths.js        路径契约与平面（PLANE）
 core/log.js          事件流：追加 / 读取 / seq 复算 / 写回校验（F9）
 core/lock.js         runtime 锁：rename 破锁（F2）+ token 校验 + 可重入
@@ -119,10 +119,9 @@ core/gates.js        六闸（纯函数查询）
 core/commit.js       写入编排：意图登记 + 按证据自动收口
 core/render.js       渲染投影（I2）+ 架构档指纹解析与 stamp
 core/format.js       输出文本成形（说给模型看的话都在这里）
-core/boundary.js     工作区边界判定（纯函数）
 core/legacy.js       旧账本 → 事件流迁移器（一次性）
-test/core.test.mjs           领域行为基准（46）
-test/architecture.test.mjs   不变量 I1/I2/I3 · A1–A6（21）
+test/core.test.mjs           领域行为基准（43）
+test/architecture.test.mjs   不变量 I1/I2/I3 · A1–A6（22）
 test/concurrency.test.mjs    并发与锁（F1/F2）（12）
 test/host.test.mjs           真 host 代码 + 桩 ctx 的装配面与端到端（21）
 test/host-harness.mjs        host 编译夹具（data:/file: shim）

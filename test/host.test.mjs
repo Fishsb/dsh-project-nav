@@ -270,33 +270,3 @@ test('端到端：六闸全绿的一笔改动 —— 登记 → 改 → 自动�
   assert.match(proj, /给 A 加一层/, '已收口的改动必须在人类可读投影里可回溯')
   assert.match(proj, /## 最近的收口/)
 })
-
-// 回归：v0.9.0 曾把 governedWorkspaceOf 只以 `export … from` 挂在文件末尾，
-// 而 :155 直接调用裸标识符 —— re-export 不建立本地绑定，于是每次 agent/session-start
-// 都抛 ReferenceError（被 catch 吞掉），线上 0 个会话被绑上。本用例打开 autoBindWorkspace
-// 并走到 append，缺了顶部 import 就会失败。
-test('工作区边界：autoBindWorkspace=true 时 session-start 必须真的绑上（缺本地 import 即回归失败）', async (t) => {
-  const root = tmpRoot(t)
-  await seed(root, { files: ['ws/src/a.js'], feature: 'PN-F01', module: 'core', project: 'PN-P01' })
-  // 项目节点必须带真实子目录路径：governedWorkspaceOf 只认 layer=project & status=active 的名字/登记路径
-  await appendEvents(root, [{ kind: 'node', op: 'upsert', layer: 'project', id: 'PN-P01', fields: { name: 'PN-P01', path: 'ws' } }])
-  const appended = []
-  const h = await mountHost(root, {
-    config: { boundaryWorkspaces: 'PN-P01', autoBindWorkspace: true },
-    services: { sandboxPolicy: { overrideOf: () => undefined } }
-  })
-  t.after(() => h.dispose())
-  await new Promise((r) => setTimeout(r, 0)) // 等 boot 探针的 Promise 落地（boundaryUsable → true）
-
-  const handlers = h.stub.listeners.get('agent/session-start') || []
-  assert.equal(handlers.length, 1, '必须恰好挂一个 session-start 监听')
-  const session = { header: { cwd: join(root, 'ws') }, append: (kind, payload) => appended.push([kind, payload]) }
-  handlers[0]({ agent: { id: 'bound-test-1', session } })
-
-  assert.deepEqual(appended, [['sandbox/mode', { mode: 'workspace-write' }]], '命中治理工作区就必须 append sandbox/mode')
-  const diag = JSON.parse(readFileSync(join(root, '.internal', 'boundary-diag.json'), 'utf-8'))
-  const last = diag.sessions.at(-1)
-  assert.equal(last.decision, 'bound', `决策必须为 bound，实得 ${last.decision}: ${last.detail}`)
-  assert.match(last.detail, /previous=undefined/)
-  assert.equal(diag.sessions.some((s) => s.decision === 'error'), false, '不允许出现 error 决策（ReferenceError 回归）')
-})

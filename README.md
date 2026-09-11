@@ -122,8 +122,6 @@ npm pack
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `root` | `''` → 进程 cwd | 被治理工作区根（其 `.internal/` 存事件流）。**建议显式设置** |
-| `boundaryWorkspaces` | `''` | 工作区边界白名单（逗号分隔的项目名/相对路径/目录名）。空 = 什么都不绑 |
-| `autoBindWorkspace` | `true` | 边界总开关 |
 
 ## 6. 迁移（旧账本 → 事件流）
 
@@ -141,13 +139,13 @@ nav_render                   # 重建全部投影
 ## 7. 测试
 
 ```bash
-npm test                  # 四个套件：101 项
+npm test                  # 四个套件：98 项
 npm run test:node-runner  # 同一批用例走 node --test
 ```
 
 | 套件 | 覆盖 |
 |---|---|
-| `test/core.test.mjs` | 事件流 / 折叠 / scope 解析 / 六闸 / 收口 / 迁移（含真实索引形状与落点口径）（46） |
+| `test/core.test.mjs` | 事件流 / 折叠 / scope 解析 / 六闸 / 收口 / 迁移（含真实索引形状与落点口径）（43） |
 | `test/architecture.test.mjs` | **不变量** I1·I2·I3·A1·A2·A4·A5·A6（22） |
 | `test/concurrency.test.mjs` | F1 并发追加不丢 / F2 破锁竞态 / token 校验 / 重入 / 无锁残留（12） |
 | `test/host.test.mjs` | 真 host 代码 + 桩 ctx：装配面 6 工具、闸门接线、端到端、归属归一回归（22） |

@@ -3,7 +3,7 @@
 > **本文件由 `nav_render` 生成，永不手写**（I2）。真相是 `.internal/events.jsonl`（append-only）；
 > 本文件是它的折叠投影，供人阅读与 `git diff` 审查。删除 `.internal/runtime/` 后本文件仍可由事件流重建。
 
-生成时间：2026-09-11T00:34:08.267Z · 事件数：22
+生成时间：2026-09-11T10:51:14.340Z · 事件数：24
 
 ## 主线向量
 
@@ -13,8 +13,8 @@
 
 ## 覆盖度
 
-- 项目 1 · 模块 8 · 功能 9 · 文档工件 2
-- 登记文件 28 · 未登记文件 15 · 已退役 0
+- 项目 1 · 模块 7 · 功能 8 · 文档工件 2
+- 登记文件 27 · 未登记文件 4 · 已退役 2
 - 在途改动 0 · 架构决策 1
 
 ## 节点
@@ -24,7 +24,7 @@
 | artifact | `artifact:arch-contract` | 架构契约（本仓） | — | `ARCHITECTURE.md` | when=改代码前必读；改架构时必须先改它；判断"某个状态该落在哪一层"时 |
 | artifact | `artifact:handoff` | 历史交接记录 | — | `HANDOFF.md` | when=追溯 v0.8.x 及更早的实现选择、事故记录、发布过程时 |
 | feature | `feature:pn-f09` | 测试与契约面 | host-face | 16 文件 | 2026-09-11T00:34:08.252Z |
-| feature | `feature:pn-f06` | 工作区边界 | core-boundary | 1 文件 | 2026-09-11T00:34:08.252Z |
+| feature | `feature:pn-f06` | 工作区边界 **(退役)** | core-boundary | 1 文件 | 2026-09-11T10:48:37.883Z |
 | feature | `feature:pn-f07` | 旧账本迁移 | core-migrate | 2 文件 | 2026-09-11T00:34:08.252Z |
 | feature | `feature:pn-f04` | 六闸 | core-gates | 1 文件 | 2026-09-11T00:34:08.252Z |
 | feature | `feature:pn-f03` | 模型折叠 | core-model | 2 文件 | 2026-09-11T00:34:08.252Z |
@@ -32,7 +32,7 @@
 | feature | `feature:pn-f02` | 事件流 | core-log | 2 文件 | 2026-09-11T00:34:08.252Z |
 | feature | `feature:pn-f05` | 渲染投影 | core-render | 2 文件 | 2026-09-11T00:34:08.252Z |
 | feature | `feature:pn-f08` | 装配面与工具 | host-face | 1 文件 | 2026-09-11T00:34:08.252Z |
-| module | `module:core-boundary` | 工作区边界 | project:pn-p01 | — | 2026-09-11T00:34:08.252Z |
+| module | `module:core-boundary` | 工作区边界 **(退役)** | project:pn-p01 | — | 2026-09-11T10:51:14.322Z |
 | module | `module:core-migrate` | 旧账本迁移 | project:pn-p01 | — | 2026-09-11T00:34:08.252Z |
 | module | `module:core-gates` | 六闸 | project:pn-p01 | — | 2026-09-11T00:34:08.252Z |
 | module | `module:core-model` | 模型折叠 | project:pn-p01 | — | 2026-09-11T00:34:08.252Z |

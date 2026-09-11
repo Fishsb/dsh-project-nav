@@ -14,7 +14,6 @@ import { resolveScope, evidenceOf, diffEvidence, globToRegExp } from '../core/sc
 import { anchorGate, scopeGate, mainlineGate, countGate, decisionGate, runGates } from '../core/gates.js'
 import { commitIntent, reconcile, archiveIntent } from '../core/commit.js'
 import { migrateLegacy, inspectLegacy, legacyToDrafts } from '../core/legacy.js'
-import { governedWorkspaceOf } from '../core/boundary.js'
 import { paths } from '../core/paths.js'
 
 // ============ 事件流（唯一事实源） ============
@@ -557,39 +556,4 @@ test('迁移后旧账本不再被任何读路径读取（改了它，模型不�
   const before = buildModel(root).vector.doing
   writeFileSync(join(root, '.internal', 'legacy', 'vector.json'), JSON.stringify({ doing: 'HACKED' }), 'utf-8')
   assert.equal(buildModel(root).vector.doing, before)
-})
-
-// ============ 边界（事故事实保留） ============
-
-function modelWith(projects) {
-  const nodes = new Map()
-  for (const [name, path] of projects) {
-    nodes.set(nodeId('project', name), { id: nodeId('project', name), layer: 'project', name, status: 'active', meta: { path } })
-  }
-  return { nodes }
-}
-
-test('工作区边界是 opt-in：空白名单什么都不绑', () => {
-  const m = modelWith([['PN-P01', 'project-nav'], ['alpha', 'deepseek/alpha']])
-  assert.equal(governedWorkspaceOf(m, 'D:\\FF', 'D:\\FF\\project-nav', ''), '')
-  assert.equal(governedWorkspaceOf(m, 'D:\\FF', 'D:\\FF\\project-nav', []), '')
-})
-
-test('工作区边界：三种写法都命中，且只命中被登记的项目', () => {
-  const m = modelWith([['PN-P01', 'project-nav'], ['alpha', 'deepseek/alpha']])
-  const norm = (s) => String(s).replace(/\\/g, '/')
-  assert.equal(norm(governedWorkspaceOf(m, 'D:\\FF', 'D:\\FF\\project-nav\\host', ['project-nav'])), 'D:/FF/project-nav')
-  assert.equal(norm(governedWorkspaceOf(m, 'D:\\FF', 'D:/FF/project-nav', ['PN-P01'])), 'D:/FF/project-nav')
-  assert.equal(norm(governedWorkspaceOf(m, 'D:\\FF', 'D:/FF/deepseek/alpha', ['deepseek/alpha'])), 'D:/FF/deepseek/alpha')
-})
-
-test('工作区边界：root 自身永不治理；未登记目录；越界；兄弟前缀；缺输入', () => {
-  const m = modelWith([['PN-P01', 'project-nav']])
-  assert.equal(governedWorkspaceOf(m, 'D:\\FF', 'D:\\FF', ['project-nav', 'FF', 'D:/FF']), '')
-  assert.equal(governedWorkspaceOf(m, 'D:\\FF', 'D:\\FF\\scratch', ['project-nav', 'scratch']), '')
-  assert.equal(governedWorkspaceOf(m, 'D:\\FF', 'C:\\Users\\lk\\elsewhere', ['project-nav']), '')
-  assert.equal(governedWorkspaceOf(m, 'D:\\FF', 'D:\\FFx', ['project-nav']), '')
-  assert.equal(governedWorkspaceOf(null, 'D:\\FF', 'D:\\FF', ['project-nav']), '')
-  assert.equal(governedWorkspaceOf(m, 'D:\\FF', '', ['project-nav']), '')
-  assert.equal(governedWorkspaceOf({ nodes: new Map() }, 'D:\\FF', 'D:\\FF\\project-nav', ['project-nav']), '')
 })

@@ -14,10 +14,9 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
-import { writeFileSync, mkdirSync, readFileSync, existsSync, renameSync } from 'node:fs'
-import { resolve, dirname } from 'node:path'
+import { resolve } from 'node:path'
 import {
-  PLANE, paths, nowIso, normSlashes, key
+  paths, normSlashes, key
 } from '../core/paths.js'
 import { loadModel, normalizeAnchor, pressureFor, coverage, REPEAT_PATCH_THRESHOLD } from '../core/model.js'
 import { appendEvents, verifyLog, readEvents } from '../core/log.js'
@@ -30,15 +29,13 @@ import {
   splitList, parseKv, truncate, renderHealth, renderScopeTarget, renderGaps,
   renderDocs, renderAdrs, renderArchDocs, renderMap, renderCommitResult
 } from '../core/format.js'
-import { governedWorkspaceOf } from '../core/boundary.js' // 本地绑定（:155 直接调用；末尾 :523 的 re-export 不建立本地绑定）
 export const name = '@dsh-external/project-nav'
-// `shell` 是真实硬依赖：工作区边界的可执行性探针走 shell 缝，且必须等它注册后再探。
-export const inject = ['tools', 'shell']
+// `tools` 是唯一依赖：6 个工具全部经 ctx.tools.register 注册。
+// 沙箱/权限是宿主原生能力（dsh-sandbox-policy / dsh-permission-presets），本插件不设、不切、不探。
+export const inject = ['tools']
 
 export const Config = z.object({
-  root: z.string().default(''),
-  boundaryWorkspaces: z.string().default(''),
-  autoBindWorkspace: z.boolean().default(true)
+  root: z.string().default('')
 })
 
 const OUTPUT = {
@@ -66,119 +63,11 @@ export function apply(ctx, config) {
     return loadModel(root, { now })
   }
 
-  // ================= 工作区边界（ADR-014/016 的事故事实保留） =================
-  const boundaryOn = config?.autoBindWorkspace !== false
-  let boundaryUsable = null
-  let boundaryReason = 'not probed yet'
-  let boundaryInFlight = false
-  let boundaryAttempts = 0
-  let boundaryLastAttemptAt = 0
-  const BOUNDARY_RETRY_MS = 10000
-  const boundarySessions = []
-
-  function boundaryDiagPath() { return resolve(root, '.internal', 'boundary-diag.json') }
-  function writeBoundaryDiag() {
-    try {
-      const payload = {
-        updatedAt: nowIso(), root, enabled: boundaryOn, allow: String(config?.boundaryWorkspaces || ''),
-        probe: { verdict: boundaryUsable, reason: boundaryReason, attempts: boundaryAttempts, lastAttemptAt: boundaryLastAttemptAt ? nowIso(boundaryLastAttemptAt) : null },
-        sessions: boundarySessions.slice(-25)
-      }
-      const file = boundaryDiagPath()
-      if (!existsSync(dirname(file))) mkdirSync(dirname(file), { recursive: true })
-      const tmp = `${file}.tmp-${process.pid}`
-      writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf-8')
-      renameSync(tmp, file)
-    } catch { /* 诊断 best-effort：绝不因为日志失败而影响会话 */ }
-  }
-  function recordSession(cwd, zone, decision, detail) {
-    boundarySessions.push({ at: nowIso(), cwd: String(cwd || ''), zone: String(zone || ''), decision: String(decision), detail: String(detail || '') })
-    writeBoundaryDiag()
-  }
-  function probeBoundary(trigger) {
-    const why = trigger || 'boot'
-    if (boundaryInFlight || boundaryUsable === true) return
-    const now = Date.now()
-    if (boundaryAttempts >= 2 && now - boundaryLastAttemptAt < BOUNDARY_RETRY_MS) return
-    boundaryInFlight = true
-    boundaryAttempts += 1
-    boundaryLastAttemptAt = now
-    const shell = ctx.get?.('shell')
-    if (!shell || typeof shell.resolve !== 'function' || typeof shell.run !== 'function') {
-      boundaryInFlight = false
-      boundaryUsable = false
-      boundaryReason = `shell seam unavailable (resolve=${typeof shell?.resolve}, run=${typeof shell?.run}, trigger=${why})`
-      ctx.logger?.warn?.(`[project-nav] workspace boundary: ${boundaryReason}; sessions will NOT be bound`)
-      writeBoundaryDiag()
-      return
-    }
-    try {
-      const spec = shell.resolve({ command: 'exit 0', workdir: root, timeoutMs: 20000, sandboxPolicy: { mode: 'read-only', workspaceRoot: root } })
-      Promise.resolve(shell.run(spec)).then((res) => {
-        boundaryInFlight = false
-        const sb = res && res.sandbox
-        const runnerFailed = !!(sb && sb.runnerFailed)
-        boundaryUsable = !runnerFailed && !!res && res.exitCode === 0
-        boundaryReason = `probe ${boundaryUsable ? 'PASS' : 'FAIL'} (attempt ${boundaryAttempts}, trigger=${why}, exitCode=${res ? res.exitCode : 'n/a'}, runnerFailed=${runnerFailed})`
-        if (boundaryUsable) ctx.logger?.info?.(`[project-nav] workspace boundary: ${boundaryReason}`)
-        else ctx.logger?.warn?.(`[project-nav] workspace boundary: ${boundaryReason}; sessions will NOT be bound`)
-        writeBoundaryDiag()
-      }, (e) => {
-        boundaryInFlight = false
-        boundaryUsable = false
-        boundaryReason = `probe rejected (attempt ${boundaryAttempts}, trigger=${why}): ${(e && e.message) || e}`
-        ctx.logger?.warn?.(`[project-nav] workspace boundary: ${boundaryReason}; sessions will NOT be bound`)
-        writeBoundaryDiag()
-      })
-    } catch (e) {
-      boundaryInFlight = false
-      boundaryUsable = false
-      boundaryReason = `probe threw (attempt ${boundaryAttempts}, trigger=${why}): ${e.message}`
-      ctx.logger?.warn?.(`[project-nav] workspace boundary: ${boundaryReason}; sessions will NOT be bound`)
-      writeBoundaryDiag()
-    }
-  }
-  if (boundaryOn && String(config?.boundaryWorkspaces || '').trim() && typeof ctx.on === 'function') probeBoundary('boot')
-  if (boundaryOn && typeof ctx.on !== 'function') {
-    ctx.logger?.warn?.('[project-nav] workspace boundary: this context exposes no ctx.on — sessions will NOT be bound to their workspace. Set autoBindWorkspace=false to silence.')
-  }
-  if (boundaryOn && typeof ctx.on === 'function') {
-    ctx.on('agent/session-start', (payload) => {
-      try {
-        const session = payload?.agent?.session
-        const cwd = session?.header?.cwd
-        if (!session || !cwd || typeof session.append !== 'function') {
-          recordSession(cwd, '', 'skipped-no-session-or-append', `session=${!!session} cwd=${cwd || ''}`)
-          return
-        }
-        const zone = governedWorkspaceOf(loadModel(root), root, cwd, config?.boundaryWorkspaces)
-        if (!zone) { recordSession(cwd, '', 'not-governed', ''); return }
-        if (boundaryUsable !== true) {
-          probeBoundary('session-start')
-          recordSession(cwd, zone, 'deferred-probe', boundaryReason)
-          return
-        }
-        const policy = ctx.get?.('sandboxPolicy')
-        if (!policy || typeof policy.overrideOf !== 'function') {
-          recordSession(cwd, zone, 'skipped-no-sandboxPolicy', `policy=${typeof policy}`)
-          return
-        }
-        // 会话在 hook 之前就已被盖上模式 → 问的不是"有没有 override"，而是"模式是什么"。
-        const current = policy.overrideOf(session)
-        if (current === 'workspace-write' || current === 'read-only') {
-          recordSession(cwd, zone, `already-${current}`, '')
-          return
-        }
-        session.append('sandbox/mode', { mode: 'workspace-write' })
-        recordSession(cwd, zone, 'bound', `previous=${current === undefined ? 'undefined' : current}`)
-        ctx.logger?.info?.(`[project-nav] workspace boundary: session ${String(payload?.agent?.id || '').slice(0, 8)} bound to workspace-write (${zone})`)
-      } catch (e) {
-        recordSession('', '', 'error', (e && e.message) || String(e))
-        ctx.logger?.warn?.(`[project-nav] workspace boundary: left session untouched (${e.message})`)
-      }
-    })
-  }
-  // ================= 边界结束 =================
+  // ================= 工作区边界：已拆除（0.9.2） =================
+  // 沙箱模式与审批策略是宿主原生能力（dsh-sandbox-policy 的全局默认 + dsh-permission-presets
+  // 的三档预设 + UI 切换入口），本插件不再代宿主切换会话模式，也不再做可执行性探针。
+  // 事故事实（v0.8.1 判据错导致永不绑 / v0.8.4 竞态把 fail-safe 变永久惰性）保留在
+  // HANDOFF.md 与 docs/ 下的历史档，不再有活代码；依赖面从 ['tools','shell'] 收回 ['tools']。
 
   // ---- 1. nav_graph — 读：模型查询 ----
   ctx.effect(() => ctx.tools.register(defineTool({
@@ -236,7 +125,7 @@ export function apply(ctx, config) {
           return [`Legacy ledgers (.internal/):`, ...Object.entries(info.files).map(([f, v]) => `  ${v === null ? '· (absent)' : v.corrupt ? `⛔ ${f} (corrupt)` : `· ${f}: ${JSON.stringify(v)}`}`), info.alreadyMigrated ? `\n已迁移: ${info.marker?.at}（${info.marker?.events} 事件）` : '\n未迁移 → 用 nav_graph mode=legacy json 看全貌，迁移动作用 nav_node layer=migrate'].join('\n')
         }
         if (mode === 'json') return j(snapshotOf(model, root, lastReconcile, 'health'))
-        return renderHealth(model, { rootPath: root, opens: model.openCommits, inflight: inflightView(root), locks: listLocks(root), archDocs: listArchDocs(root), logCheck: verifyLog(root), boundary: { enabled: boundaryOn, probe: { verdict: boundaryUsable, reason: boundaryReason } } })
+        return renderHealth(model, { rootPath: root, opens: model.openCommits, inflight: inflightView(root), locks: listLocks(root), archDocs: listArchDocs(root), logCheck: verifyLog(root) })
       } catch (e) { return err(e) }
     }
   })), 'project-nav: nav_graph')
@@ -369,16 +258,29 @@ export function apply(ctx, config) {
             if (n && n.status === 'active') { hit = n; break }
           }
           if (!hit) return `ERROR: nothing to retire for "${args.target}" — 未找到现行节点。\n  用 nav_graph ${args.target} 确认标识；retire 从不凭空造条目。`
-          const ref = model.openCommits.find((c) => (c.scope?.features || []).includes(args.target)
-            || (c.scope?.modules || []).includes(args.target)
-            || (c.files || []).map(key).includes(key(args.target)))
-          if (ref) return `ERROR: "${args.target}" 仍被在途改动 ${ref.id}（${ref.task}）引用。\n  改完文件后它会按证据自动收口；或 nav_commit mode=archive id=${ref.id} 归档后再 retired。`
-          const [w] = await appendEvents(root, [{ kind: 'node', op: 'retire', layer: hit.layer, id: hit.name }])
+          // ⚠ 事件里的 id 必须是**该节点被写入时的裸标识**，不能写模型全 id：
+          // 折叠时 ensure() 会再拼一次 `${layer}:${key(id)}`，写全 id 就成了
+          // "retire of unknown …" 被丢弃，而工具却报成功（假绿）。
+          // 可靠取法：模型节点 id **就是** `${layer}:${key(写入时的 id)}`，字面切掉前缀即可；
+          // 若写入时用的是带前缀的 id（历史数据），回填会还原成同一形态。
+          // 注意不能用 key() 折叠后的值去比对大小写敏感的登记名 —— 一律过 key()。
+          const bareId = hit.id.slice(hit.layer.length + 1)
+          const ref = model.openCommits.find((c) => (c.scope?.features || []).map(key).includes(key(bareId))
+            || (c.scope?.modules || []).map(key).includes(key(bareId))
+            || (c.files || []).map(key).includes(key(bareId)))
+          if (ref) return `ERROR: "${hit.name}" 仍被在途改动 ${ref.id}（${ref.task}）引用。\n  改完文件后它会按证据自动收口；或 nav_commit mode=archive id=${ref.id} 归档后再 retired。`
+          const [w] = await appendEvents(root, [{ kind: 'node', op: 'retire', layer: hit.layer, id: bareId }])
           const after = loadModel(root)
+          const gone = after.nodes.get(hit.id)
+          if (!gone || gone.status !== 'retired') {
+            const why = (after.log || []).slice(-3).map((p) => `    · seq=${p.seq ?? '?'} ${p.problem}`).join('\n')
+            return [`ERROR: 退役未生效 —— ${hit.layer} "${hit.name}" 仍是 ${gone ? gone.status : '缺失'}（事件 seq ${w.seq} 已写入）。`,
+              '  模型自检报告:', why || '    · (无)', '  这是 bug，不是数据问题：请报告 host/index.js 的 nav_node retire 分支。'].join('\n')
+          }
           const casc = hit.layer === 'feature' ? `文件映射 ${(hit.files || []).length} 条随之消失${hit.module ? `，从模块 ${hit.module} 摘除` : ''}`
             : hit.layer === 'module' ? `项目归属 ${hit.project || '(none)'} 摘除；其 ${(hit.features || []).length} 个功能存活（失去模块）`
               : `其模块被摘除而非删除（变为 unattached，会在地图上暴露出来）`
-          return [`✓ 已退役 ${hit.layer} ${hit.name}（事件 seq ${w.seq}）`, `  级联: ${casc}`, `  现在 active 节点 ${[...after.nodes.values()].filter((n) => n.status === 'active').length} 个。`, '  退役语义保留是 F3/F8 的要求：能删才不会永远留假 STALE。'].join('\n')
+          return [`✓ 已退役 ${hit.layer} ${hit.name}（事件 seq ${w.seq}，状态已核验 = retired）`, `  级联: ${casc}`, `  现在 active 节点 ${[...after.nodes.values()].filter((n) => n.status === 'active').length} 个。`, '  退役语义保留是 F3/F8 的要求：能删才不会永远留假 STALE。'].join('\n')
         }
 
         // upsert
@@ -517,10 +419,6 @@ export function apply(ctx, config) {
     if (!check.ok && ctx.logger?.warn) ctx.logger.warn(`[project-nav] event log has ${check.problems.length} problem(s): ${check.problems.slice(0, 3).join(' | ')}`)
   } catch { /* 首次运行没有事件流是正常态 */ }
 }
-
-// ---- 边界判定：实现在 core/boundary.js（纯函数，可独立测试；host 只调用） ----
-export { governedWorkspaceOf } from '../core/boundary.js'
-
 
 // ---- nav_graph 的 JSON 快照（只取叶子字段，绝不序列化活对象） ----
 function snapshotOf(model, rootPath, rec, mode, target) {

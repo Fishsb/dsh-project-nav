@@ -127,8 +127,6 @@ npm pack
 | Key | Default | Meaning |
 |---|---|---|
 | `root` | `''` → process cwd | governed workspace root (its `.internal/` holds the event log). **Set it explicitly.** |
-| `boundaryWorkspaces` | `''` | workspace-boundary allow-list (project names / relative paths / directory names). Empty binds nothing |
-| `autoBindWorkspace` | `true` | master switch for the boundary |
 
 ## 6. Migration (legacy ledgers → event log)
 
@@ -147,13 +145,13 @@ no two-phase sidecar and no roll-back switch; the archived snapshot is evidence 
 ## 7. Tests
 
 ```bash
-npm test                  # four suites, 101 cases
+npm test                  # four suites, 98 cases
 npm run test:node-runner  # the same cases through node --test
 ```
 
 | Suite | Coverage |
 |---|---|
-| `test/core.test.mjs` | event log / fold / scope resolution / six gates / closure / migration (incl. real index shape & path qualification) (46) |
+| `test/core.test.mjs` | event log / fold / scope resolution / six gates / closure / migration (incl. real index shape & path qualification) (43) |
 | `test/architecture.test.mjs` | **invariants** I1·I2·I3·A1·A2·A4·A5·A6 (22) |
 | `test/concurrency.test.mjs` | F1 concurrent appends lose nothing / F2 broken-lock race / token check / reentrancy (12) |
 | `test/host.test.mjs` | real host code + stub ctx: assembly face, gate wiring, end-to-end, attribution-normalisation regressions (22) |

@@ -86,7 +86,6 @@ export function stubCtx({ logs = [], services = {} } = {}) {
     },
     get(name) {
       if (Object.prototype.hasOwnProperty.call(services, name)) return services[name]
-      if (name === 'shell') return { resolve: () => ({}), run: async () => ({ exitCode: 0, sandbox: { runnerFailed: false } }) }
       return undefined
     }
   }
@@ -98,11 +97,11 @@ export function stubCtx({ logs = [], services = {} } = {}) {
 }
 
 /** 挂载 host 到桩 ctx：返回可调用工具的集合。
- *  services：额外的 ctx 服务替身（如 sandboxPolicy），供边界装配等分支用。 */
+ *  services：额外的 ctx 服务替身。 */
 export async function mountHost(root, { config = {}, logs = [], services = {} } = {}) {
   const { mod, dispose } = await loadHost()
   const stub = stubCtx({ logs, services })
-  mod.apply(stub.ctx, { root, boundaryWorkspaces: '', autoBindWorkspace: false, ...config })
+  mod.apply(stub.ctx, { root, ...config })
   return {
     mod, stub, logs, dispose,
     tool: (name) => {

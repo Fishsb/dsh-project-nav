@@ -29,7 +29,7 @@ export function truncate(s, n = 120) {
   return t.length > n ? `${t.slice(0, n)}…` : t
 }
 
-export function renderHealth(model, { rootPath, opens, locks = [], inflight = [], archDocs = [], logCheck = null, boundary = null } = {}) {
+export function renderHealth(model, { rootPath, opens, locks = [], inflight = [], archDocs = [], logCheck = null } = {}) {
   const cv = coverage(model)
   const L = []
   L.push('Health')
@@ -72,10 +72,6 @@ export function renderHealth(model, { rootPath, opens, locks = [], inflight = []
     L.push('')
     L.push(`  runtime 锁 (${locks.length}):`)
     for (const l of locks) L.push(`    · ${l.name} age=${Math.round(l.ageMs / 1000)}s pid=${l.pid ?? '?'}`)
-  }
-  if (boundary) {
-    L.push('')
-    L.push(`  工作区边界: ${boundary.enabled ? 'on' : 'off'} | 探针=${boundary.probe?.verdict} | ${truncate(boundary.probe?.reason, 100)}`)
   }
   return L.join('\n')
 }

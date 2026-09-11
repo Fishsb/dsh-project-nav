@@ -30,7 +30,6 @@ const MODULES = [
   { id: 'core-model', name: '模型折叠', features: ['PN-F03'] },
   { id: 'core-gates', name: '六闸', features: ['PN-F04'] },
   { id: 'core-render', name: '渲染投影', features: ['PN-F05'] },
-  { id: 'core-boundary', name: '工作区边界', features: ['PN-F06'] },
   { id: 'core-migrate', name: '旧账本迁移', features: ['PN-F07'] },
   { id: 'host-face', name: '装配面与工具', features: ['PN-F08'] }
 ]
@@ -60,11 +59,6 @@ const FEATURES = [
     id: 'PN-F05', name: '渲染投影', module: 'core-render', files: ['core/render.js', 'core/format.js'],
     userView: '地图 / PROJECT.md 标记区 / ARCH-MODEL.md / 架构档指纹全部由模型生成，手改即被覆盖',
     systemView: 'renderAll + writeProjectSection（标记外零触碰）+ arch-cache 指纹解析与 stamp'
-  },
-  {
-    id: 'PN-F06', name: '工作区边界', module: 'core-boundary', files: ['core/boundary.js'],
-    userView: '只把"工作自包含"的工作区绑进沙箱；空白名单什么都不绑',
-    systemView: 'governedWorkspaceOf 纯函数：全函数契约 + root 自身永不治理 + 必须匹配已登记项目'
   },
   {
     id: 'PN-F07', name: '旧账本迁移', module: 'core-migrate', files: ['core/legacy.js', 'core/commit.js'],
