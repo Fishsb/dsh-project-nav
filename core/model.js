@@ -442,6 +442,13 @@ export function moduleBelongsTo(moduleNode, projectNode) {
 export function normalizeAnchor(model, anchor) {
   const a = String(anchor ?? '').trim()
   if (!a) return null
+  // 完整节点 id（"feature:pn-f09"）必须与裸名等价。
+  // 它们本来不等价：先前的实现只走 nodeId(layer, a)，而 nodeId 会再 key() 一次，
+  // 于是 "module:pn-m03" 被折成 "module:module:pn-m03" → 恒 NULL。
+  // 症状是「工具描述说锚点可为节点 id，实际凡是照描述写的都被锚点闸拒」——
+  // 描述与实现不符，比拒绝本身更坏：它会把人训练成猜别名的写法。
+  const direct = model.nodes.get(key(a))
+  if (direct) return { kind: 'node', id: direct.id, layer: direct.layer, name: direct.name, node: direct }
   for (const layer of ['feature', 'module', 'project', 'artifact']) {
     const n = model.nodes.get(nodeId(layer, a))
     if (n) return { kind: 'node', id: n.id, layer, name: n.name, node: n }
@@ -483,6 +490,43 @@ export function impactOf(model, files) {
     }
   }
   return out
+}
+
+/**
+ * 文件职责压力 —— "一个文件里塞了多个功能"的可机检信号。
+ *
+ * 为什么不用行数判据：行数是**代理指标**。长文件未必坏（本仓 core/model.js 就长），
+ * 短文件照样能混三个职责；而一旦把行数做成闸门，它必然退化成狼来了
+ * —— 与 0.10.0 修掉的「计数闸把收口回执当补丁、阈值 3 实际 ~1.5 就触发」是同一类错。
+ *
+ * 真信号是**结构**，且全部由磁盘实况 + 事件流派生（零手写、删 runtime/ 可无损重建）：
+ *   - owners：这个文件被几个**不同**架构节点登记为落点。1 个 = 职责单一；
+ *             3 个以上 = 它成了多个功能的公共堆放点。
+ *   - din   ：被多少个文件 import（基础模块被广泛引用是**正常**的，只作参考，不作判据）。
+ *   - dout  ：它 import 了多少个文件（耦合面）。
+ *
+ * 函数只**报告**，不做拒绝：拆不拆是架构判断，交给模型与 ADR，不交给阈值。
+ */
+export function filePressure(model, { threshold = REPEAT_PATCH_THRESHOLD } = {}) {
+  const din = new Map()
+  for (const [, tos] of model.edges.fileEdges) {
+    for (const t of new Set(tos || [])) din.set(t, (din.get(t) || 0) + 1)
+  }
+  const files = []
+  for (const [f, ownerIds] of model.fileOwners) {
+    const owners = [...new Set(ownerIds)].map((id) => model.nodes.get(id)).filter(Boolean)
+    files.push({
+      file: normSlashes(f),
+      owners: owners.map((n) => ({ id: n.id, name: n.name })),
+      ownerCount: owners.length,
+      din: din.get(f) || 0,
+      dout: new Set(model.edges.fileEdges.get(f) || []).size,
+      over: owners.length >= threshold
+    })
+  }
+  // 先按"被几个节点瓜分"，再按被引用广度，最后按路径 —— 确定性排序，便于 diff 与断言。
+  files.sort((a, b) => (b.ownerCount - a.ownerCount) || (b.din - a.din) || (a.file < b.file ? -1 : a.file > b.file ? 1 : 0))
+  return { files, threshold, over: files.filter((f) => f.over) }
 }
 
 /** 覆盖率：登记功能 / 全部磁盘文件。 */

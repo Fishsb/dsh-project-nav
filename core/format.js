@@ -3,8 +3,11 @@
 // 一切"说给模型看"的文本都在这里成形，避免 host 里散落字符串模板。
 
 import { key, normSlashes } from './paths.js'
-import { coverage, moduleBelongsTo, REPEAT_PATCH_THRESHOLD } from './model.js'
+import { coverage, moduleBelongsTo, filePressure, REPEAT_PATCH_THRESHOLD } from './model.js'
 import { renderTreeText } from './render.js'
+
+/** health 里「文件职责」一节最多显示多少个落点文件（排序在模型层，确定性）。 */
+const FILE_PRESSURE_TOP = 8
 
 export function splitList(s) {
   return s ? String(s).split(',').map((x) => x.trim()).filter(Boolean) : []
@@ -57,6 +60,20 @@ export function renderHealth(model, { rootPath, opens, locks = [], inflight = []
   if (pressure.length) {
     L.push('  ⚠ 计数闸压力:')
     for (const p of pressure) L.push(`    · ${p.anchor} ${p.sinceDecisionCount}/${REPEAT_PATCH_THRESHOLD}（自 ${p.sinceDecision || '项目开始'}）`)
+  }
+  // 文件职责压力：一个文件被几个不同架构节点登记为落点。
+  // 只报不拒 —— 拆不拆是架构判断（走 ADR），不是阈值判断。阈值 3 与计数闸同一量级：
+  // 两个功能共用文件是正常设计，三个以上才是"这个文件在替多个功能兜底"。
+  const fp = filePressure(model)
+  if (fp.files.length) {
+    L.push('')
+    L.push(`  文件职责（登记落点派生 · 只读）：${fp.files.length} 个落点文件${fp.over.length ? ` · ⚠ ${fp.over.length} 个被 ≥${fp.threshold} 个节点共用` : ''}`)
+    for (const f of fp.files.slice(0, FILE_PRESSURE_TOP)) {
+      const names = f.owners.map((o) => o.name || o.id).join(' / ')
+      L.push(`    ${f.over ? '⚠' : '·'} ${f.file} — 归属 ${f.ownerCount}（${names}）· 被引 ${f.din} · 引用 ${f.dout}`)
+    }
+    if (fp.files.length > FILE_PRESSURE_TOP) L.push(`    …(+${fp.files.length - FILE_PRESSURE_TOP})`)
+    if (fp.over.length) L.push('    → 一个文件被 ≥3 个节点共用时，先问它是否已承担多个职责；要拆就先改 ARCHITECTURE §9 落点表（新增文件 = 架构变更）。')
   }
   if (model.stale.length) {
     L.push('')

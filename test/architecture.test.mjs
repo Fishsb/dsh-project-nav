@@ -11,7 +11,7 @@ import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, readdirSync
 import { join } from 'node:path'
 import { tmpRoot, put, touch, seed } from './helper.mjs'
 import { appendEvents, readEvents, verifyLog, rewriteVerified } from '../core/log.js'
-import { loadModel, buildModel, coverage, pressureFor } from '../core/model.js'
+import { loadModel, buildModel, coverage, pressureFor, filePressure, normalizeAnchor } from '../core/model.js'
 import { commitIntent, reconcile, archiveIntent } from '../core/commit.js'
 import { paths, PLANE } from '../core/paths.js'
 import { renderAll, writeProjectSection, renderModelDoc, renderMapHtml, MARK_START, MARK_END } from '../core/render.js'
@@ -302,4 +302,41 @@ test('I3 删掉 runtime/ 后依赖图无损重建（它是磁盘派生，不是�
   const after = [...buildModel(root).edges.fileEdges]
   assert.deepEqual(before, after)
   assert.equal(existsSync(join(root, '.internal', 'runtime')), false, '重建发生在内存里，不留下资产')
+})
+
+// ============ 文件职责压力（"一个文件里塞多个功能"的可机检信号） ============
+
+test('锚点归一：完整节点 id 与裸名等价（工具描述承诺的形式必须真的能用）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  const m = buildModel(root)
+  const byId = normalizeAnchor(m, 'feature:PN-F01')
+  const byBare = normalizeAnchor(m, 'PN-F01')
+  assert.ok(byId, '带前缀的完整节点 id 必须能被解析 —— 否则工具描述在骗人')
+  assert.equal(byId.id, byBare.id)
+  assert.equal(byId.id, 'feature:pn-f01')
+})
+
+test('文件职责压力：一个文件被 3 个节点登记为落点即报 over（不读行数、只读落点）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root, { files: ['src/shared.js'] })
+  await appendEvents(root, [
+    { kind: 'node', op: 'upsert', layer: 'feature', id: 'PN-F02', fields: { name: 'F2', files: ['src/shared.js'], module: 'core' } },
+    { kind: 'node', op: 'upsert', layer: 'feature', id: 'PN-F03', fields: { name: 'F3', files: ['src/shared.js'], module: 'core' } }
+  ])
+  const fp = filePressure(buildModel(root))
+  const shared = fp.files.find((f) => f.file === 'src/shared.js')
+  assert.ok(shared, '落点文件必须出现在文件压力表里')
+  assert.equal(shared.ownerCount, 3, `三个功能都登记了同一个文件（实际 ${shared.ownerCount}）`)
+  assert.equal(shared.over, true)
+  assert.deepEqual(fp.over.map((f) => f.file), ['src/shared.js'])
+})
+
+test('文件职责压力是磁盘 + 事件流派生：删掉 runtime/ 后逐字节一致（I3）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  rmSync(join(root, '.internal', 'runtime'), { recursive: true, force: true })
+  const a = JSON.stringify(filePressure(buildModel(root)))
+  const b = JSON.stringify(filePressure(buildModel(root)))
+  assert.equal(a, b, '派生量不得依赖可丢弃缓存')
 })

@@ -121,7 +121,9 @@ $checks = @(
   @{ f='core\model.js';  has='function projectDirsOf';        msg='projectDirsOf 在位（扫描边界）' },
   @{ f='core\model.js';  has='function isPatchRecord';        msg='isPatchRecord 在位（计数闸只数真补丁）' },
   @{ f='core\model.js';  has='export function impactOf';      msg='impactOf 在位（文件精度影响面）' },
-  @{ f='core\gates.js';  has='export function impactGate';    msg='impactGate 在位（第七闸）' }
+  @{ f='core\gates.js';  has='export function impactGate';    msg='impactGate 在位（第七闸）' },
+  @{ f='core\model.js';  has='export function filePressure';  msg='filePressure 在位（文件职责只读信号）' },
+  @{ f='core\model.js';  has='const direct = model.nodes.get'; msg='锚点归一支持完整节点 id（0.10.2 修）' }
 )
 foreach ($c in $checks) {
   $p = Join-Path $Dest $c.f

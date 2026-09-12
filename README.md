@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.10.1-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.10.2-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-%3E%3D0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -81,7 +81,7 @@
 
 | 工具 | 模型操作 | 典型用法 |
 |---|---|---|
-| `nav_graph` | **读**：落点 / **影响面** / 缺口 / 覆盖度 / 文档路由 / 健康快照 / 地图 | `nav_graph mode=impact target=core/model.js` |
+| `nav_graph` | **读**：落点 / **影响面** / 缺口 / 覆盖度 / 文档路由 / 健康快照（含**文件职责**）/ 地图 | `nav_graph mode=impact target=core/model.js` |
 | `nav_commit` | **写**：登记改动意图（锚点 + scope + `arch=` 一句话），跑七闸；**自动按证据收上一笔** | `nav_commit task="加一层校验" anchor=PN-F01 arch="架构不变" features=PN-F01` |
 | `nav_decide` | **写**：架构决策（挂节点，登记即重置该节点补丁计数） | `nav_decide anchor=PN-F01 reason=… decision=…` |
 | `nav_node` | **写**：节点 upsert / 退役并级联 / 参考文档工件 | `nav_node target=E-F01 name=编辑器 files=src/a.js` |
@@ -125,6 +125,23 @@ File: core/model.js  —  1 个落点文件
 | **完结闸** | 有该收而未收的意图吗？ | 开新笔时按证据自动收旧；异常才报 | 自动 + 报异常 |
 
 闸门是**查询**而不是流程，因此不可能产生"孤儿状态"，也无法被"另开一条路"绕过——写入只有一个入口。
+
+### 文件职责：治「一个文件越堆越长」的那条只读信号（**不是闸门**）
+
+`nav_graph mode=health` 里除了闸门压力，还有一节**文件职责**：一个落点文件被**几个不同架构节点**登记。
+
+```
+文件职责（登记落点派生 · 只读）：96 个落点文件 · ⚠ 6 个被 ≥3 个节点共用
+  ⚠ project-nav/core/model.js — 归属 5（nav_query / nav_update / nav_docs / nav_status / nav_set_vector）· 被引 9 · 引用 3
+```
+
+**为什么不用行数红线**：行数是代理指标。长文件未必坏，短文件照样能混三个职责；而一旦把行数做成闸门，
+它必然退化成"狼来了"——与 0.10.0 修掉的计数闸退化（每笔改动被计两次、阈值 3 实际 ~1.5 就触发）是同一类错。
+
+**判据是结构，不是长度**：`归属数` = 这个文件被几个节点声明为落点（1 个 = 职责单一）；`被引/引用` = 依赖度数。
+它们全部由**落点表 + 依赖图**派生，零手写、删 `runtime/` 可无损重建。
+函数只**报告**不拒绝——拆不拆是架构判断（走 ADR），不是阈值判断。
+要拆就先改 `ARCHITECTURE.md §9` 落点表：**新增文件 = 架构变更**。
 
 ## 5. 数据面：3 层
 
@@ -190,6 +207,12 @@ npm run test:node-runner  # 同一批用例走 node --test
 - `0.9.2 → 0.10.0`：**换代** —— 模型从「包含树」升级为「包含树 + 依赖图」，闸门六 → 七。
 - `0.10.0 → 0.10.1`：**修 bug**（非换代）—— 计数闸曾把 `closed` 收口回执也当补丁数，每笔改动被计两次、
   阈值 3 实际在 ~1.5 笔就触发；另修 `.d.ts` 被当代码扫、退役锚点计数仍显示。
+- `0.10.1 → 0.10.2`：**修 bug + 补一条只读信号**（非换代）——
+  ① 锚点归一修漏：`normalizeAnchor` 只走 `nodeId(layer, a)`，而 `nodeId` 会再 `key()` 一次，
+  于是 `module:pn-m03` 这类**完整节点 id** 被折成 `module:module:pn-m03` → 恒 NULL。
+  症状是「工具描述写着锚点可为节点 id，照写的反而全被锚点闸拒」——描述与实现不符会把人训练成猜别名。
+  ② `nav_graph mode=health` 新增**文件职责**一节：一个文件被几个不同架构节点登记为落点
+  （由落点表与依赖图派生，只读、不拒、**不设行数红线**——行数是代理指标，做成闸门必然退化成狼来了）。
 
 ## 9. 开发纪律
 
