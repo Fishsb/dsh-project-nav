@@ -14,9 +14,8 @@ import { appendEvents, readEvents, verifyLog, rewriteVerified } from '../core/lo
 import { loadModel, buildModel, coverage, pressureFor } from '../core/model.js'
 import { commitIntent, reconcile, archiveIntent } from '../core/commit.js'
 import { paths, PLANE } from '../core/paths.js'
-import { renderAll, writeProjectSection, renderModelDoc, renderMapHtml, MARK_START, MARK_END, archDocState, stampArchDoc, listArchDocs } from '../core/render.js'
+import { renderAll, writeProjectSection, renderModelDoc, renderMapHtml, MARK_START, MARK_END } from '../core/render.js'
 import { scanTools, effectMountedTools, OLD_TOOL_NAMES, NEW_TOOL_NAMES } from './tools-list.mjs'
-import { migrateLegacy } from '../core/legacy.js'
 
 // ============ I1 单源 ============
 
@@ -137,54 +136,6 @@ test('I2 投影全部可生成：地图 / 模型文档 / PROJECT.md 自动区', 
   assert.ok(renderModelDoc(m).includes('真相是'))
 })
 
-test('A2 架构档真相可自检：声明文件变了就必须报过期（D2 的机检面）', async (t) => {
-  const root = tmpRoot(t)
-  put(root, 'src/a.js', 'v1')
-  mkdirSync(join(root, '.internal', 'arch'), { recursive: true })
-  writeFileSync(join(root, '.internal', 'arch', 'doc.md'), [
-    '---',
-    'arch-cache: |-',
-    `  src/a.js: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef`,
-    '  at: 2026-09-11T00:00:00.000Z',
-    '---',
-    '',
-    '# 架构档',
-    ''
-  ].join('\n'), 'utf-8')
-  let st = archDocState(root, '.internal/arch/doc.md')
-  assert.equal(st.fresh, false)
-  assert.match(st.reason, /已变/)
-
-  // 刷新指纹后视为新鲜
-  const stamped = stampArchDoc(root, '.internal/arch/doc.md')
-  assert.equal(stamped.changed, true)
-  st = archDocState(root, '.internal/arch/doc.md')
-  assert.equal(st.fresh, true, `刷新后必须新鲜：${st.reason}`)
-
-  // 源文件再变 → 立刻过期
-  touch(root, 'src/a.js', 'v2')
-  st = archDocState(root, '.internal/arch/doc.md')
-  assert.equal(st.fresh, false, '声明文件一变，档就必须过期')
-})
-
-test('A2 没有指纹头的档被明确标为「未纳管」，而不是假装新鲜', async (t) => {
-  const root = tmpRoot(t)
-  mkdirSync(join(root, '.internal', 'arch'), { recursive: true })
-  writeFileSync(join(root, '.internal', 'arch', 'bare.md'), '# 无头文件\n', 'utf-8')
-  const st = archDocState(root, '.internal/arch/bare.md')
-  assert.equal(st.fresh, false)
-  assert.equal(st.noHeader, true)
-})
-
-test('A2 给不存在的文件刷指纹必须报错（不许把档钉在一个幻觉上）', async (t) => {
-  const root = tmpRoot(t)
-  mkdirSync(join(root, '.internal', 'arch'), { recursive: true })
-  writeFileSync(join(root, '.internal', 'arch', 'doc.md'), '---\narch-cache: |-\n  ghost.js: abc\n---\n\n# d\n', 'utf-8')
-  assert.throws(() => stampArchDoc(root, '.internal/arch/doc.md'), /does not exist/)
-})
-
-// ============ I3 可丢弃 ============
-
 test('I3 删掉整个 runtime/ → 治理零损失（查询结果逐字节一致）', async (t) => {
   const root = tmpRoot(t)
   await seed(root)
@@ -301,7 +252,7 @@ test('A5 模型面字段数 ≤ 4（锚点 / scope / arch= / 理由）', () => {
   assert.ok(nonMode.length <= 4, `nav_commit 的模型面字段过多: ${nonMode.join(', ')}`)
 })
 
-test('A4 六闸在 host 的写入路径上是强制的（闸门不在流程里，在查询里）', async (t) => {
+test('A4 七闸在 host 的写入路径上是强制的（闸门不在流程里，在查询里）', async (t) => {
   const root = tmpRoot(t)
   await seed(root)
   // 锚点闸：假锚点直接拒
@@ -319,7 +270,7 @@ test('A4 六闸在 host 的写入路径上是强制的（闸门不在流程里�
   assert.ok(blocked.gates.blocked.some((b) => b.gate === 'count'))
 })
 
-// ============ 迁移与平面 ============
+// ============ 平面契约 ============
 
 test('平面契约：长期资产只有一个事件流文件（数据面 7 → 3）', async (t) => {
   const root = tmpRoot(t)
@@ -330,16 +281,25 @@ test('平面契约：长期资产只有一个事件流文件（数据面 7 → 3
   assert.deepEqual(longLived, ['events.jsonl'], `长期数据面必须只有事件流，实际: ${longLived.join(', ')}`)
 })
 
-test('迁移后不存在第二真相：旧账本文件名的读路径已消失', async (t) => {
+// ============ 依赖图的不变量（I1 / I3） ============
+
+test('I1 依赖图在缓存与非缓存两条路径上必须一致（同一个真相不许有两个答案）', async (t) => {
   const root = tmpRoot(t)
-  mkdirSync(join(root, '.internal'), { recursive: true })
-  for (const f of ['nav-index.json', 'vector.json', 'nav-actions.json', 'nav-docs.json', 'nav-arch.json']) {
-    writeFileSync(join(root, '.internal', f), JSON.stringify({}), 'utf-8')
-  }
-  const r = await migrateLegacy(root)
-  assert.equal(r.status, 'migrated')
-  for (const f of ['nav-index.json', 'vector.json', 'nav-actions.json', 'nav-docs.json', 'nav-arch.json']) {
-    assert.equal(existsSync(join(root, '.internal', f)), false)
-    assert.equal(existsSync(join(root, '.internal', 'legacy', f)), true)
-  }
+  await seed(root)
+  put(root, 'src/b.js', "import './a.js'\n")
+  const cold = loadModel(root, { useCache: false })
+  const warm = loadModel(root, { useCache: true })
+  assert.deepEqual([...cold.edges.fileEdges], [...warm.edges.fileEdges])
+  assert.deepEqual([...cold.edges.deps], [...warm.edges.deps])
+})
+
+test('I3 删掉 runtime/ 后依赖图无损重建（它是磁盘派生，不是长期资产）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, 'src/b.js', "import './a.js'\n")
+  const before = [...buildModel(root).edges.fileEdges]
+  rmSync(join(root, '.internal', 'runtime'), { recursive: true, force: true })
+  const after = [...buildModel(root).edges.fileEdges]
+  assert.deepEqual(before, after)
+  assert.equal(existsSync(join(root, '.internal', 'runtime')), false, '重建发生在内存里，不留下资产')
 })

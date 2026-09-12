@@ -88,7 +88,7 @@ test('nav_graph：项目名与模块归属键不同名时，地图仍能列出�
   assert.match(tree, /核心/, '模块必须出现在其项目下（归属键不一致曾让它彻底看不见）')
 })
 
-test('nav_commit：六闸接线 —— 假锚点被拒，且不留下任何记录', async (t) => {
+test('nav_commit：七闸接线 —— 假锚点被拒，且不留下任何记录', async (t) => {
   const { root, h } = await boot(t)
   await seed(root)
   const before = readEvents(root).events.length
@@ -150,14 +150,14 @@ test('nav_set：向量逐字段更新，未给字段保持', async (t) => {
   assert.equal(buildModel(root).vector.doing, '新焦点')
 })
 
-test('nav_graph：task 模式给影响面 + 架构档指针 + 下一步', async (t) => {
+test('nav_graph：task 模式给落点、影响面入口与下一步', async (t) => {
   const { root, h } = await boot(t)
   await seed(root)
   const out = await h.call('nav_graph', { mode: 'task', target: 'src/a.js' })
   assert.match(out, /File: src\/a\.js/)
   assert.match(out, /<- 功能 PN-F01/)
   assert.match(out, /模块 core/)
-  assert.match(out, /架构档指针/)
+  assert.match(out, /影响面: nav_graph mode=impact/)
   assert.match(out, /下一步: 改前先 nav_commit/)
 })
 
@@ -206,47 +206,7 @@ test('nav_render：三个投影全生成；标记缺失时明确拒绝而不是�
   assert.ok(!text.includes('\nold\n'), '标记内必须被重渲染')
 })
 
-test('nav_render：target=架构档 → 刷新指纹并变新鲜', async (t) => {
-  const { root, h } = await boot(t)
-  put(root, 'src/a.js', 'v1')
-  mkdirSync(join(root, '.internal', 'arch'), { recursive: true })
-  writeFileSync(join(root, '.internal', 'arch', 'd.md'), [
-    '---', 'arch-cache: |-', '  src/a.js: 0000000000000000000000000000000000000000', '---', '', '# d', ''
-  ].join('\n'), 'utf-8')
-  const out = await h.call('nav_render', { target: '.internal/arch/d.md' })
-  assert.match(out, /架构档指纹: .*已刷新/)
-  const after = readFileSync(join(root, '.internal', 'arch', 'd.md'), 'utf-8')
-  assert.ok(!after.includes('0000000000000000000000000000000000000000'))
-})
-
-test('nav_node layer=migrate：旧账本一次性折叠 + 归档', async (t) => {
-  const { root, h } = await boot(t)
-  mkdirSync(join(root, '.internal'), { recursive: true })
-  writeFileSync(join(root, '.internal', 'nav-index.json'), JSON.stringify({
-    projectPaths: { alpha: 'alpha' },
-    projects: { alpha: { name: 'Alpha' } },
-    modules: { editor: { name: 'Editor', project: 'alpha', features: ['A-F01'] } },
-    features: { 'A-F01': { name: 'Edit', files: ['alpha/e.js'] } },
-    indexes: { fileToFeature: { 'alpha/e.js': ['A-F01'] }, featureToFiles: { 'A-F01': ['alpha/e.js'] } }
-  }), 'utf-8')
-  writeFileSync(join(root, '.internal', 'vector.json'), JSON.stringify({ doing: 'alpha' }), 'utf-8')
-  const out = await h.call('nav_node', { layer: 'migrate' })
-  assert.match(out, /迁移完成/)
-  assert.equal(existsSync(join(root, '.internal', 'legacy', 'vector.json')), true)
-  assert.equal(existsSync(join(root, '.internal', 'vector.json')), false)
-  assert.equal(buildModel(root).vector.doing, 'alpha')
-})
-
-test('nav_graph mode=legacy：迁移前能看清旧账本全貌', async (t) => {
-  const { root, h } = await boot(t)
-  mkdirSync(join(root, '.internal'), { recursive: true })
-  writeFileSync(join(root, '.internal', 'vector.json'), JSON.stringify({ doing: 'x' }), 'utf-8')
-  const out = await h.call('nav_graph', { mode: 'legacy' })
-  assert.match(out, /vector\.json/)
-  assert.match(out, /未迁移/)
-})
-
-test('端到端：六闸全绿的一笔改动 —— 登记 → 改 → 自动收口 → 投影', async (t) => {
+test('端到端：七闸全绿的一笔改动 —— 登记 → 改 → 自动收口 → 投影', async (t) => {
   const { root, h } = await boot(t)
   await seed(root, { files: ['src/a.js'] })
   const commit = await h.call('nav_commit', { task: '给 A 加一层', anchor: 'PN-F01', arch: '架构不变，纯局部', features: 'PN-F01' })
@@ -254,6 +214,7 @@ test('端到端：六闸全绿的一笔改动 —— 登记 → 改 → 自动�
   assert.match(commit, /✓ anchor/)
   assert.match(commit, /✓ scope/)
   assert.match(commit, /✓ mainline/)
+  assert.match(commit, /✓ impact/)
   assert.match(commit, /✓ count/)
   assert.match(commit, /✓ decision/)
   touch(root, 'src/a.js', 'v2')
@@ -269,4 +230,20 @@ test('端到端：六闸全绿的一笔改动 —— 登记 → 改 → 自动�
   assert.match(proj, /接口按节点粒度/)
   assert.match(proj, /给 A 加一层/, '已收口的改动必须在人类可读投影里可回溯')
   assert.match(proj, /## 最近的收口/)
+})
+
+test('nav_graph mode=impact：端到端给出依赖图两侧（我引用谁 / 谁引用我）', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root)                                   // PN-F01 -> src/a.js
+  put(root, 'src/b.js', "import a from './a.js'\n")
+  await appendEvents(root, [
+    { kind: 'node', op: 'upsert', layer: 'feature', id: 'PN-F02', fields: { name: 'PN-F02', files: ['src/b.js'], module: 'core' } }
+  ])
+  const out = await h.call('nav_graph', { mode: 'impact', target: 'PN-F01' })
+  assert.match(out, /我引用谁/)
+  assert.match(out, /谁引用我/, '影响面就是本插件存在的理由，必须直出')
+  assert.match(out, /src\/b\.js/, '引用方要列出来')
+  assert.match(out, /依赖图: 范围=/)
+  assert.match(out, /扫 \d+ 个代码文件/)
+  assert.match(out, /候选 \d+ 文件/)
 })

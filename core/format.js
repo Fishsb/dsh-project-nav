@@ -2,7 +2,7 @@
 //
 // 一切"说给模型看"的文本都在这里成形，避免 host 里散落字符串模板。
 
-import { key } from './paths.js'
+import { key, normSlashes } from './paths.js'
 import { coverage, moduleBelongsTo, REPEAT_PATCH_THRESHOLD } from './model.js'
 import { renderTreeText } from './render.js'
 
@@ -29,7 +29,7 @@ export function truncate(s, n = 120) {
   return t.length > n ? `${t.slice(0, n)}…` : t
 }
 
-export function renderHealth(model, { rootPath, opens, locks = [], inflight = [], archDocs = [], logCheck = null } = {}) {
+export function renderHealth(model, { rootPath, opens, locks = [], inflight = [], logCheck = null } = {}) {
   const cv = coverage(model)
   const L = []
   L.push('Health')
@@ -48,11 +48,12 @@ export function renderHealth(model, { rootPath, opens, locks = [], inflight = []
   }
   if (inflight.length) L.push(`    在途状态文件: ${inflight.length}（runtime 缓存，可丢）`)
   L.push('')
-  L.push(`  架构档 (${archDocs.length}): 新鲜 ${archDocs.filter((d) => d.fresh).length} / 过期 ${archDocs.filter((d) => !d.fresh).length}`)
-  for (const d of archDocs.filter((x) => !x.fresh)) L.push(`    ⛔ ${d.path} — ${truncate(d.reason, 110)}`)
-  L.push('')
   L.push(`  架构决策: ${model.decisions.length} 条${model.decisions.length ? `（最近 ${model.decisions[model.decisions.length - 1].id} @ ${model.decisions[model.decisions.length - 1].anchor}）` : ''}`)
-  const pressure = [...model.patchPressure.values()].filter((p) => p.sinceDecisionCount >= 2)
+  const pressure = [...model.patchPressure.values()].filter((p) => {
+    if (p.sinceDecisionCount < 2) return false
+    const n = model.nodes.get(p.anchor)
+    return !(n && n.status === 'retired')     // 退役锚点的历史计数没有意义：它已不可能再被锚定
+  })
   if (pressure.length) {
     L.push('  ⚠ 计数闸压力:')
     for (const p of pressure) L.push(`    · ${p.anchor} ${p.sinceDecisionCount}/${REPEAT_PATCH_THRESHOLD}（自 ${p.sinceDecision || '项目开始'}）`)
@@ -146,6 +147,57 @@ export function renderScopeTarget(model, loc) {
   return L.join('\n')
 }
 
+/**
+ * 影响面（依赖图 · 文件精度）。这是"全局思想"的读侧入口：
+ * 动手前看一眼——我改的东西，谁在引用；我又引用了谁。
+ */
+export function renderImpact(model, loc) {
+  const files = loc.kind === 'file' ? [loc.file] : (loc.node?.files || [])
+  const title = loc.kind === 'file'
+    ? `File: ${loc.file}`
+    : `${loc.kind}: ${loc.node?.name}${loc.node?.meta?.name ? ` — ${loc.node.meta.name}` : ''}`
+  if (!files.length) return `${title}\n  落点: (空) —— 依赖图无话可说（先 nav_node files= 登记落点）`
+
+  const inside = new Set(files.map(key))
+  const mine = new Set(files.map(normSlashes))
+
+  const outbound = new Map()          // 我的文件 → 它引用的 scope 外文件
+  for (const f of mine) {
+    const tos = (model.edges.fileEdges.get(f) || []).filter((t) => !inside.has(key(t)))
+    if (tos.length) outbound.set(f, tos)
+  }
+  const inbound = new Map()           // scope 外文件 → 它引用的我的文件
+  for (const [from, tos] of model.edges.fileEdges) {
+    if (inside.has(key(from))) continue
+    const hits = tos.filter((t) => inside.has(key(t)))
+    if (hits.length) inbound.set(normSlashes(from), hits)
+  }
+
+  const L = [`${title}  —  ${files.length} 个落点文件`, '']
+  L.push(`↓ 我引用谁（${outbound.size} 个落点有外部依赖）:`)
+  if (!outbound.size) L.push('  (无 —— 不依赖任何 scope 外文件)')
+  for (const [f, ts] of [...outbound].slice(0, 12)) L.push(`  ${f} → ${ts.join(', ')}`)
+
+  const nodes = new Set()
+  for (const f of inbound.keys()) for (const o of model.fileOwners.get(key(f)) || []) nodes.add(o)
+  L.push('')
+  L.push(`↑ 谁引用我 = 影响面（${inbound.size} 个文件 · ${nodes.size} 个节点）:`)
+  if (!inbound.size) L.push('  (无 —— 没有 scope 外文件依赖它，这次改动是局部封闭的)')
+  for (const [f, ts] of [...inbound].slice(0, 12)) L.push(`  ${f} ← 被 ${ts.join(', ')} 引用`)
+  if (nodes.size) L.push(`  波及节点: ${[...nodes].slice(0, 12).join('、')}${nodes.size > 12 ? ` …+${nodes.size - 12}` : ''}`)
+
+  const e = model.edges
+  const sc = e.scope || { mode: 'all', dirs: [], candidates: 0 }
+  const where = sc.mode === 'projects'
+    ? `已登记项目目录（${sc.dirs.length} 个）`
+    : '全仓 fallback（取不到项目目录 ⇒ 降级为全量，绝不静默扫空）'
+  L.push('')
+  L.push(`依赖图: 范围=${where} · 候选 ${sc.candidates} 文件 → 扫 ${e.scanned} 个代码文件 · ${e.fileEdges.size} 条文件边 · 外部包 ${e.external.size} 个文件有 bare import`)
+  if (e.unresolved.length) L.push(`  ⚠ ${e.unresolved.length} 条相对引用解析不到（未静默丢弃，用 mode=json 可取全量）`)
+  if (e.skipped.length) L.push(`  跳过 ${e.skipped.length} 个超体量文件（打包产物，噪声大于信号）`)
+  return L.join('\n')
+}
+
 export function renderGaps(model, { limit = 30 } = {}) {
   const L = []
   L.push(`Gaps — 未登记文件 ${model.unregistered.length} · STALE 落点 ${model.stale.length}`)
@@ -210,21 +262,6 @@ export function renderAdrs(model, { anchor = '', limit = 20 } = {}) {
   return L.join('\n')
 }
 
-export function renderArchDocs(docs, { target = '', model = null } = {}) {
-  if (!docs.length) return 'No arch docs found under .internal/arch/ (none registered / none existing).'
-  const fresh = docs.filter((d) => d.fresh)
-  const L = [`Arch Docs (${docs.length}): 新鲜 ${fresh.length} / 过期 ${docs.length - fresh.length}`]
-  for (const d of docs) {
-    L.push(`  ${d.fresh ? '✓' : '⛔'} ${d.path} — ${d.reason}`)
-    if (!d.fresh && d.files?.length) {
-      const bad = d.files.filter((f) => f.status !== 'same')
-      if (bad.length) L.push(`      变动: ${bad.map((f) => `${f.path}:${f.status}`).slice(0, 6).join(', ')}`)
-      L.push(`      -> 重生成内容后 nav_render target=${d.path} 刷新指纹`)
-    }
-  }
-  return L.join('\n')
-}
-
 export function renderMap(model, { target = '' } = {}) {
   return renderTreeText(model, { target })
 }
@@ -272,6 +309,5 @@ export function renderCommitResult(res, model) {
   }
   L.push('')
   L.push('收口无需动作：改完文件后，下一次任意工具调用会按证据自动收口（A1）。')
-  L.push('架构档: ' + (res.archNote || '（nav_graph mode=arch 查新鲜度）'))
   return L.join('\n')
 }

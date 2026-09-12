@@ -1,13 +1,17 @@
-// core/gates.js — 六闸（ARCHITECTURE §5）
+// core/gates.js — 七闸（ARCHITECTURE §6）
 //
 // 每个闸门都是**对架构模型的纯查询**，不是独立流程。这是 P3 的直接后果：
 //   · 没有 begin/done 生命周期 ⇒ 不可能产生"孤儿动作"
 //   · 闸门不持有状态 ⇒ 不需要身份 ⇒ 报错原文「a session can only drive its own actions」消失
 //
 // 强度只有两档：reject（拒，写不进去）与 warn（告警，写进去但信号可见）。
+//
+// 告警闸的纪律（否则闸门会变成"狼来了"）：只报**跨节点**的牵动。
+// 同一节点内部的引用是预期行为，报出来就是噪声。
 
 import { key, normSlashes } from './paths.js'
-import { normalizeAnchor, pressureFor, REPEAT_PATCH_THRESHOLD } from './model.js'
+import { normalizeAnchor, pressureFor, impactOf, REPEAT_PATCH_THRESHOLD } from './model.js'
+import { isTestPath } from './scope.js'
 
 export const SEVERITY = { REJECT: 'reject', WARN: 'warn' }
 
@@ -94,6 +98,44 @@ export function mainlineGate(model, intent) {
   return ok('mainline', 'scope 涉及的模块都在主线上')
 }
 
+/** 闸门 7 · 影响面闸：scope 的落点被 **scope 之外的节点** 引用了吗？（全局思想的最小强制） */
+export function impactGate(model, intent) {
+  const files = intent.materialized?.files || []
+  if (!files.length) return ok('impact', '无落点文件，影响面不可判（scope 为空时不误报）')
+
+  // scope 自己的节点集 = 显式声明的 ∪ 从落点归属推导的
+  const scopeNodes = new Set()
+  for (const f of files) for (const o of model.fileOwners.get(key(f)) || []) scopeNodes.add(o)
+  for (const c of intent.scope?.features || []) scopeNodes.add(`feature:${key(c)}`)
+  for (const m of intent.scope?.modules || []) scopeNodes.add(`module:${key(m)}`)
+
+  const impact = impactOf(model, files)
+  const outside = []                     // [被引文件, [scope 外的引用方]]
+  for (const [target, froms] of impact) {
+    const outs = froms.filter((f) => {
+      if (isTestPath(f)) return false                    // 测试是预期下游，不算"意外牵动"
+      const owners = model.fileOwners.get(key(f)) || []
+      return owners.length > 0 && owners.every((o) => !scopeNodes.has(o))
+    })
+    if (outs.length) outside.push([target, outs])
+  }
+  if (!outside.length) return ok('impact', `本 scope 的 ${files.length} 个落点没有被 scope 外的节点引用`)
+
+  const downFiles = new Set()
+  const downNodes = new Set()
+  for (const [, froms] of outside) {
+    for (const f of froms) {
+      downFiles.add(f)
+      for (const o of model.fileOwners.get(key(f)) || []) downNodes.add(o)
+    }
+  }
+  const bare = (id) => String(id).slice(String(id).indexOf(':') + 1)
+  const names = [...downNodes].map(bare)
+  return warn('impact',
+    `影响面：scope 外的 ${downFiles.size} 个文件引用本 scope 落点，涉及 ${downNodes.size} 个节点（${names.slice(0, 6).join('、')}${names.length > 6 ? ` …+${names.length - 6}` : ''}）。`,
+    `改这里会牵动它们 —— 确认是否一并纳入 scope，或明确下游不受影响：${outside.slice(0, 4).map(([t, fs]) => `${t} ← ${fs.slice(0, 3).join(', ')}${fs.length > 3 ? '…' : ''}`).join('；')}${outside.length > 4 ? ` …(+${outside.length - 4} 处)` : ''}`)
+}
+
 /** 闸门 4 · 计数闸：同一锚点是否又在反复打补丁？ */
 export function countGate(model, anchor, { threshold = REPEAT_PATCH_THRESHOLD } = {}) {
   const p = pressureFor(model, anchor)
@@ -144,6 +186,7 @@ export function runGates(model, intent, opts = {}) {
     anchorGate(model, intent.anchor),
     scopeGate(model, intent),
     mainlineGate(model, intent),
+    impactGate(model, intent),
     countGate(model, intent.anchor, opts),
     decisionGate(intent),
     completionGate(model, opts)

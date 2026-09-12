@@ -22,12 +22,11 @@ import { loadModel, normalizeAnchor, pressureFor, coverage, REPEAT_PATCH_THRESHO
 import { appendEvents, verifyLog, readEvents } from '../core/log.js'
 import { reconcile, commitIntent, archiveIntent, inflightView, materialize } from '../core/commit.js'
 import { locate, resolveScope, evidenceOf } from '../core/scope.js'
-import { listArchDocs, archDocsFor, stampArchDoc, renderAll, renderMapHtml, renderTreeText, archDocState } from '../core/render.js'
+import { renderAll, renderMapHtml, renderTreeText } from '../core/render.js'
 import { listLocks } from '../core/lock.js'
-import { inspectLegacy, migrateLegacy } from '../core/legacy.js'
 import {
   splitList, parseKv, truncate, renderHealth, renderScopeTarget, renderGaps,
-  renderDocs, renderAdrs, renderArchDocs, renderMap, renderCommitResult
+  renderDocs, renderAdrs, renderMap, renderCommitResult, renderImpact
 } from '../core/format.js'
 export const name = '@dsh-external/project-nav'
 // `tools` 是唯一依赖：6 个工具全部经 ctx.tools.register 注册。
@@ -72,9 +71,9 @@ export function apply(ctx, config) {
   // ---- 1. nav_graph — 读：模型查询 ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_graph',
-    description: 'Query the architecture model (the single source of truth folded from the event log). Modes: task (expand a target into features/modules/projects + gates), gaps (unregistered files + STALE落点), coverage, docs (reference docs / rank by task), adrs, arch (arch doc freshness), map (text tree), health (snapshot: coverage + in-flight + pressure + arch freshness + log integrity), legacy (old ledger to migrate), json. Read-only.',
+    description: 'Query the architecture model (the single source of truth folded from the event log). Modes: task (expand a target into features/modules/projects + gates), impact (dependency graph: what this target imports and — the point — what imports IT), gaps (unregistered files + STALE落点), coverage, docs (reference docs / rank by task), adrs, map (text tree), health (snapshot: coverage + in-flight + pressure + log integrity), json. Read-only.',
     parameters: {
-      mode: { type: 'string', description: 'task (default) | gaps | coverage | docs | adrs | arch | map | health | legacy | json' },
+      mode: { type: 'string', description: 'task (default) | impact | gaps | coverage | docs | adrs | map | health | json' },
       target: { type: 'string', description: 'task/map: file path, feature code, module or project name; docs: task description to rank; adrs: anchor' },
       format: { type: 'string', description: 'text (default) | json' }
     },
@@ -92,18 +91,14 @@ export function apply(ctx, config) {
           const out = [renderScopeTarget(model, loc)]
           if (loc.kind !== 'empty' && loc.kind !== 'unknown') {
             const files = loc.kind === 'file' ? [loc.file] : (loc.node?.files || [])
-            const owners = files.flatMap((f) => model.fileOwners.get(key(f)) || [])
-            const docs = archDocsFor(root, model, loc.kind === 'file' ? loc.file : (loc.node?.name || args.target))
             out.push('')
-            out.push('架构档指针:')
-            if (!docs.length) out.push('  (无覆盖此目标的架构档 — 若这是架构级改动，先出/更新 .internal/arch/*.md)')
-            for (const d of docs) out.push(`  ${d.fresh ? '✓' : '⛔'} ${d.path} — ${d.reason}`)
+            out.push(`影响面: nav_graph mode=impact target=${loc.kind === 'file' ? loc.file : loc.node?.name}`)
             const open = model.openCommits.filter((c) => (c.files || []).some((f) => files.includes(f)))
             if (open.length) { out.push(''); for (const c of open) out.push(`🔴 在途: ${c.id} ${c.task}（${c.actor ? `by ${String(c.actor).slice(0, 8)}` : 'actor=?'}）`) }
             const pressure = model.patchPressure.get(key(loc.kind === 'file' ? loc.file : loc.node?.id))
             if (pressure && pressure.sinceDecisionCount >= 2) out.push(`⚠ 计数闸: ${pressure.anchor} ${pressure.sinceDecisionCount}/${REPEAT_PATCH_THRESHOLD}`)
             out.push('')
-            out.push('下一步: 改前先 nav_commit（锚点 + scope + arch= 一句话），它跑六闸。')
+            out.push('下一步: 改前先 nav_commit（锚点 + scope + arch= 一句话），它跑七闸。')
           }
           return out.join('\n')
         }
@@ -114,26 +109,24 @@ export function apply(ctx, config) {
         }
         if (mode === 'docs') return renderDocs(model, { task: args.target || '' })
         if (mode === 'adrs') return renderAdrs(model, { anchor: args.target || '' })
-        if (mode === 'arch') {
-          const all = listArchDocs(root)
-          const docs = args.target ? archDocsFor(root, model, args.target) : all
-          return renderArchDocs(docs, { target: args.target, model })
+        if (mode === 'impact') {
+          const loc = locate(root, model, args.target)
+          if (loc.kind === 'empty' || loc.kind === 'unknown') {
+            return `No mapping found for "${args.target}" — 影响面要先有落点登记（nav_node target=<功能码> files=…）。`
+          }
+          return renderImpact(model, loc)
         }
         if (mode === 'map') return renderMap(model, { target: args.target || '' })
-        if (mode === 'legacy') {
-          const info = inspectLegacy(root)
-          return [`Legacy ledgers (.internal/):`, ...Object.entries(info.files).map(([f, v]) => `  ${v === null ? '· (absent)' : v.corrupt ? `⛔ ${f} (corrupt)` : `· ${f}: ${JSON.stringify(v)}`}`), info.alreadyMigrated ? `\n已迁移: ${info.marker?.at}（${info.marker?.events} 事件）` : '\n未迁移 → 用 nav_graph mode=legacy json 看全貌，迁移动作用 nav_node layer=migrate'].join('\n')
-        }
         if (mode === 'json') return j(snapshotOf(model, root, lastReconcile, 'health'))
-        return renderHealth(model, { rootPath: root, opens: model.openCommits, inflight: inflightView(root), locks: listLocks(root), archDocs: listArchDocs(root), logCheck: verifyLog(root) })
+        return renderHealth(model, { rootPath: root, opens: model.openCommits, inflight: inflightView(root), locks: listLocks(root), logCheck: verifyLog(root) })
       } catch (e) { return err(e) }
     }
   })), 'project-nav: nav_graph')
 
-  // ---- 2. nav_commit — 写：登记改动意图（自动对账 + 六闸） ----
+  // ---- 2. nav_commit — 写：登记改动意图（自动对账 + 七闸） ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_commit',
-    description: 'Record a change intent BEFORE touching anything: anchor (architecture node) + scope + a one-line architecture reflection (arch=). Runs six gates (anchor/count/scope/mainline/decision/completion). Closure needs no second call: when the scope evidence changes, the next tool call on any session closes it automatically (evidence-based, session-independent). mode=archive voids a stale intent explicitly.',
+    description: 'Record a change intent BEFORE touching anything: anchor (architecture node) + scope + a one-line architecture reflection (arch=). Runs seven gates (anchor/scope/mainline/impact/count/decision/completion). Closure needs no second call: when the scope evidence changes, the next tool call on any session closes it automatically (evidence-based, session-independent). mode=archive voids a stale intent explicitly.',
     parameters: {
       task: { type: 'string', required: true, description: 'One-line task description' },
       anchor: { type: 'string', required: true, description: 'Architecture node this task belongs to: feature code / module / project / file path / .internal/arch/*.md' },
@@ -164,10 +157,6 @@ export function apply(ctx, config) {
         }, { actor })
         const model = loadModel(root)
         const files = res.materialized?.files || []
-        const docs = archDocsFor(root, model, args.anchor)
-        res.archNote = docs.length
-          ? docs.map((d) => `${d.fresh ? '✓' : '⛔'} ${d.path}`).join(' / ')
-          : '无覆盖此锚点的架构档'
         const text = renderCommitResult(res, model)
         if (res.status === 'ok' && files.length) {
           return `${text}\n\n改动完成后无需再调用本工具收口。若这属于架构级改动，记得 nav_decide。`
@@ -214,10 +203,10 @@ export function apply(ctx, config) {
   // ---- 4. nav_node — 写：节点 upsert / 退役 / 文档工件 / 迁移 ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_node',
-    description: 'Create-or-update an architecture node (upsert), register a reference-doc artifact, retire a node with cascade, or run the one-time legacy migration. Existing target = field update; absent target + creation fields = create. Arbitrary fields via set=k=v pairs. layer=migrate folds the legacy .internal ledgers into the event log once.',
+    description: 'Create-or-update an architecture node (upsert), register a reference-doc artifact, or retire a node with cascade. Existing target = field update; absent target + creation fields = create. Arbitrary fields via set=k=v pairs.',
     parameters: {
       target: { type: 'string', description: 'Feature code / module name / project name / artifact id' },
-      layer: { type: 'string', description: 'project | module | feature | artifact | migrate' },
+      layer: { type: 'string', description: 'project | module | feature | artifact' },
       name: { type: 'string', description: 'Human-readable name' },
       files: { type: 'string', description: 'Feature/artifact: comma-separated file paths (REPLACES the file list)' },
       features: { type: 'string', description: 'Module: comma-separated feature codes (REPLACES the list; empty = module shell)' },
@@ -233,21 +222,6 @@ export function apply(ctx, config) {
     output: OUTPUT,
     async execute(args) {
       try {
-        if (String(args.layer || '').toLowerCase() === 'migrate') {
-          const info = inspectLegacy(root)
-          if (!info.files || Object.values(info.files).every((v) => v === null)) return 'Legacy ledgers absent — nothing to migrate.'
-          const r = await migrateLegacy(root)
-          if (r.status === 'already-migrated') return `Already migrated at ${r.marker?.at} (${r.marker?.events} events, seq ${JSON.stringify(r.marker?.seqRange)}).`
-          if (r.status === 'nothing-to-migrate') return 'Legacy ledgers present but contained no entries — nothing migrated.'
-          return [
-            `✓ 迁移完成：${r.events} 事件（seq ${r.seqRange[0]}…${r.seqRange[1]}）`,
-            `  归档: ${r.archived.map((a) => a.to).join(', ') || '(none)'}`,
-            ...(r.warnings.length ? ['', '⚠ 警告:', ...r.warnings.map((w) => `  - ${w}`)] : []),
-            '',
-            '旧账本已成为只读快照（.internal/legacy/）。之后所有治理数据只写 .internal/events.jsonl。',
-            '下一步: nav_render 重建全部投影。'
-          ].join('\n')
-        }
         if (args.retire) {
           const model = await refresh()
           const layer = args.layer ? String(args.layer).toLowerCase() : null
@@ -345,9 +319,8 @@ export function apply(ctx, config) {
   // ---- 5. nav_render — 写：重生成全部投影（I2） ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_render',
-    description: 'Regenerate every projection from the model: PROJECT.md marker section (outside the markers is never touched), .internal/ARCH-MODEL.md (the human-readable model snapshot), the HTML map, and optionally an arch doc fingerprint stamp. Renderings are never hand-written — hand edits are overwritten by the next render.',
+    description: 'Regenerate every projection from the model: PROJECT.md marker section (outside the markers is never touched), .internal/ARCH-MODEL.md (the human-readable model snapshot), the HTML map. Renderings are never hand-written — hand edits are overwritten by the next render.',
     parameters: {
-      target: { type: 'string', description: 'Optional: an arch doc path (.internal/arch/*.md) to stamp after you regenerated its content' },
       path: { type: 'string', description: 'Optional: PROJECT.md path override (default PROJECT.md at the governed root)' }
     },
     output: OUTPUT,
@@ -359,17 +332,6 @@ export function apply(ctx, config) {
         L.push(`  PROJECT.md 标记区: ${res.project.markerMissing ? '⛔ 找不到 nav:auto 标记（未写入，Once-Only：绝不猜位置）' : res.project.changed ? `已更新${res.project.created ? '（新建）' : ''}` : '无变化'}`)
         L.push(`  模型文档: ${res.modelDoc.path}`)
         L.push(`  地图: ${res.map.path}`)
-        if (args.target) {
-          try {
-            const s = stampArchDoc(root, args.target)
-            L.push(`  架构档指纹: ${s.path} ${s.changed ? `已刷新（声明 ${s.declared} 文件）` : '无变化'}`)
-          } catch (e) {
-            L.push(`  ⛔ 架构档指纹刷新失败: ${e.message}`)
-          }
-        } else {
-          const stale = listArchDocs(root).filter((d) => !d.fresh)
-          if (stale.length) L.push(`  ⚠ ${stale.length} 个架构档过期（重生成内容后 nav_render target=<档> 刷新指纹）: ${stale.map((d) => d.path).join(', ')}`)
-        }
         if (res.project.markerMissing) L.push('  → 目标 md 里加上 <!-- nav:auto:start --> / <!-- nav:auto:end --> 两个标记后重跑。')
         return L.join('\n')
       } catch (e) { return err(e) }

@@ -1,12 +1,15 @@
 // core/render.js — 渲染投影（I2）
 //
 // 一切产出都是**模型的重渲染**，零手写：
-//   PROJECT.md 标记区 · 模型文档（ARCH-MODEL.md）· 地图 text/html · 架构档指纹指针
+//   PROJECT.md 标记区 · 模型文档（ARCH-MODEL.md）· 地图 text/html
 // 手改渲染物 => 下一次渲染覆盖它（这就是 I2 的验法，不是靠"人别改"）。
+//
+// ⚠ 架构档（.internal/arch/*.md）**不再是本文件的事**：按 ARCHITECTURE §2，它已从
+// "要维护的资产（sha1 指纹 + 新鲜度机检 + 行号重锚）"降级为**按需临时投影**。
+// 需要把架构档纳入路由时，把它登记成普通的 artifact 节点（nav_node layer=artifact when=…），
+// 用 nav_graph mode=docs 按任务检索 —— 复用已有机制，不新增一套指纹契约。
 
-import { createHash } from 'node:crypto'
-import { readFileSync, readdirSync, existsSync } from 'node:fs'
-import { execFileSync } from 'node:child_process'
+import { readFileSync, existsSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { normSlashes, key, paths, nowIso } from './paths.js'
 import { coverage, moduleBelongsTo } from './model.js'
@@ -14,204 +17,6 @@ import { rewriteVerified } from './log.js'
 
 export const MARK_START = '<!-- nav:auto:start -->'
 export const MARK_END = '<!-- nav:auto:end -->'
-
-// ---- 最小 YAML 读（只支持本插件写出的扁平映射，够用且无依赖） ----
-
-function parseFlatYaml(text) {
-  const out = {}
-  for (const line of String(text).split(/\r?\n/)) {
-    const m = /^\s*([A-Za-z_][\w./-]*):\s*(.*)$/.exec(line)
-    if (m) out[m[1]] = m[2]
-  }
-  return out
-}
-
-// ---- 架构档（.internal/arch/*.md） ----
-
-/**
- * 解析架构档头部的 arch-cache 指纹块。
- * 兼容两种块格式（本插件写 YAML 块 `arch-cache: |-`，旧档为 ```arch-cache 围栏 JSON）。
- * @returns {{source:string|null, files:Array<{path:string,sha1:string}>, at:string|null, head:string|null}|null}
- */
-export function parseArchCache(text) {
-  const src = String(text || '').slice(0, 65536) // 窗口须容下整个 frontmatter：8000 会截断大声明档（79 文件 ≈ 8.1KB）→ 恒报未纳管
-  const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(src)
-  const front = fm ? parseFlatYaml(fm[1]) : {}
-  let blockText = null
-  const inline = front['arch-cache']
-  if (inline !== undefined) {
-    if (/^[|>]/.test(inline.trim())) {
-      // YAML 块标量：取 frontmatter 内 arch-cache: 之后的缩进行。
-      // 空行**不断块** —— 早期实现把正文前的空行当结束符，结果"有头文件却报未纳管"。
-      const lines = fm[1].split(/\r?\n/)
-      const start = lines.findIndex((l) => /^\s*arch-cache:/.test(l))
-      if (start >= 0) {
-        const collected = []
-        for (let i = start + 1; i < lines.length; i++) {
-          const l = lines[i]
-          if (/^\s{2,}/.test(l)) { collected.push(l.trim()); continue }
-          if (l.trim() === '') { collected.push(''); continue }
-          break
-        }
-        blockText = collected.join('\n').trim() || null
-      }
-    } else {
-      blockText = inline.trim()
-    }
-  }
-  if (!blockText) {
-    const fence = /```arch-cache\s*\n([\s\S]*?)```/.exec(src)
-    if (fence) blockText = fence[1].trim()
-  }
-  if (!blockText) return null
-
-  if (blockText.startsWith('{')) {
-    try {
-      const j = JSON.parse(blockText)
-      return {
-        source: 'json',
-        files: Array.isArray(j.files) ? j.files.map((f) => ({ path: String(f.path ?? f.file), sha1: String(f.sha1 || '') })) : [],
-        at: j.at || j.generated || null,
-        head: j.head || null
-      }
-    } catch { return { source: 'json-invalid', files: [], at: null, head: null } }
-  }
-  const kv = parseFlatYaml(blockText)
-  const files = []
-  for (const [k, v] of Object.entries(kv)) {
-    if (k === 'files' || k === 'at' || k === 'head') continue
-    files.push({ path: k, sha1: String(v).trim() })
-  }
-  return { source: 'yaml', files, at: kv.at || null, head: kv.head || null }
-}
-
-function sha1OfFile(abs) {
-  try { return createHash('sha1').update(readFileSync(abs)).digest('hex') } catch { return null }
-}
-
-let cachedHead = { at: 0, value: null }
-/** 当前 HEAD commit（epoch 标记；git 不可用时为 null，不阻塞任何事）。 */
-export function headCommit(rootPath) {
-  if (Date.now() - cachedHead.at < 5000) return cachedHead.value
-  let v = null
-  try {
-    v = execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: rootPath, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
-  } catch { v = null }
-  cachedHead = { at: Date.now(), value: v }
-  return v
-}
-
-/**
- * 一个架构档的新鲜度。判据 = 声明文件的 sha1 是否与当前一致（D2 的机检面）。
- * @returns {{path,exists,fresh,reason,files:Array<{path,status}>,declared:number,noHeader:boolean}}
- */
-export function archDocState(rootPath, relPath, { text = null } = {}) {
-  const rel = normSlashes(relPath)
-  const abs = join(rootPath, rel)
-  if (!existsSync(abs)) return { path: rel, exists: false, fresh: false, reason: 'file missing', files: [], declared: 0, noHeader: false }
-  const body = text ?? readFileSync(abs, 'utf-8')
-  const cache = parseArchCache(body)
-  if (!cache) return { path: rel, exists: true, fresh: false, reason: 'no arch-cache header (未纳管)', files: [], declared: 0, noHeader: true }
-  if (cache.source === 'json-invalid') return { path: rel, exists: true, fresh: false, reason: 'arch-cache header unparsable', files: [], declared: 0, noHeader: false }
-  if (!cache.files.length) return { path: rel, exists: true, fresh: false, reason: 'arch-cache declares no source files', files: [], declared: 0, noHeader: false }
-
-  const files = []
-  let staleCount = 0
-  for (const f of cache.files) {
-    const fAbs = join(rootPath, f.path)
-    if (!existsSync(fAbs)) { files.push({ path: f.path, status: 'missing' }); staleCount++; continue }
-    const cur = sha1OfFile(fAbs)
-    if (!f.sha1) { files.push({ path: f.path, status: 'unstamped' }); staleCount++; continue }
-    if (cur !== f.sha1) { files.push({ path: f.path, status: 'changed' }); staleCount++; continue }
-    files.push({ path: f.path, status: 'same' })
-  }
-  if (staleCount) {
-    const bad = files.filter((f) => f.status !== 'same')
-    return {
-      path: rel, exists: true, fresh: false,
-      reason: `声明 ${cache.files.length} 个源文件中有 ${staleCount} 个已变（${bad.map((f) => `${f.path}:${f.status}`).join(', ')}）`,
-      files, declared: cache.files.length, noHeader: false, at: cache.at
-    }
-  }
-  const head = headCommit(rootPath)
-  const headNote = cache.head && head && cache.head !== head ? `（HEAD 已从 ${cache.head} 前移到 ${head}，但声明文件内容未变 -> 仍视为新鲜）` : ''
-  return { path: rel, exists: true, fresh: true, reason: `声明 ${cache.files.length} 文件的 sha1 全部一致${headNote}`, files, declared: cache.files.length, noHeader: false, at: cache.at, head: cache.head }
-}
-
-/** 列出全部架构档的新鲜度。 */
-export function listArchDocs(rootPath) {
-  const dir = paths.archDir(rootPath)
-  if (!existsSync(dir)) return []
-  const out = []
-  for (const f of readdirSync(dir)) {
-    if (!f.endsWith('.md')) continue
-    const rel = normSlashes(relative(rootPath, join(dir, f)))
-    try { out.push(archDocState(rootPath, rel)) } catch (e) { out.push({ path: rel, exists: true, fresh: false, reason: `read failed: ${e.message}`, files: [], declared: 0 }) }
-  }
-  return out.sort((a, b) => a.path.localeCompare(b.path))
-}
-
-/** 覆盖某个目标的架构档（按声明文件 + 文件名启发匹配）。 */
-export function archDocsFor(rootPath, model, target) {
-  const docs = listArchDocs(rootPath)
-  const t = String(target ?? '').trim()
-  if (!t) return docs
-  const owners = model.fileOwners.get(key(t)) || []
-  const ownerFiles = new Set([normSlashes(t)])
-  for (const o of owners) {
-    const n = model.nodes.get(o)
-    for (const f of n?.files || []) ownerFiles.add(normSlashes(f))
-  }
-  const tk = key(t)
-  return docs.filter((d) => {
-    if (key(d.path).includes(tk)) return true
-    return (d.files || []).some((f) => ownerFiles.has(key(f.path)) || key(f.path).includes(tk))
-  })
-}
-
-/** 重写架构档的 arch-cache 头（stamp 的唯一实现）。正文其余部分零触碰。 */
-export function stampArchDoc(rootPath, relPath, { now = Date.now() } = {}) {
-  const rel = normSlashes(relPath)
-  const abs = join(rootPath, rel)
-  if (!existsSync(abs)) throw new Error(`arch doc not found: ${rel}`)
-  const text = readFileSync(abs, 'utf-8')
-  const cache = parseArchCache(text)
-  const declared = (cache?.files || []).map((f) => normSlashes(f.path)).filter(Boolean)
-  if (!declared.length) {
-    throw new Error(`arch doc ${rel} declares no source files in its arch-cache header — nothing to stamp. Add the declared file list to the header first (it is the doc's contract).`)
-  }
-  const lines = ['arch-cache: |-']
-  for (const f of declared) {
-    const sha = sha1OfFile(join(rootPath, f))
-    if (!sha) throw new Error(`declared file missing on disk: ${f} (refusing to stamp a doc against a file that does not exist)`)
-    lines.push(`  ${f}: ${sha}`)
-  }
-  lines.push(`  at: ${nowIso(now)}`)
-  const head = headCommit(rootPath)
-  if (head) lines.push(`  head: ${head}`)
-  const block = lines.join('\n')
-
-  let out
-  const fm = /^(---\r?\n)([\s\S]*?)(\r?\n---)/.exec(text)
-  if (fm && /^arch-cache:/m.test(fm[2])) {
-    const linesOfFm = fm[2].split(/\r?\n/)
-    const kept = []
-    for (let i = 0; i < linesOfFm.length; i++) {
-      if (/^arch-cache:/.test(linesOfFm[i])) { while (i + 1 < linesOfFm.length && /^\s{2,}/.test(linesOfFm[i + 1])) i++; continue }
-      kept.push(linesOfFm[i])
-    }
-    out = fm[1] + [...kept, ...block.split('\n')].join('\n') + fm[3] + text.slice(fm[0].length)
-  } else if (fm) {
-    out = fm[1] + fm[2] + '\n' + block + fm[3] + text.slice(fm[0].length)
-  } else {
-    out = `---\n${block}\n---\n\n${text}`
-  }
-  if (out === text) return { path: rel, changed: false, declared: declared.length }
-  rewriteVerified(abs, out)
-  return { path: rel, changed: true, declared: declared.length }
-}
-
-// ---- 投影：地图 text / html ----
 
 function truncate(s, n) {
   const t = String(s).replace(/\s+/g, ' ').trim()
@@ -507,7 +312,7 @@ export function writeProjectSection(rootPath, model, { relPath = 'PROJECT.md' } 
 
 /** 全部投影一次重生成（nav_render 的实现）。 */
 export function renderAll(rootPath, model, { now = Date.now() } = {}) {
-  const results = { project: null, modelDoc: null, map: null, archDocs: [] }
+  const results = { project: null, modelDoc: null, map: null }
   results.project = writeProjectSection(rootPath, model)
   rewriteVerified(paths.modelDoc(rootPath), renderModelDoc(model))
   results.modelDoc = { path: normSlashes(relative(rootPath, paths.modelDoc(rootPath))), changed: true }

@@ -8,7 +8,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { key, normSlashes, paths, nowIso } from './paths.js'
 import { readEvents, rewriteVerified, logStamp } from './log.js'
-import { walkFiles, globToRegExp } from './scope.js'
+import { walkFiles, globToRegExp, scanImports } from './scope.js'
 
 export const LAYERS = ['project', 'module', 'feature', 'artifact']
 /** 补丁计数闸阈值（同一锚点连续 3 次补丁 → 强制先出决策） */
@@ -177,6 +177,20 @@ function fileOwnersOf(nodes) {
   return fileOwners
 }
 
+/**
+ * 一条 commit 事件算不算「一次补丁」？
+ *
+ *   open                → 算：一次改动意图。
+ *   closed 且带 closes   → **不算**：它只是那笔意图的收口回执（同一笔改动的第二个事件）。
+ *                          两者都算 ⇒ 每笔改动被计两次 ⇒ 阈值 3 实际在 ~1.5 笔时就触发，
+ *                          计数闸（第一性原理触发器）会退化成狼来了。
+ *   closed 且不带 closes → 算：历史迁移来的"已完成的改动"记录，没有配对的 open 事件。
+ */
+function isPatchRecord(c) {
+  if (c.phase === 'open') return true
+  return c.phase === 'closed' && !c.closes
+}
+
 /** 锚点补丁计数（计数闸数据源）。缓存与非缓存路径共用同一实现。 */
 function pressureFrom(folded) {
   const lastDecisionByAnchor = new Map()
@@ -185,16 +199,145 @@ function pressureFrom(folded) {
   const openCommits = []
   for (const c of folded.commits) {
     if (c.phase === 'open') openCommits.push(c)
+    if (!isPatchRecord(c)) continue
     const a = c.anchorKey || key(c.anchor)
+    if (!a) continue                    // 无锚点的记录归属不到架构节点，不进计数
     patchCount.set(a, (patchCount.get(a) || 0) + 1)
   }
   const patchPressure = new Map()
   for (const [anchor, count] of patchCount) {
     const last = lastDecisionByAnchor.get(anchor)
-    const since = last ? folded.commits.filter((c) => c.seq > last.seq && (c.anchorKey || key(c.anchor)) === anchor).length : count
+    const since = last
+      ? folded.commits.filter((c) => isPatchRecord(c) && c.seq > last.seq && (c.anchorKey || key(c.anchor)) === anchor).length
+      : count
     patchPressure.set(anchor, { anchor, count, sinceDecision: last ? last.id : null, sinceDecisionCount: since })
   }
   return { patchPressure, openCommits }
+}
+
+/**
+ * 依赖图（ARCHITECTURE §1 的「谁引用谁」）。
+ *
+ * **磁盘派生，不是事件** —— 与 STALE / 缺口同一位置计算，所以：
+ *   · 不进事件流（守住 §3「不存在第四层」）
+ *   · 不缓存（事件流的戳证明不了磁盘 import 新鲜；缓存它就会给出第二答案，违反 I1）
+ *   · 删 runtime/ 可无损重建（I3）
+ *
+ * 文件级边用 fileOwners 提升为**节点级边**：一个功能/模块引用另一个，当且仅当
+ * 它名下的某个文件 import 了对方名下的某个文件。跨节点才成边（同节点内部引用不是架构信息）。
+ *
+ * ⚠ 节点级边是**粗粒度投影**，不是判据：同模块内功能共享文件多，rollup 会退化成近似完全图。
+ * 判据一律用 `impactOf()` 的文件精度。
+ *
+ * ⚠ 扫描边界：只扫**已登记项目目录**内的文件（仓里常躺着未登记工程 / 产物 / 归档，
+ * 实测它们能占全部代码文件的 92%，扫了又慢又无用）。
+ * **但一个项目目录都取不到时退回全量扫描** —— 宁可慢，也不能"取不到边界就静默扫出空图"：
+ * 空图会让影响面闸永远放行，那是假绿。用了哪种模式记在 `scope.mode` 并在 mode=impact 里显示。
+ *
+ * @returns {{fileEdges, external, unresolved, skipped, scanned, deps, dependents, scope}}
+ *   deps       nodeId → Set(nodeId)：我引用谁
+ *   dependents nodeId → Set(nodeId)：谁引用我（= 改动的影响面）
+ */
+function buildEdges(rootPath, diskFiles, fileOwners, projectDirs = []) {
+  const dirs = projectDirs.filter(Boolean)
+  const inScope = (f) => {
+    if (!dirs.length) return true
+    for (const d of dirs) {
+      if (d === '.' || d === '') return true              // 项目就在根 ⇒ 全仓都在范围内
+      if (f === d || f.startsWith(`${d}/`)) return true
+    }
+    return false
+  }
+  const within = diskFiles.filter(inScope)
+  const scan = scanImports(rootPath, within)
+  const deps = new Map()
+  const dependents = new Map()
+  for (const [from, tos] of scan.edges) {
+    const fromNodes = fileOwners.get(key(from)) || []
+    if (!fromNodes.length) continue
+    for (const to of tos) {
+      const toNodes = fileOwners.get(key(to)) || []
+      if (!toNodes.length) continue
+      for (const a of fromNodes) {
+        for (const b of toNodes) {
+          if (a === b) continue
+          if (!deps.has(a)) deps.set(a, new Set())
+          deps.get(a).add(b)
+          if (!dependents.has(b)) dependents.set(b, new Set())
+          dependents.get(b).add(a)
+        }
+      }
+    }
+  }
+  return {
+    fileEdges: scan.edges, external: scan.external, unresolved: scan.unresolved,
+    skipped: scan.skipped, scanned: scan.scanned, deps, dependents,
+    scope: { mode: dirs.length ? 'projects' : 'all', dirs, candidates: within.length }
+  }
+}
+
+/**
+ * 一组文件的**共同目录前缀**（'' / null = 散在多处，不贡献边界）。
+ * 单层文件（无 `/`）不参与共同前缀计算 —— 一个根级文件不该把边界拉平成全仓。
+ */
+function commonDirPrefix(files) {
+  const partsList = files
+    .map((f) => {
+      const s = normSlashes(f)
+      const i = s.lastIndexOf('/')
+      return i < 0 ? null : s.slice(0, i)
+    })
+    .filter((d) => d && d !== '.')
+    .map((d) => d.split('/'))
+  if (!partsList.length) return null
+  const first = partsList[0]
+  let n = first.length
+  for (const p of partsList) {
+    n = Math.min(n, p.length)
+    for (let i = 0; i < n; i++) {
+      if (p[i] !== first[i]) { n = i; break }
+    }
+  }
+  return n === 0 ? null : first.slice(0, n).join('/')
+}
+
+/**
+ * 已登记项目的目录前缀 = 依赖图扫描边界。
+ *
+ * ① 优先用显式登记的 `project.meta.path` / `meta.projectPaths`；
+ * ② 没有时**从登记落点推导** —— 一个项目下所有功能文件所在目录的共同前缀。
+ *    这样不必为了性能去补一份新的登记数据（登记即维护，能派生就派生）。
+ * 取不到任何目录 ⇒ 返回空数组 ⇒ buildEdges 退回全量扫描并把 mode 标成 all（fail-loud）。
+ */
+function projectDirsOf(nodes) {
+  const dirs = new Set()
+  const projects = [...nodes.values()].filter((n) => n.layer === 'project' && n.status === 'active')
+  for (const n of projects) {
+    for (const d of Object.values(n.meta?.projectPaths || {})) {
+      const s = normSlashes(String(d)).replace(/\/+$/, '')
+      if (s) dirs.add(s)
+    }
+    const p = n.meta?.path ? normSlashes(String(n.meta.path)).replace(/\/+$/, '') : ''
+    if (p && p !== '.') dirs.add(p)
+  }
+  if (dirs.size) return [...dirs].sort()
+
+  for (const p of projects) {
+    const ids = new Set()
+    for (const m of nodes.values()) {
+      if (m.layer !== 'module' || m.status !== 'active' || !moduleBelongsTo(m, p)) continue
+      for (const c of m.features || []) ids.add(nodeId('feature', c))
+    }
+    for (const f of nodes.values()) {
+      if (f.layer !== 'feature' || f.status !== 'active') continue
+      const mod = f.module ? nodes.get(nodeId('module', f.module)) : null
+      if (mod && moduleBelongsTo(mod, p)) ids.add(f.id)
+    }
+    const files = [...ids].flatMap((id) => nodes.get(id)?.files || [])
+    const pre = commonDirPrefix(files)
+    if (pre) dirs.add(pre)
+  }
+  return [...dirs].sort()
 }
 
 /**
@@ -228,14 +371,9 @@ export function buildModel(rootPath, { now = Date.now() } = {}) {
     }
   }
 
-  // 缺口：磁盘上有、登记里没有（只在已知项目目录内探测）
-  const projectDirs = new Set()
-  for (const n of base.nodes.values()) {
-    if (n.layer !== 'project' || n.status !== 'active') continue
-    for (const d of Object.values(n.meta.projectPaths || {})) projectDirs.add(normSlashes(String(d)))
-    const p = n.meta.path
-    if (p) projectDirs.add(normSlashes(String(p)))
-  }
+  // 缺口：磁盘上有、登记里没有
+  // （projectDirs 同时充当依赖图扫描边界 —— 原来算了却没人用，是死代码）
+  const projectDirs = projectDirsOf(base.nodes)
   const diskFiles = walkFiles(rootPath)
   const anchoredGlobs = new Set()
   for (const n of base.nodes.values()) {
@@ -253,6 +391,9 @@ export function buildModel(rootPath, { now = Date.now() } = {}) {
     unregistered.push(f)
   }
 
+  // 磁盘实况：依赖图（谁引用谁）—— ARCHITECTURE §1 / §3。复用上面走出的 diskFiles，不重复走盘。
+  const edges = buildEdges(rootPath, diskFiles, fileOwners, projectDirs)
+
   // 最近决策 + 锚点补丁计数（计数闸的数据源）—— 与缓存路径共用同一实现
   const { patchPressure, openCommits } = pressureFrom(base)
 
@@ -267,6 +408,7 @@ export function buildModel(rootPath, { now = Date.now() } = {}) {
     fileOwners,
     stale,
     unregistered,
+    edges,
     patchPressure,
     log: [...base.log, ...corrupt.map((c) => ({ seq: null, problem: `corrupt event line ${c.line}: ${c.reason}` }))],
     eventCount: events.length,
@@ -320,6 +462,27 @@ export function pressureFor(model, anchor) {
   const n = normalizeAnchor(model, anchor)
   const k = key(n ? n.id : anchor)
   return model.patchPressure.get(k) || { anchor: k, count: 0, sinceDecision: null, sinceDecisionCount: 0 }
+}
+
+/**
+ * 影响面（**文件精度**）：scope 内文件被 scope 外哪些文件引用。
+ *
+ * 为什么判据用文件精度、不用节点粗粒度：同一模块内的功能常常互相成边（共享文件太多），
+ * 节点级 rollup 会退化成近似完全图 —— 那是"看起来很有信息"的噪声，会让闸门变成狼来了。
+ * 节点级 deps/dependents 仍保留，只作**粗粒度投影**（画图 / 一页总览），不作判据。
+ */
+export function impactOf(model, files) {
+  const inside = new Set((files || []).map(key))
+  const out = new Map()                     // 被引文件 → [scope 外的引用方]
+  for (const [from, tos] of model.edges.fileEdges) {
+    if (inside.has(key(from))) continue     // 引用方已在 scope 内 ⇒ 已覆盖
+    for (const to of tos) {
+      if (!inside.has(key(to))) continue    // 被引方不在 scope ⇒ 无关
+      if (!out.has(to)) out.set(to, [])
+      out.get(to).push(from)
+    }
+  }
+  return out
 }
 
 /** 覆盖率：登记功能 / 全部磁盘文件。 */
@@ -395,6 +558,9 @@ function buildModelFromPlain(plain, rootPath) {
     nodes, vector: plain.vector || {}, decisions: folded.decisions, commits: folded.commits,
     openCommits, fileOwners,
     stale: plain.stale || [], unregistered: plain.unregistered || [],
+    // 依赖图**不缓存、每次重算**：它是磁盘派生，事件流的戳证明不了磁盘 import 还新鲜。
+    // 两条路径走同一实现 ⇒ 结果必然一致（I1：同一份真相不允许两个答案）。
+    edges: buildEdges(rootPath, walkFiles(rootPath), fileOwners, projectDirsOf(nodes)),
     patchPressure, log: folded.log, eventCount: plain.eventCount || 0, extras: {},
     stamp: plain.stamp
   }

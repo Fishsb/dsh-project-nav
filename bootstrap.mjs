@@ -28,9 +28,8 @@ const MODULES = [
   { id: 'core-plane', name: '平面契约', features: ['PN-F01'] },
   { id: 'core-log', name: '事件流', features: ['PN-F02'] },
   { id: 'core-model', name: '模型折叠', features: ['PN-F03'] },
-  { id: 'core-gates', name: '六闸', features: ['PN-F04'] },
+  { id: 'core-gates', name: '七闸', features: ['PN-F04'] },
   { id: 'core-render', name: '渲染投影', features: ['PN-F05'] },
-  { id: 'core-migrate', name: '旧账本迁移', features: ['PN-F07'] },
   { id: 'host-face', name: '装配面与工具', features: ['PN-F08'] }
 ]
 
@@ -48,22 +47,17 @@ const FEATURES = [
   {
     id: 'PN-F03', name: '模型折叠', module: 'core-model', files: ['core/model.js', 'core/scope.js'],
     userView: '可丢弃的架构模型：删掉 runtime/ 后立刻可由事件流复算（I3）',
-    systemView: 'foldEvents 纯函数 + attachAnchorKeys 归一锚点 + 磁盘实况叠加（STALE/缺口）'
+    systemView: 'foldEvents 纯函数 + attachAnchorKeys 归一锚点 + 磁盘实况叠加（STALE / 缺口 / 依赖图——import 静态扫描派生，非登记）'
   },
   {
-    id: 'PN-F04', name: '六闸', module: 'core-gates', files: ['core/gates.js'],
-    userView: '锚点/范围/主线/计数/决策/完结 —— 六个都是查询，所以不会产生孤儿状态',
-    systemView: '六个纯函数返回 {pass,severity,detail,hint}；runGates 汇总 blocked/warnings'
+    id: 'PN-F04', name: '七闸', module: 'core-gates', files: ['core/gates.js'],
+    userView: '锚点/范围/主线/影响面/计数/决策/完结 —— 七个都是查询，所以不会产生孤儿状态',
+    systemView: '七个纯函数返回 {pass,severity,detail,hint}；影响面闸用文件精度判「跨节点牵动」；runGates 汇总 blocked/warnings'
   },
   {
     id: 'PN-F05', name: '渲染投影', module: 'core-render', files: ['core/render.js', 'core/format.js'],
-    userView: '地图 / PROJECT.md 标记区 / ARCH-MODEL.md / 架构档指纹全部由模型生成，手改即被覆盖',
-    systemView: 'renderAll + writeProjectSection（标记外零触碰）+ arch-cache 指纹解析与 stamp'
-  },
-  {
-    id: 'PN-F07', name: '旧账本迁移', module: 'core-migrate', files: ['core/legacy.js', 'core/commit.js'],
-    userView: '5 个旧账本一次性折叠成事件并归档为只读快照，迁移后不存在第二真相',
-    systemView: 'legacyToDrafts 纯函数 + migrateLegacy 落标记；commit.js 负责意图登记与按证据收口'
+    userView: '地图 / PROJECT.md 标记区 / ARCH-MODEL.md 全部由模型生成，手改即被覆盖',
+    systemView: 'renderAll + writeProjectSection（标记外零触碰）；架构档已按 §2 降级为按需投影，不再有指纹契约'
   },
   {
     id: 'PN-F08', name: '装配面与工具', module: 'host-face', files: ['host/index.js'],

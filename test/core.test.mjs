@@ -9,11 +9,10 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, statSync } 
 import { join } from 'node:path'
 import { tmpRoot, put, touch, seed } from './helper.mjs'
 import { appendEvents, readEvents, verifyLog, logStamp } from '../core/log.js'
-import { buildModel, loadModel, normalizeAnchor, coverage, pressureFor, nodeId } from '../core/model.js'
-import { resolveScope, evidenceOf, diffEvidence, globToRegExp } from '../core/scope.js'
-import { anchorGate, scopeGate, mainlineGate, countGate, decisionGate, runGates } from '../core/gates.js'
+import { buildModel, loadModel, normalizeAnchor, coverage, pressureFor, nodeId, impactOf } from '../core/model.js'
+import { resolveScope, evidenceOf, diffEvidence, globToRegExp, scanImports, extractSpecifiers, walkFiles, isTestPath } from '../core/scope.js'
+import { anchorGate, scopeGate, mainlineGate, countGate, decisionGate, runGates, impactGate } from '../core/gates.js'
 import { commitIntent, reconcile, archiveIntent } from '../core/commit.js'
-import { migrateLegacy, inspectLegacy, legacyToDrafts } from '../core/legacy.js'
 import { paths } from '../core/paths.js'
 
 // ============ 事件流（唯一事实源） ============
@@ -308,7 +307,12 @@ test('runGates 汇总：blocked 与 warnings 分离', async (t) => {
   const m = buildModel(root)
   const r = runGates(m, { anchor: 'NOPE', scope: {}, materialized: { files: ['src/a.js'] } })
   assert.ok(r.blocked.length >= 1)
-  assert.ok(r.results.length === 6, '六闸一个不少')
+  // 钉住的是**闸门集合**（架构契约，ARCHITECTURE §6），不是数字 —— 数字会漂，集合不会。
+  assert.deepEqual(
+    r.results.map((x) => x.gate).sort(),
+    ['anchor', 'completion', 'count', 'decision', 'impact', 'mainline', 'scope'],
+    '七闸一个不少'
+  )
 })
 
 // ============ 写入：意图登记与自动收口（A1） ============
@@ -422,138 +426,82 @@ test('开新意图会先按证据收上一笔（完结闸 = 自动对账）', as
   assert.equal(buildModel(root).openCommits[0].task, '第二笔')
 })
 
-// ============ 迁移（一次性） ============
+// ============ 依赖图：import 静态扫描（ARCHITECTURE §1 的「谁引用谁」） ============
 
-test('迁移·真实索引形状：projects/modules/features 三表为空时，以 projectPaths/projectToModules/moduleToFeatures/descriptions 为准', async (t) => {
-  const root = tmpRoot(t)
-  mkdirSync(join(root, '.internal'), { recursive: true })
-  // 这是生产索引的真实形态（实测 D:\FF\.internal\nav-index.json）：三张"正表"是空的
-  writeFileSync(join(root, '.internal', 'nav-index.json'), JSON.stringify({
-    projectPaths: { alpha: 'deepseek/alpha' },
-    projects: {}, modules: {}, features: {},
-    descriptions: { 'A-F01': { name: '编辑', userView: '用户视角', systemView: '系统视角' } },
-    indexes: {
-      projectToModules: { alpha: ['editor'] },
-      moduleToFeatures: { editor: ['A-F01'] },
-      featureToFiles: { 'A-F01': ['src/e.js'] },
-      fileToFeature: { 'src/e.js': ['A-F01'] }
-    }
-  }), 'utf-8')
-  const { drafts } = legacyToDrafts(root)
-  const mods = drafts.filter((d) => d.layer === 'module')
-  const feats = drafts.filter((d) => d.layer === 'feature')
-  assert.equal(mods.length, 1, '模块必须从 moduleToFeatures/projectToModules 推出（只读三表会一个模块都没有）')
-  assert.deepEqual(mods[0].fields.features, ['A-F01'], '模块→功能的挂载关系必须保留')
-  assert.equal(mods[0].fields.project, 'alpha', '模块归属必须从 projectToModules 反查')
-  assert.equal(feats.length, 1)
-  assert.equal(feats[0].fields.module, 'editor', '功能必须挂在模块上，否则地图被拆散')
-  assert.equal(feats[0].fields.name, '编辑', '描述必须从 descriptions 取（不在 features 表里）')
-  assert.equal(feats[0].fields.userView, '用户视角')
+test('extractSpecifiers：跨行 import 抽得到；注释里的 import 必须被剥掉（幻影边比缺边更糟）', () => {
+  const src = [
+    'import {',
+    '  a,',
+    '  b',
+    "} from './x.js'",
+    "import './side.js'",
+    "const c = require('./y.js')",
+    "const d = await import('./z.js')",
+    "import pkg from 'external-pkg'",
+    "// import Ghost from './line-comment.js'",
+    "/* import Blocked from './block-comment.js' */",
+    "const url = 'https://example.com/a.js'"
+  ].join('\n')
+  const specs = extractSpecifiers(src)
+  assert.deepEqual(specs, ['./x.js', './side.js', './y.js', './z.js', 'external-pkg'])
+  assert.ok(!specs.some((s) => s.includes('comment')), '注释中的 import 是幻影边，必须剥掉')
 })
 
-test('迁移·落点口径对齐：项目相对路径补项目前缀，已是 root 相对的不动', async (t) => {
+test('scanImports：相对引用成边、外部包单列、解析不到不静默丢（F4 精神）', async (t) => {
   const root = tmpRoot(t)
-  mkdirSync(join(root, '.internal'), { recursive: true })
-  // 磁盘：项目相对的文件确实位于项目目录下；root 相对的确实位于根下
-  put(root, 'deepseek/alpha/src/rel.js')
-  put(root, 'deepseek/alpha/src/abs.js')
-  put(root, 'src/at-root.js')
-  writeFileSync(join(root, '.internal', 'nav-index.json'), JSON.stringify({
-    projectPaths: { alpha: 'deepseek/alpha' },
-    projects: {}, modules: {}, features: {},
-    indexes: {
-      projectToModules: { alpha: ['editor'] },
-      moduleToFeatures: { editor: ['A-F01'] },
-      // 一个功能里混着两种口径：rel.js 是项目相对，abs.js 是 root 相对
-      featureToFiles: { 'A-F01': ['src/rel.js', 'deepseek/alpha/src/abs.js'] },
-      fileToFeature: {}
-    }
-  }), 'utf-8')
-  const { drafts, warnings } = legacyToDrafts(root)
-  const f = drafts.find((d) => d.layer === 'feature')
-  assert.deepEqual(f.fields.files, ['deepseek/alpha/src/abs.js', 'deepseek/alpha/src/rel.js'],
-    '项目相对的要补前缀、root 相对的要原样保留 —— 不做对齐会得到全量假 STALE')
-  assert.ok(warnings.some((w) => w.includes('补了路径前缀')), '补前缀这件事必须进警告（可审计）')
+  put(root, 'src/a.js', "import b from './b.js'\nimport ext from 'lodash'\nimport m from './missing.js'\n")
+  put(root, 'src/b.js', 'export default 1\n')
+  const r = scanImports(root, walkFiles(root))
+  assert.deepEqual(r.edges.get('src/a.js'), ['src/b.js'])
+  assert.deepEqual(r.external.get('src/a.js'), ['lodash'])
+  assert.deepEqual(r.unresolved, ['src/a.js -> ./missing.js'])
 })
 
-test('迁移·无证据的在途动作不迁移为在途意图（否则是永久孤儿）', async (t) => {
+test('scanImports：确定性 —— 同输入必同输出（它是磁盘派生的事实，不是推断）', async (t) => {
   const root = tmpRoot(t)
-  mkdirSync(join(root, '.internal'), { recursive: true })
-  mkdirSync(join(root, '.internal', 'legacy'), { recursive: true })
-  writeFileSync(join(root, '.internal', 'nav-actions.json'), JSON.stringify({
-    actions: [
-      { id: 'ACT-001', status: 'in_progress', task: '旧版在途（无 scopeFiles/scopeState）', anchor: 'A-F01', scope: { features: ['A-F01'] } },
-      { id: 'ACT-002', status: 'in_progress', task: '新版在途（有证据）', anchor: 'A-F01', scope: { features: ['A-F01'] }, scopeFiles: ['src/e.js'], scopeState: { 'src/e.js': { exists: true, size: 1, sha1: 'x' } } },
-      { id: 'ACT-003', status: 'done', task: '已完成', anchor: 'A-F01', scope: { features: ['A-F01'] } }
-    ]
-  }), 'utf-8')
-  const { drafts, warnings } = legacyToDrafts(root)
-  const open = drafts.filter((d) => d.kind === 'commit' && d.phase === 'open')
-  assert.equal(open.length, 1, '只有带证据的那笔才成为在途意图')
-  assert.equal(open[0].task, '新版在途（有证据）')
-  assert.equal(drafts.filter((d) => d.kind === 'commit' && d.phase === 'closed').length, 1, '已完成动作照常迁移')
-  assert.ok(warnings.some((w) => w.includes('没有任何 scope 证据')), '丢弃必须报数，不能静默')
+  put(root, 'src/a.js', "import './b.js'\n")
+  put(root, 'src/b.js', "import './c.js'\n")
+  put(root, 'src/c.js', 'export const c = 1\n')
+  const one = scanImports(root, walkFiles(root))
+  const two = scanImports(root, walkFiles(root))
+  assert.deepEqual([...one.edges], [...two.edges])
 })
 
-test('旧账本折叠成事件：索引/向量/动作/决策/文档一条不丢', async (t) => {
+test('isTestPath：测试是「预期下游」，不当影响面告警', () => {
+  assert.equal(isTestPath('test/core.test.mjs'), true)
+  assert.equal(isTestPath('src/__tests__/x.js'), true)
+  assert.equal(isTestPath('src/a.spec.ts'), true)
+  assert.equal(isTestPath('core/model.js'), false)
+})
+
+test('模型把文件边提升为跨节点边，影响面按文件精度给出', async (t) => {
   const root = tmpRoot(t)
-  mkdirSync(join(root, '.internal'), { recursive: true })
-  put(root, 'alpha/e.js')   // 落点必须真实存在：迁移会核对（不存在的会进警告，不是静默）
-  writeFileSync(join(root, '.internal', 'nav-index.json'), JSON.stringify({
-    projectPaths: { alpha: 'alpha' },
-    projects: { alpha: { name: 'Alpha' } },
-    modules: { editor: { name: 'Editor', project: 'alpha', features: ['A-F01'] } },
-    features: { 'A-F01': { name: 'Edit', files: ['alpha/e.js'], module: 'editor', userView: 'edit' } },
-    indexes: { fileToFeature: { 'alpha/e.js': ['A-F01'] }, featureToFiles: { 'A-F01': ['alpha/e.js'] } }
-  }), 'utf-8')
-  writeFileSync(join(root, '.internal', 'vector.json'), JSON.stringify({ doing: 'alpha', next: 'n', notDoing: 'x', exitCondition: 'e' }), 'utf-8')
-  writeFileSync(join(root, '.internal', 'nav-actions.json'), JSON.stringify({
-    actions: [
-      { id: 'ACT-001', status: 'done', task: 'done one', anchor: 'A-F01', scope: { features: ['A-F01'] }, scopeFiles: ['alpha/e.js'] },
-      { id: 'ACT-002', status: 'in_progress', task: 'live one', anchor: 'A-F01', scope: { features: ['A-F01'] }, scopeFiles: ['alpha/e.js'], scopeState: { 'alpha/e.js': { exists: true, size: 1, sha1: 's' } } }
-    ]
-  }), 'utf-8')
-  writeFileSync(join(root, '.internal', 'nav-arch.json'), JSON.stringify({ decisions: [{ anchor: 'A-F01', reason: 'r', decision: 'd', impact: 'i' }] }), 'utf-8')
-  writeFileSync(join(root, '.internal', 'nav-docs.json'), JSON.stringify({ docs: [{ id: 'DOC-1', title: 'T', path: 'p.md', when: 'w', tags: ['t'] }] }), 'utf-8')
-
-  const info = inspectLegacy(root)
-  assert.equal(info.alreadyMigrated, false)
-  const { drafts, warnings } = legacyToDrafts(root)
-  assert.ok(drafts.some((d) => d.kind === 'node' && d.layer === 'feature' && d.id === 'A-F01'))
-  assert.ok(drafts.some((d) => d.kind === 'set'))
-  assert.ok(drafts.some((d) => d.kind === 'decide'))
-  assert.ok(drafts.some((d) => d.kind === 'commit' && d.phase === 'open'))
-  assert.ok(drafts.some((d) => d.kind === 'commit' && d.phase === 'closed'))
-  assert.equal(warnings.length, 0)
-
-  const r = await migrateLegacy(root)
-  assert.equal(r.status, 'migrated')
+  await seed(root)                                   // PN-F01 -> src/a.js
+  put(root, 'src/b.js', "import a from './a.js'\n")
+  await appendEvents(root, [
+    { kind: 'node', op: 'upsert', layer: 'feature', id: 'PN-F02', fields: { name: 'PN-F02', files: ['src/b.js'], module: 'core' } }
+  ])
   const m = buildModel(root)
-  assert.equal(m.nodes.get('feature:a-f01').files.length, 1)
-  assert.equal(m.vector.doing, 'alpha')
-  assert.equal(m.decisions.length, 1)
-  assert.equal(m.openCommits.length, 1, 'in_progress 的动作迁移为在途意图')
-  assert.equal([...m.nodes.values()].filter((n) => n.layer === 'artifact').length, 1)
+  assert.deepEqual([...m.edges.dependents.get('feature:pn-f01')], ['feature:pn-f02'], 'F02 依赖 F01')
+  assert.deepEqual(impactOf(m, ['src/a.js']).get('src/a.js'), ['src/b.js'], '影响面用文件精度，不用节点粗粒度')
 })
 
-test('迁移把旧账本归档为只读快照，且不再有第二个真相', async (t) => {
+test('影响面闸：跨节点牵动 → 告警；引用方也在 scope 内 → 过（否则是狼来了）', async (t) => {
   const root = tmpRoot(t)
-  mkdirSync(join(root, '.internal'), { recursive: true })
-  writeFileSync(join(root, '.internal', 'vector.json'), JSON.stringify({ doing: 'x' }), 'utf-8')
-  await migrateLegacy(root)
-  assert.equal(existsSync(join(root, '.internal', 'vector.json')), false, '旧账本必须离开原位')
-  assert.equal(existsSync(join(root, '.internal', 'legacy', 'vector.json')), true)
-  assert.equal(existsSync(join(root, '.internal', 'legacy', 'migrated.json')), true)
-  const again = await migrateLegacy(root)
-  assert.equal(again.status, 'already-migrated', '迁移只跑一次')
-})
+  await seed(root)
+  put(root, 'src/b.js', "import a from './a.js'\n")
+  await appendEvents(root, [
+    { kind: 'node', op: 'upsert', layer: 'feature', id: 'PN-F02', fields: { name: 'PN-F02', files: ['src/b.js'], module: 'core' } }
+  ])
+  const m = buildModel(root)
+  const intent = (scope) => ({ scope, materialized: { files: ['src/a.js'] } })
 
-test('迁移后旧账本不再被任何读路径读取（改了它，模型不变）', async (t) => {
-  const root = tmpRoot(t)
-  mkdirSync(join(root, '.internal'), { recursive: true })
-  writeFileSync(join(root, '.internal', 'vector.json'), JSON.stringify({ doing: 'x' }), 'utf-8')
-  await migrateLegacy(root)
-  const before = buildModel(root).vector.doing
-  writeFileSync(join(root, '.internal', 'legacy', 'vector.json'), JSON.stringify({ doing: 'HACKED' }), 'utf-8')
-  assert.equal(buildModel(root).vector.doing, before)
+  const cross = impactGate(m, intent({ features: ['PN-F01'] }))
+  assert.equal(cross.severity, 'warn', 'scope 外节点引用它 ⇒ 必须告警')
+  assert.match(cross.detail, /pn-f02/)
+
+  const same = impactGate(m, intent({ features: ['PN-F01', 'PN-F02'] }))
+  assert.equal(same.pass, true, '引用方也在 scope 内 ⇒ 已覆盖，不告警')
+
+  assert.equal(impactGate(m, { scope: {}, materialized: { files: [] } }).pass, true, 'scope 为空不误报')
 })
