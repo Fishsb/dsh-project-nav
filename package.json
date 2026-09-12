@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/project-nav",
-  "version": "0.10.2",
+  "version": "0.10.3",
   "description": "DSH plugin: architecture-first project governance. v0.10.0 makes the model a TREE + GRAPH — the containment tree (who belongs to whom) now sits beside a dependency graph (who imports whom), and the graph is DERIVED from a static import scan: never registered, never hand-written, never stale. Seven gates (anchor / scope / mainline / impact / repeat-patch / decision / completion) are pure queries inside the single write entry point nav_commit, so there is no begin/done lifecycle and no orphan state: closure is decided by EVIDENCE (did the scope files change?), never by session identity — kill a session and its intent still closes (A1). Governance surface is minimal by construction: anything that would rot when code changes must be a PROJECTION, not a document — hand-written surface is two contracts (ARCHITECTURE.md / AGENTS.md), and .internal/arch/*.md dropped its sha1-fingerprint/freshness machinery to become an on-demand projection. ONE append-only event log (.internal/events.jsonl) remains the single source of truth; the runtime model (incl. the dependency graph) is disposable — delete runtime/ and governance loses nothing (I3). Tool face 6: nav_graph (read, incl. mode=impact) / nav_commit (intent) / nav_decide (ADR) / nav_node (nodes) / nav_render (projections) / nav_set (mainline vector).",
   "type": "module",
   "main": "./host/index.js",

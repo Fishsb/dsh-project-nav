@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.10.2-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.10.3-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-%3E%3D0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -213,6 +213,11 @@ npm run test:node-runner  # 同一批用例走 node --test
   症状是「工具描述写着锚点可为节点 id，照写的反而全被锚点闸拒」——描述与实现不符会把人训练成猜别名。
   ② `nav_graph mode=health` 新增**文件职责**一节：一个文件被几个不同架构节点登记为落点
   （由落点表与依赖图派生，只读、不拒、**不设行数红线**——行数是代理指标，做成闸门必然退化成狼来了）。
+- `0.10.2 → 0.10.3`：**仓清理（非换代、非功能）** —— 删除三个**不进包**的死投影
+  （`PROJECT.md` / `.internal/ARCH-MODEL.md` / `.internal/events.jsonl`）：产自 0.9 自举期，
+  而本仓**不是治理根**（治理根 `D:\FF`，事件流在那边）⇒ 永不被 `nav_render` 重算 ⇒ 是历史快照而非投影，
+  且带着假事实（主线仍写"安装 0.9.0"、引用已删的 `HANDOFF.md` / `core/legacy.js`）。
+  **包内容与 0.10.2 逐字节相同**（三者都不在 `files` 内），本版仅版本号与文档变化。
 
 ## 9. 开发纪律
 
