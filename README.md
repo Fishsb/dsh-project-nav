@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.10.3-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.10.4-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-%3E%3D0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -218,6 +218,13 @@ npm run test:node-runner  # 同一批用例走 node --test
   而本仓**不是治理根**（治理根 `D:\FF`，事件流在那边）⇒ 永不被 `nav_render` 重算 ⇒ 是历史快照而非投影，
   且带着假事实（主线仍写"安装 0.9.0"、引用已删的 `HANDOFF.md` / `core/legacy.js`）。
   **包内容与 0.10.2 逐字节相同**（三者都不在 `files` 内），本版仅版本号与文档变化。
+- **口径澄清（2026-09-12）**：**「每次更新」= 任何合并进 main 的改动**，含**不进包的仓清理**
+  （`.gitignore` / `test/` / 本地脚本等）—— 一律 **+0.0.1**，**不设「太小不必升」的判断口子**；
+  只有架构换代才跳位。理由：**可判定性高于省一个版本号**；且 `0.10.0–0.10.2` 的**发布链缺档**
+  正是「靠判断决定要不要发布」的产物 —— 留判断口子 = 重造同类缺陷。
+- `0.10.3 → 0.10.4`：**仓清理（非换代、非功能）** —— `.gitignore` 收敛三条已失效的 `.internal`
+  强制入仓规则（本仓非治理根；`PROJECT.md` / `.internal/ARCH-MODEL.md` / `.internal/events.jsonl`
+  已随死投影清理删除）。**不进包**（`files` 不含 `.gitignore`）⇒ 除版本号外包内容与 0.10.3 相同。
 
 ## 9. 开发纪律
 
