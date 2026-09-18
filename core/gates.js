@@ -66,7 +66,7 @@ export function scopeGate(model, intent) {
   }
   if (overlaps.length) {
     return warn('scope',
-      `${overlaps.length} 笔在途意图与你重叠：${overlaps.map((o) => `${o.commit}(${o.files.slice(0, 3).join(', ')}${o.files.length > 3 ? '…' : ''})`).join('、')}`,
+      `${overlaps.length} 笔在途意图与你重叠：${overlaps.map((o) => `${o.commit}(${o.files.slice(0, 3).join(', ')}${o.files.length > 3 ? ` …等 ${o.files.length} 文件` : ''})`).join('、')}`,
       '重叠文件级串行更安全：等它按证据收口（改完文件即自动收），或把 scope 切成不相交的片。')
   }
   return ok('scope', `scope 与主线反面无冲突，与在途意图无重叠（${mine.size} 文件）`)
@@ -133,7 +133,7 @@ export function impactGate(model, intent) {
   const names = [...downNodes].map(bare)
   return warn('impact',
     `影响面：scope 外的 ${downFiles.size} 个文件引用本 scope 落点，涉及 ${downNodes.size} 个节点（${names.slice(0, 6).join('、')}${names.length > 6 ? ` …+${names.length - 6}` : ''}）。`,
-    `改这里会牵动它们 —— 确认是否一并纳入 scope，或明确下游不受影响：${outside.slice(0, 4).map(([t, fs]) => `${t} ← ${fs.slice(0, 3).join(', ')}${fs.length > 3 ? '…' : ''}`).join('；')}${outside.length > 4 ? ` …(+${outside.length - 4} 处)` : ''}`)
+    `改这里会牵动它们 —— 确认是否一并纳入 scope，或明确下游不受影响：${outside.slice(0, 4).map(([t, fs]) => `${t} ← ${fs.slice(0, 3).join(', ')}${fs.length > 3 ? ` +${fs.length - 3}` : ''}`).join('；')}${outside.length > 4 ? ` …(+${outside.length - 4} 处)` : ''}`)
 }
 
 /** 闸门 4 · 计数闸：同一锚点是否又在反复打补丁？ */
@@ -165,7 +165,7 @@ export function decisionGate(intent) {
 export function completionGate(model, { pending = [] } = {}) {
   if (pending.length) {
     return warn('completion',
-      `${pending.length} 笔在途意图的证据尚未变化：${pending.map((p) => `${p.id}(${p.task})`).join('、')}`,
+      `${pending.length} 笔在途意图的证据尚未变化：${pending.map((p) => `${p.id}(${String(p.task).replace(/\s+/g, ' ').slice(0, 60)}${String(p.task).length > 60 ? '…' : ''})`).join('、')}`,
       '在途 = 有人正在改，不是孤儿。改完文件后它会在下一次任意调用时按证据自动收口。')
   }
   const emptyScoped = model.openCommits.filter((c) => !(c.files || []).length && !(c.scope?.files || []).length && !(c.scope?.features || []).length && !(c.scope?.modules || []).length)

@@ -8,7 +8,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { tmpRoot, put, touch, seed } from './helper.mjs'
 import { appendEvents, readEvents, verifyLog, rewriteVerified } from '../core/log.js'
 import { loadModel, buildModel, coverage, pressureFor, filePressure, normalizeAnchor } from '../core/model.js'
@@ -330,6 +331,78 @@ test('文件职责压力：一个文件被 3 个节点登记为落点即报 over
   assert.equal(shared.ownerCount, 3, `三个功能都登记了同一个文件（实际 ${shared.ownerCount}）`)
   assert.equal(shared.over, true)
   assert.deepEqual(fp.over.map((f) => f.file), ['src/shared.js'])
+})
+
+// ============ 信息可达性（省 token 只能靠压缩去冗余，禁止静默丢条目） ============
+
+test('投影索引完整性：每个节点与每条 ADR 都必须被点名（退役的标灰但不消失）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  await appendEvents(root, [
+    { kind: 'decide', anchor: 'PN-F01', reason: 'r1', decision: 'd1' },
+    { kind: 'decide', anchor: 'PN-F01', reason: 'r2', decision: 'd2' },
+    { kind: 'decide', anchor: 'PN-F01', reason: 'r3', decision: 'd3' },
+    { kind: 'node', op: 'retire', layer: 'feature', id: 'PN-F01' }
+  ])
+  const m = buildModel(root)
+  const doc = renderModelDoc(m)
+  for (const n of m.nodes.values()) {
+    assert.ok(doc.includes(n.id), `节点 ${n.id} 必须在投影里点名 —— 条目不得被无声省略（含退役）`)
+  }
+  assert.ok(doc.includes('**(退役)**'), '退役节点必须标灰而不是消失')
+  for (const d of m.decisions) {
+    assert.ok(doc.includes(d.id), `ADR ${d.id} 必须在投影索引里 —— 老决策不得整条消失`)
+  }
+  assert.ok(/全部 3 条/.test(doc), 'ADR 索引必须自报总量')
+})
+
+test('确定性渲染：同一模型重渲染 ⇒ 逐字节相同 ⇒ 第二次写盘整个跳过（零 diff）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  await appendEvents(root, [{ kind: 'decide', anchor: 'PN-F01', reason: 'r', decision: 'd' }])
+  const m = buildModel(root)
+  assert.equal(renderModelDoc(m), renderModelDoc(m), 'renderModelDoc 必须是纯函数（不得含时间戳等第二输入）')
+  assert.equal(renderMapHtml(m), renderMapHtml(m))
+  const first = renderAll(root, m)
+  assert.equal(first.modelDoc.changed, true)
+  const second = renderAll(root, m)
+  assert.equal(second.modelDoc.changed, false, '模型未变 ⇒ 投影无变化 ⇒ 不写盘（无事件就没有 diff）')
+  assert.equal(second.map.changed, false)
+  assert.ok(Number.isInteger(first.modelDoc.bytes) && first.modelDoc.bytes > 0, '投影体积必须自报（信号，不是裁决）')
+})
+
+test('无静默列表截断：源码里每处定长 slice 丢弃条目的，同一输出必须带 +N/共N 交代或总量自报', async (t) => {
+  // 扫描器封的是「丢条目不打招呼」，不是字节数 —— 上限会逼着无声削内容，正是要避免的路。
+  const here = dirname(fileURLToPath(import.meta.url))
+  const SRC = ['core/format.js', 'core/gates.js', 'core/render.js', 'host/index.js']
+  // 明确豁免：字符串字段截断（文本省略类，条目未丢）与基础设施诊断行（logger / join 产物 / 日志样本）
+  const EXEMPT = [/\.at\.slice/, /String\([^)]*\)\.slice/, /String\([^)]*\)\.replace\([^)]*\)\.slice/, /\bs\.slice/, /\bline\.slice/, /text\.slice/, /\bfirst\.slice/, /Math\.random/, /\.join\([^)]*\)\.slice/, /ctx\.logger/]
+  for (const rel of SRC) {
+    const lines = readFileSync(join(here, '..', rel), 'utf-8').split('\n')
+    lines.forEach((line, idx) => {
+      const isListSlice = /\.slice\((-?\d+)(, ?(-?\d+))?\)/.test(line)
+      if (!isListSlice || EXEMPT.some((re) => re.test(line))) return
+      const window = lines.slice(Math.max(0, idx - 6), idx + 7).join('\n')
+      const disclosed = /\+\$\{/.test(window) || /…\+\d/.test(window) || /共 \$\{/.test(window) || /等 \$\{/.test(window) || /另 \$\{/.test(window) || /全部 \$\{/.test(window)
+      assert.ok(disclosed, `${rel}:${idx + 1} 有定长 slice 却附近没有 "+N / 共N / 总量自报"：${line.trim().slice(0, 100)}`)
+    })
+  }
+})
+
+test('json 视图与所读 mode 一一对应：gaps 的 json 不再携带全模型（json ≠ 最肥路径）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  await appendEvents(root, [{ kind: 'decide', anchor: 'PN-F01', reason: 'r', decision: 'd' }])
+  const { mountHost } = await import('./host-harness.mjs')
+  const h = await mountHost(root, { config: {} })
+  t.after(() => h.dispose())
+  const gaps = JSON.parse(await h.call('nav_graph', { mode: 'gaps', format: 'json' }))
+  assert.ok(Array.isArray(gaps.unregistered) && !('vector' in gaps), 'mode=gaps 的 json 应只含 gaps 相关字段')
+  const adrs = JSON.parse(await h.call('nav_graph', { mode: 'adrs', format: 'json' }))
+  assert.equal(adrs.decisions.length, 1)
+  assert.ok(!('unregistered' in adrs))
+  const full = JSON.parse(await h.call('nav_graph', { mode: 'json' }))
+  assert.ok(full.vector && full.decisions && Array.isArray(full.unregistered), 'mode=json 仍是全量真相视图（显式要全量就真给全量，不 slice）')
 })
 
 test('文件职责压力是磁盘 + 事件流派生：删掉 runtime/ 后逐字节一致（I3）', async (t) => {

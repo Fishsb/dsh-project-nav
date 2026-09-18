@@ -72,19 +72,20 @@ export function renderHealth(model, { rootPath, opens, locks = [], inflight = []
       const names = f.owners.map((o) => o.name || o.id).join(' / ')
       L.push(`    ${f.over ? '⚠' : '·'} ${f.file} — 归属 ${f.ownerCount}（${names}）· 被引 ${f.din} · 引用 ${f.dout}`)
     }
-    if (fp.files.length > FILE_PRESSURE_TOP) L.push(`    …(+${fp.files.length - FILE_PRESSURE_TOP})`)
-    if (fp.over.length) L.push('    → 一个文件被 ≥3 个节点共用时，先问它是否已承担多个职责；要拆就先改 ARCHITECTURE §9 落点表（新增文件 = 架构变更）。')
+    if (fp.files.length > FILE_PRESSURE_TOP) L.push(`    …(+${fp.files.length - FILE_PRESSURE_TOP}，全量 = nav_graph mode=json)`)
+    if (fp.over.length) L.push(`    → ${fp.over.length} 个文件被 ≥${fp.threshold} 个节点共用（只读信号，不拒写入）`)
   }
   if (model.stale.length) {
     L.push('')
     L.push(`  STALE 落点 (${model.stale.length}) — 登记了但磁盘上没有:`)
     for (const s of model.stale.slice(0, 15)) L.push(`    · ${s.file} <- ${s.node}`)
-    if (model.stale.length > 15) L.push(`    …(+${model.stale.length - 15})`)
+    if (model.stale.length > 15) L.push(`    …(+${model.stale.length - 15}，全量 = nav_graph mode=gaps)`)
   }
   if (model.log.length) {
     L.push('')
     L.push(`  ⛔ 模型自身问题 (${model.log.length}) —— 不吞:`)
     for (const p of model.log.slice(0, 10)) L.push(`    · seq=${p.seq ?? '?'} ${truncate(p.problem, 110)}`)
+    if (model.log.length > 10) L.push(`    …(+${model.log.length - 10}，全量 = 事件流逐条可查 .internal/events.jsonl)`)
   }
   if (locks.length) {
     L.push('')
@@ -135,7 +136,9 @@ export function renderScopeTarget(model, loc) {
       L.push(`  ○ ${f.name}${f.meta?.name ? ` — ${f.meta.name}` : ''}`)
       if (f.meta?.userView) L.push(`      用户视角: ${truncate(f.meta.userView, 110)}`)
       if (f.meta?.systemView) L.push(`      系统视角: ${truncate(f.meta.systemView, 110)}`)
-      for (const file of (f.files || []).slice(0, 15)) L.push(`      · ${file}`)
+      const fl = f.files || []
+      for (const file of fl.slice(0, 15)) L.push(`      · ${file}`)
+      if (fl.length > 15) L.push(`      · …(+${fl.length - 15}，全量 = nav_graph mode=task target=${f.name})`)
     }
     return L.join('\n')
   }
@@ -193,15 +196,17 @@ export function renderImpact(model, loc) {
   const L = [`${title}  —  ${files.length} 个落点文件`, '']
   L.push(`↓ 我引用谁（${outbound.size} 个落点有外部依赖）:`)
   if (!outbound.size) L.push('  (无 —— 不依赖任何 scope 外文件)')
-  for (const [f, ts] of [...outbound].slice(0, 12)) L.push(`  ${f} → ${ts.join(', ')}`)
+  for (const [f, ts] of [...outbound].slice(0, 12)) L.push(`  ${f} → ${ts.slice(0, 6).join(', ')}${ts.length > 6 ? ` …+${ts.length - 6}` : ''}`)
+  if (outbound.size > 12) L.push(`  …(+${outbound.size - 12}，全量 = nav_graph mode=json)`)
 
   const nodes = new Set()
   for (const f of inbound.keys()) for (const o of model.fileOwners.get(key(f)) || []) nodes.add(o)
   L.push('')
   L.push(`↑ 谁引用我 = 影响面（${inbound.size} 个文件 · ${nodes.size} 个节点）:`)
   if (!inbound.size) L.push('  (无 —— 没有 scope 外文件依赖它，这次改动是局部封闭的)')
-  for (const [f, ts] of [...inbound].slice(0, 12)) L.push(`  ${f} ← 被 ${ts.join(', ')} 引用`)
-  if (nodes.size) L.push(`  波及节点: ${[...nodes].slice(0, 12).join('、')}${nodes.size > 12 ? ` …+${nodes.size - 12}` : ''}`)
+  for (const [f, ts] of [...inbound].slice(0, 12)) L.push(`  ${f} ← 被 ${ts.slice(0, 6).join(', ')}${ts.length > 6 ? ` …+${ts.length - 6}` : ''} 引用`)
+  if (inbound.size > 12) L.push(`  …(+${inbound.size - 12}，全量 = nav_graph mode=json)`)
+  if (nodes.size) L.push(`  波及节点: ${[...nodes].slice(0, 12).join('、')}${nodes.size > 12 ? ` …+${nodes.size - 12}（全量 = nav_graph mode=json）` : ''}`)
 
   const e = model.edges
   const sc = e.scope || { mode: 'all', dirs: [], candidates: 0 }
@@ -219,16 +224,29 @@ export function renderGaps(model, { limit = 30 } = {}) {
   const L = []
   L.push(`Gaps — 未登记文件 ${model.unregistered.length} · STALE 落点 ${model.stale.length}`)
   if (model.unregistered.length) {
+    // 按顶层目录聚合：每组计数 ⇒ 全量总数守恒（4,291 个名字压成几行，但没有任何文件被无声抹掉）
+    const groups = new Map()
+    for (const f of model.unregistered) {
+      const slash = f.indexOf('/')
+      const g = slash < 0 ? '(仓根散文件)' : f.slice(0, slash + 1)
+      if (!groups.has(g)) groups.set(g, [])
+      groups.get(g).push(f)
+    }
+    const sorted = [...groups.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]))
     L.push('')
-    L.push('  未登记文件（磁盘上有、架构模型里没有落点 => 地图对它们失明）:')
-    for (const f of model.unregistered.slice(0, limit)) L.push(`    · ${f}`)
-    if (model.unregistered.length > limit) L.push(`    …(+${model.unregistered.length - limit})`)
+    L.push(`  未登记文件（磁盘上有、架构模型里没有落点 => 地图对它们失明）· 共 ${model.unregistered.length} 个，按顶层目录聚合：`)
+    const TOP = 10
+    for (const [g, fs] of sorted.slice(0, TOP)) {
+      L.push(`    · ${g} — ${fs.length} 个（例: ${fs.slice(0, 2).join('、')}${fs.length > 2 ? ` …+${fs.length - 2}` : ''}）`)
+    }
+    if (sorted.length > TOP) L.push(`    · …另 ${sorted.length - TOP} 组 / ${model.unregistered.length - sorted.slice(0, TOP).reduce((n, [, fs]) => n + fs.length, 0)} 个文件（分组全量 = nav_graph mode=json）`)
     L.push('  -> nav_node target=<功能码> set=files=<路径> 把它挂到某个功能下')
   }
   if (model.stale.length) {
     L.push('')
-    L.push('  STALE（登记了但磁盘上没有 => 每次都会被报成漂移，假警报会腐蚀信号）:')
+    L.push(`  STALE（登记了但磁盘上没有 => 每次都会被报成漂移，假警报会腐蚀信号）· 共 ${model.stale.length} 条:`)
     for (const s of model.stale.slice(0, limit)) L.push(`    · ${s.file} <- ${s.node}`)
+    if (model.stale.length > limit) L.push(`    · …(+${model.stale.length - limit}，全量 = nav_graph mode=json)`)
     L.push('  -> 真删了：nav_node target=<节点> retire=true；只是搬走：nav_node set=files=…')
   }
   if (!model.unregistered.length && !model.stale.length) L.push('  ✓ 无缺口：登记与磁盘一致。')
@@ -269,7 +287,7 @@ export function renderAdrs(model, { anchor = '', limit = 20 } = {}) {
   let list = model.decisions
   if (anchor) list = list.filter((d) => key(d.anchor) === key(anchor) || key(d.anchor).includes(key(anchor)))
   if (!list.length) return `No architecture decision recorded${anchor ? ` for anchor "${anchor}"` : ''}.\n  用 nav_decide anchor=… reason=… decision=… 登记（挂到节点上，决策天然有项目归属）。`
-  const L = [`Architecture decisions (${list.length}${anchor ? `, anchor=${anchor}` : ''}):`]
+  const L = [`Architecture decisions (共 ${list.length} 条${anchor ? `, anchor=${anchor}` : ''}${list.length > limit ? `，此处最近 ${limit}；更早的按 anchor=<锚点> 或到事件流 grep ADR id` : ''}):`]
   for (const d of list.slice(-limit).reverse()) {
     L.push(`  · ${d.id} [${d.anchor}] ${d.at.slice(0, 10)}`)
     L.push(`      为什么必须改: ${truncate(d.reason, 150)}`)
@@ -313,16 +331,22 @@ export function renderCommitResult(res, model) {
   }
   const c = res.commit
   L.push(`✓ 已登记 ${c.id} @ ${c.at}`)
-  L.push(`  锚点: ${res.gates.results.find((r) => r.gate === 'anchor')?.detail || ''}`)
   L.push(`  落点: ${res.materialized.files.length} 文件（索引 ${res.materialized.sources.fromIndex.length} / 字面量 ${res.materialized.sources.fromLiteral.length} / glob ${res.materialized.sources.fromGlob.length}）`)
-  if (res.materialized.missing.length) L.push(`  ⚠ 解析未命中: ${res.materialized.missing.slice(0, 8).join('; ')}`)
-  if (res.materialized.unresolved.length) L.push(`  ⚠ 未登记标识: ${res.materialized.unresolved.slice(0, 8).join('; ')}`)
+  if (res.materialized.missing.length) L.push(`  ⚠ 解析未命中 (${res.materialized.missing.length}): ${res.materialized.missing.slice(0, 8).join('; ')}${res.materialized.missing.length > 8 ? ` …+${res.materialized.missing.length - 8}` : ''}`)
+  if (res.materialized.unresolved.length) L.push(`  ⚠ 未登记标识 (${res.materialized.unresolved.length}): ${res.materialized.unresolved.slice(0, 8).join('; ')}${res.materialized.unresolved.length > 8 ? ` …+${res.materialized.unresolved.length - 8}` : ''}`)
   L.push('')
-  L.push('闸门:')
-  for (const r of res.gates.results) {
-    const mark = r.pass ? '✓' : r.severity === 'reject' ? '⛔' : '⚠'
-    L.push(`  ${mark} ${r.gate}: ${r.detail}`)
-    if (!r.pass && r.hint) L.push(`     -> ${r.hint}`)
+  const failed = res.gates.results.filter((r) => !r.pass)
+  if (!failed.length) {
+    L.push(`闸门: ${res.gates.results.map((r) => `✓ ${r.gate}`).join(' ')}`)
+  } else {
+    const anchor = res.gates.results.find((r) => r.gate === 'anchor')
+    if (anchor?.pass && anchor.detail) L.push(`  ${anchor.detail}`)
+    for (const r of failed) {
+      L.push(`  ${r.severity === 'reject' ? '⛔' : '⚠'} ${r.gate}: ${r.detail}`)
+      if (r.hint) L.push(`     -> ${r.hint}`)
+    }
+    const passed = res.gates.results.filter((r) => r.pass).map((r) => r.gate)
+    if (passed.length) L.push(`  ✓ ${passed.join(' / ')}`)
   }
   L.push('')
   L.push('收口无需动作：改完文件后，下一次任意工具调用会按证据自动收口（A1）。')

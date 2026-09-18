@@ -184,16 +184,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\FF\project-nav\verify-ins
 ## 7. 测试
 
 ```bash
-npm test                  # 四个套件：94 项
+npm test                  # 四个套件（项数跑一次即得，不写在这里——那是会漂移的数字）
 npm run test:node-runner  # 同一批用例走 node --test
 ```
 
 | 套件 | 覆盖 |
 |---|---|
-| `test/core.test.mjs` | 事件流 / 折叠 / scope 解析 / 七闸 / **依赖图扫描与影响面** / 收口（43） |
-| `test/architecture.test.mjs` | **不变量** I1·I2·I3（含依赖图双路径一致与可重建）· A1·A4·A5·A6（20） |
-| `test/concurrency.test.mjs` | F1 并发追加不丢 / F2 破锁竞态 / token 校验 / 重入 / 无锁残留（12） |
-| `test/host.test.mjs` | 真 host 代码 + 桩 ctx：装配面 6 工具、闸门接线、**nav_graph mode=impact 端到端**、归属归一回归（19） |
+| `test/core.test.mjs` | 事件流 / 折叠 / scope 解析 / 七闸 / **依赖图扫描与影响面** / 收口 |
+| `test/architecture.test.mjs` | **不变量** I1·I2·I3（含依赖图双路径一致与可重建）· A1·A4·A5·A6 · **信息可达性**（投影索引完整性 / 确定性渲染零 diff / 源码静默截断扫描 / json 按 mode 对应） |
+| `test/concurrency.test.mjs` | F1 并发追加不丢 / F2 破锁竞态 / token 校验 / 重入 / 无锁残留 |
+| `test/host.test.mjs` | 真 host 代码 + 桩 ctx：装配面 6 工具、闸门接线、**nav_graph mode=impact 端到端**、归属归一回归 |
 
 > 沙箱提示：`node --test` 会用管道 spawn 子进程，在某些受限沙箱下报 `spawn EPERM`。
 > `npm test` 直接执行测试文件（文件被直接运行时 `node:test` 同样执行），因此不受影响。
@@ -225,6 +225,14 @@ npm run test:node-runner  # 同一批用例走 node --test
 - `0.10.3 → 0.10.4`：**仓清理（非换代、非功能）** —— `.gitignore` 收敛三条已失效的 `.internal`
   强制入仓规则（本仓非治理根；`PROJECT.md` / `.internal/ARCH-MODEL.md` / `.internal/events.jsonl`
   已随死投影清理删除）。**不进包**（`files` 不含 `.gitignore`）⇒ 除版本号外包内容与 0.10.3 相同。
+- `0.10.4 → 0.10.5`：**纪律变更（非换代、非功能）** —— 治理开销从"理念"落成 ARCHITECTURE §2「信息可达性」判据
+  （压缩去冗余可以，静默丢信息不行，**字节上限刻意不设**）。实现：① 工具描述与输出文本去重
+  （mode 语义三处 → 一处、retire 级联预写删除、commit 成功回显压成一行全勾清单、教义复述收敛）；
+  ② `format=json` 不再无视 mode 回全量（与所读 mode 一一对应；`mode=json` 仍是真全量且不 slice）；
+  ③ gaps 的未登记文件按顶层目录聚合（计数守恒，一条不丢）；④ ARCH-MODEL.md 的 ADR 节改全量一行索引
+  （老决策不再整条消失，实测投影体积大头是此节的逐条展开）；⑤ 全仓定长 slice 补"共N/+N + 取回路径"；
+  ⑥ 投影去时间戳 ⇒ 确定性渲染（模型不变 ⇒ 字节不变 ⇒ 重渲染零写盘），`nav_render` 自报体积（信号非裁决）；
+  ⑦ 新增四条机检（投影索引完整性 / 确定性渲染 / 源码静默截断扫描 / json 按 mode 对应）。
 
 ## 9. 开发纪律
 

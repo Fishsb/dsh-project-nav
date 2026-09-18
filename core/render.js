@@ -11,7 +11,7 @@
 
 import { readFileSync, existsSync } from 'node:fs'
 import { join, relative } from 'node:path'
-import { normSlashes, key, paths, nowIso } from './paths.js'
+import { normSlashes, key, paths } from './paths.js'
 import { coverage, moduleBelongsTo } from './model.js'
 import { rewriteVerified } from './log.js'
 
@@ -81,7 +81,7 @@ function renderModule(model, m, match, openByFile, indent) {
       const open = openByFile.get(key(file))
       lines.push(`${indent}      · ${file}${open ? `   🔴 ${open} 在途` : ''}`)
     }
-    if ((f.files || []).length > 12) lines.push(`${indent}      · …(+${f.files.length - 12} more)`)
+    if ((f.files || []).length > 12) lines.push(`${indent}      · …(+${f.files.length - 12}，全量 = nav_graph mode=task target=${f.name})`)
   }
   return lines
 }
@@ -107,8 +107,8 @@ export function renderMapHtml(model, { title = 'Project Nav Map', target = '' } 
     parts.push('</ul>')
   }
   if (model.decisions.length) {
-    parts.push('<h2>架构决策</h2><ul>')
-    for (const d of model.decisions.slice(-8).reverse()) parts.push(`<li>${esc(d.id)} <code>${esc(d.anchor)}</code> ${esc(truncate(d.decision, 110))}</li>`)
+    parts.push(`<h2>架构决策（${model.decisions.length} 条，全部）</h2><ul>`)
+    for (const d of [...model.decisions].reverse()) parts.push(`<li>${esc(d.id)} <code>${esc(d.anchor)}</code> ${esc(truncate(d.decision, 110))}</li>`)
     parts.push('</ul>')
   }
   parts.push('<h2>架构地图</h2>')
@@ -137,7 +137,7 @@ export function renderMapHtml(model, { title = 'Project Nav Map', target = '' } 
     }
     parts.push('</details>')
   }
-  parts.push(`<p class="meta">generated ${esc(nowIso())} · events=${model.eventCount} · 唯一事实源 = .internal/events.jsonl</p>`)
+  parts.push(`<p class="meta">events=${model.eventCount} · 唯一事实源 = .internal/events.jsonl（本图由其重渲染，同模型必同字节）</p>`)
   parts.push('</body></html>')
   return parts.join('\n')
 }
@@ -152,7 +152,7 @@ export function renderModelDoc(model, { rootPath = '' } = {}) {
   L.push('> **本文件由 `nav_render` 生成，永不手写**（I2）。真相是 `.internal/events.jsonl`（append-only）；')
   L.push('> 本文件是它的折叠投影，供人阅读与 `git diff` 审查。删除 `.internal/runtime/` 后本文件仍可由事件流重建。')
   L.push('')
-  L.push(`生成时间：${nowIso()} · 事件数：${model.eventCount}`)
+  L.push(`事件数：${model.eventCount}（确定性渲染：模型不变 ⇒ 字节不变 ⇒ 无噪声 diff）`)
   L.push('')
   L.push('## 主线向量')
   L.push('')
@@ -177,17 +177,16 @@ export function renderModelDoc(model, { rootPath = '' } = {}) {
   }
   L.push('')
   if (model.decisions.length) {
-    L.push('## 架构决策（ADR）')
+    L.push(`## 架构决策索引（ADR · 全部 ${model.decisions.length} 条，一条不列漏）`)
     L.push('')
+    L.push('| ADR · id · 锚点 | 时间 | 架构变成什么（一句话） |')
+    L.push('|---|---|---|')
     for (const d of model.decisions) {
-      L.push(`### ${d.id} · ${d.anchor}`)
-      L.push('')
-      L.push(`- 时间：${d.at}${d.action ? ` · 关联：${d.action}` : ''}`)
-      L.push(`- 为什么必须改：${cell(d.reason)}`)
-      L.push(`- 架构变成什么：${cell(d.decision)}`)
-      if (d.impact) L.push(`- 影响面：${cell(d.impact)}`)
-      L.push('')
+      L.push(`| ADR · \`${d.id}\` · \`${d.anchor}\` | ${d.at.slice(0, 10)} | ${cell(truncate(d.decision, 120))} |`)
     }
+    L.push('')
+    L.push('*索引有意压扁了 reason / impact（是压缩不是丢条目）：单条决策的完整四字段走 `nav_graph mode=adrs anchor=<锚点>`，或在事件流 grep 该 ADR id。*')
+    L.push('')
   }
   const open = model.openCommits
   if (open.length) {
@@ -200,7 +199,7 @@ export function renderModelDoc(model, { rootPath = '' } = {}) {
   }
   const closed = model.commits.filter((c) => c.closes !== undefined).slice(-10).reverse()
   if (closed.length) {
-    L.push('## 最近的收口（证据变化 -> 自动收口）')
+    L.push(`## 最近的收口（共 ${model.commits.filter((c) => c.closes !== undefined).length} 笔，此处最近 10；全量在事件流，结构化取回 = \`nav_graph mode=json\`）`)
     L.push('')
     L.push('| id | 任务 | 锚点 | 收口依据 | 时间 |')
     L.push('|---|---|---|---|---|')
@@ -269,7 +268,7 @@ export function renderProjectSection(model) {
     L.push('')
   }
   if (model.decisions.length) {
-    L.push('### 架构决策（ADR）')
+    L.push(`### 架构决策（ADR · 全部 ${model.decisions.length} 条，一条不列漏）`)
     L.push('')
     L.push('| id | 锚点 | 决策 | 时间 |')
     L.push('|---|---|---|---|')
@@ -284,7 +283,7 @@ export function renderProjectSection(model) {
   if (!openList.length) L.push('*(无 — 所有改动都已按证据收口)*')
   else for (const c of openList) L.push(`- ${c.id} ${cell(c.task)}（anchor \`${c.anchor}\`，${(c.files || []).length} 文件）`)
   L.push('')
-  L.push(`<sub>生成于 ${nowIso()} · events=${model.eventCount}</sub>`)
+  L.push(`<sub>events=${model.eventCount} · 真相 = .internal/events.jsonl · 本区由其重渲染，同模型必同字节</sub>`)
   return L.join('\n')
 }
 
@@ -310,14 +309,22 @@ export function writeProjectSection(rootPath, model, { relPath = 'PROJECT.md' } 
   return { path: rel, changed: true }
 }
 
-/** 全部投影一次重生成（nav_render 的实现）。 */
+/** 与磁盘现值比对：相同则跳过写盘（确定性渲染 ⇒ 模型不变 ⇒ 文件不动 ⇒ 零 diff）。 */
+function rewriteIfChanged(file, content) {
+  const bytes = Buffer.byteLength(content, 'utf-8')
+  if (existsSync(file) && readFileSync(file, 'utf-8') === content) return { bytes, changed: false }
+  rewriteVerified(file, content)
+  return { bytes, changed: true }
+}
+
+/** 全部投影一次重生成（nav_render 的实现）。体积只自报不设红线：限额会逼着削内容，是丢信息的路。 */
 export function renderAll(rootPath, model, { now = Date.now() } = {}) {
   const results = { project: null, modelDoc: null, map: null }
   results.project = writeProjectSection(rootPath, model)
-  rewriteVerified(paths.modelDoc(rootPath), renderModelDoc(model))
-  results.modelDoc = { path: normSlashes(relative(rootPath, paths.modelDoc(rootPath))), changed: true }
+  const md = rewriteIfChanged(paths.modelDoc(rootPath), renderModelDoc(model))
+  results.modelDoc = { path: normSlashes(relative(rootPath, paths.modelDoc(rootPath))), changed: md.changed, bytes: md.bytes }
   const mapRel = '.internal/runtime/map-workspace.html'
-  rewriteVerified(join(rootPath, mapRel), renderMapHtml(model))
-  results.map = { path: mapRel, changed: true }
+  const mp = rewriteIfChanged(join(rootPath, mapRel), renderMapHtml(model))
+  results.map = { path: mapRel, changed: mp.changed, bytes: mp.bytes }
   return results
 }

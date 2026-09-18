@@ -226,7 +226,7 @@ test('端到端：七闸全绿的一笔改动 —— 登记 → 改 → 自动�
   assert.match(health, /在途改动 \(0\)/)
   assert.match(health, /架构决策: 1 条/)
   const proj = readFileSync(join(root, PLANE.MODEL_DOC), 'utf-8')
-  assert.match(proj, /### ADR-\d+ · feature:pn-f01/, '决策必须进投影，且挂在节点上')
+  assert.match(proj, /\| ADR · `ADR-\d+` · `feature:pn-f01` \|/, '决策必须进投影索引，且挂在节点上')
   assert.match(proj, /接口按节点粒度/)
   assert.match(proj, /给 A 加一层/, '已收口的改动必须在人类可读投影里可回溯')
   assert.match(proj, /## 最近的收口/)

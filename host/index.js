@@ -8,7 +8,7 @@
 //   ① 事件流 .internal/events.jsonl  —— 唯一事实源（append-only）
 //   ② 模型   .internal/runtime/…     —— 事件流的折叠（可丢弃，I3）
 //   ③ 投影   PROJECT.md / ARCH-MODEL.md / 地图 / 架构档指针 —— 全部渲染（I2）
-//   闸门 = 对模型的查询（六闸，全部在 nav_commit 内）
+//   闸门 = 对模型的查询（七闸，全部在 nav_commit 内）
 //
 // 工具面 6：nav_graph / nav_commit / nav_decide / nav_node / nav_render / nav_set
 
@@ -71,11 +71,11 @@ export function apply(ctx, config) {
   // ---- 1. nav_graph — 读：模型查询 ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_graph',
-    description: 'Query the architecture model (the single source of truth folded from the event log). Modes: task (expand a target into features/modules/projects + gates), impact (dependency graph: what this target imports and — the point — what imports IT), gaps (unregistered files + STALE落点), coverage, docs (reference docs / rank by task), adrs, map (text tree), health (snapshot: coverage + in-flight + pressure + log integrity), json. Read-only.',
+    description: 'Query the architecture model (folded from the single-source event log). Read-only. Modes in `mode` below; text output is complete-by-default — anything condensed is marked "+N" with its full retrieval path, and mode=json is that path.',
     parameters: {
-      mode: { type: 'string', description: 'task (default) | impact | gaps | coverage | docs | adrs | map | health | json' },
-      target: { type: 'string', description: 'task/map: file path, feature code, module or project name; docs: task description to rank; adrs: anchor' },
-      format: { type: 'string', description: 'text (default) | json' }
+      mode: { type: 'string', description: 'task (default; expand a target) | impact | gaps | coverage | docs | adrs | map | health | json' },
+      target: { type: 'string', description: 'task/impact/map: file / feature code / module / project; docs: task text to rank; adrs: anchor' },
+      format: { type: 'string', description: 'text (default) | json (structured view matching the mode; matching mode=json returns the full model snapshot)' }
     },
     output: OUTPUT,
     async execute(args) {
@@ -94,7 +94,7 @@ export function apply(ctx, config) {
             out.push('')
             out.push(`影响面: nav_graph mode=impact target=${loc.kind === 'file' ? loc.file : loc.node?.name}`)
             const open = model.openCommits.filter((c) => (c.files || []).some((f) => files.includes(f)))
-            if (open.length) { out.push(''); for (const c of open) out.push(`🔴 在途: ${c.id} ${c.task}（${c.actor ? `by ${String(c.actor).slice(0, 8)}` : 'actor=?'}）`) }
+            if (open.length) { out.push(''); for (const c of open) out.push(`🔴 在途: ${c.id} ${c.task}（${c.actor ? `by ${String(c.actor).slice(0, 8)}，全文 = mode=json` : 'actor=?'}）`) }
             const pressure = model.patchPressure.get(key(loc.kind === 'file' ? loc.file : loc.node?.id))
             if (pressure && pressure.sinceDecisionCount >= 2) out.push(`⚠ 计数闸: ${pressure.anchor} ${pressure.sinceDecisionCount}/${REPEAT_PATCH_THRESHOLD}`)
             out.push('')
@@ -117,7 +117,7 @@ export function apply(ctx, config) {
           return renderImpact(model, loc)
         }
         if (mode === 'map') return renderMap(model, { target: args.target || '' })
-        if (mode === 'json') return j(snapshotOf(model, root, lastReconcile, 'health'))
+        if (mode === 'json') return j(snapshotOf(model, root, lastReconcile, 'json'))
         return renderHealth(model, { rootPath: root, opens: model.openCommits, inflight: inflightView(root), locks: listLocks(root), logCheck: verifyLog(root) })
       } catch (e) { return err(e) }
     }
@@ -126,7 +126,7 @@ export function apply(ctx, config) {
   // ---- 2. nav_commit — 写：登记改动意图（自动对账 + 七闸） ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_commit',
-    description: 'Record a change intent BEFORE touching anything: anchor (architecture node) + scope + a one-line architecture reflection (arch=). Runs seven gates (anchor/scope/mainline/impact/count/decision/completion). Closure needs no second call: when the scope evidence changes, the next tool call on any session closes it automatically (evidence-based, session-independent). mode=archive voids a stale intent explicitly.',
+    description: 'Record a change intent BEFORE touching anything: anchor (architecture node) + scope + a one-line architecture reflection (arch=). Runs the seven gates. Closure needs no second call: when the scope evidence changes, the next tool call on any session closes it automatically (evidence-based, session-independent). mode=archive voids a stale intent explicitly.',
     parameters: {
       task: { type: 'string', required: true, description: 'One-line task description' },
       anchor: { type: 'string', required: true, description: 'Architecture node this task belongs to: feature code / module / project / file path / .internal/arch/*.md' },
@@ -159,7 +159,7 @@ export function apply(ctx, config) {
         const files = res.materialized?.files || []
         const text = renderCommitResult(res, model)
         if (res.status === 'ok' && files.length) {
-          return `${text}\n\n改动完成后无需再调用本工具收口。若这属于架构级改动，记得 nav_decide。`
+          return `${text}\n\n若这属于架构级改动，记得 nav_decide。`
         }
         return text
       } catch (e) { return err(e) }
@@ -217,7 +217,7 @@ export function apply(ctx, config) {
       when: { type: 'string', description: 'Artifact: routing rule — which kinds of tasks must consult it' },
       tags: { type: 'string', description: 'Artifact: comma-separated tags' },
       set: { type: 'string', description: 'Any extra fields as comma-separated k=v pairs (e.g. set=maturity=live,owner=lk)' },
-      retire: { type: 'boolean', description: 'RETIRE (inverse of upsert) with cascade: feature drops its file mappings + module membership; module drops its project attachment (its features survive); project detaches its modules (they survive unattached). Refused while an in-flight commit references the target.' }
+      retire: { type: 'boolean', description: 'RETIRE with cascade (what gets dropped is reported in the result; nothing else is deleted). Refused while an in-flight commit references the target.' }
     },
     output: OUTPUT,
     async execute(args) {
@@ -247,7 +247,8 @@ export function apply(ctx, config) {
           const after = loadModel(root)
           const gone = after.nodes.get(hit.id)
           if (!gone || gone.status !== 'retired') {
-            const why = (after.log || []).slice(-3).map((p) => `    · seq=${p.seq ?? '?'} ${p.problem}`).join('\n')
+            const allProblems = after.log || []
+            const why = allProblems.slice(-3).map((p) => `    · seq=${p.seq ?? '?'} ${p.problem}${allProblems.length > 3 ? `（共 ${allProblems.length} 条，全量 = .internal/events.jsonl）` : ''}`).join('\n')
             return [`ERROR: 退役未生效 —— ${hit.layer} "${hit.name}" 仍是 ${gone ? gone.status : '缺失'}（事件 seq ${w.seq} 已写入）。`,
               '  模型自检报告:', why || '    · (无)', '  这是 bug，不是数据问题：请报告 host/index.js 的 nav_node retire 分支。'].join('\n')
           }
@@ -303,7 +304,7 @@ export function apply(ctx, config) {
         const L = [`✓ ${prev ? 'updated' : 'created'} ${layer} "${args.target}"（事件 seq ${w.seq}）`]
         L.push(`  字段: ${Object.keys(fields).map((k) => `${k}=${truncate(Array.isArray(fields[k]) ? fields[k].join(',') : fields[k], 80)}`).join(' | ')}`)
         if (layer === 'feature') {
-          L.push(`  落点: ${(now.files || []).length} 文件${(now.files || []).length ? ` (${now.files.slice(0, 5).join(', ')}${now.files.length > 5 ? '…' : ''})` : ''}`)
+          L.push(`  落点: ${(now.files || []).length} 文件${(now.files || []).length ? ` (${now.files.slice(0, 5).join(', ')}${now.files.length > 5 ? `…+${now.files.length - 5}，全量 = nav_graph mode=json` : ''})` : ''}`)
           const unreg = (now.files || []).filter((f) => before.stale.some((s) => s.file === f))
           if (unreg.length) L.push(`  ⚠ 这些落点在磁盘上不存在（会算作 STALE）: ${unreg.join(', ')}`)
           if (now.module) L.push(`  模块: ${now.module}`)
@@ -319,7 +320,7 @@ export function apply(ctx, config) {
   // ---- 5. nav_render — 写：重生成全部投影（I2） ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_render',
-    description: 'Regenerate every projection from the model: PROJECT.md marker section (outside the markers is never touched), .internal/ARCH-MODEL.md (the human-readable model snapshot), the HTML map. Renderings are never hand-written — hand edits are overwritten by the next render.',
+    description: 'Regenerate every projection from the model: PROJECT.md marker section (outside the markers is never touched), .internal/ARCH-MODEL.md (the human-readable model snapshot), the HTML map. Deterministic: an unchanged model re-renders to identical bytes.',
     parameters: {
       path: { type: 'string', description: 'Optional: PROJECT.md path override (default PROJECT.md at the governed root)' }
     },
@@ -330,8 +331,8 @@ export function apply(ctx, config) {
         const res = renderAll(root, model)
         const L = ['✓ 投影已重生成（全部来自模型，零手写）:']
         L.push(`  PROJECT.md 标记区: ${res.project.markerMissing ? '⛔ 找不到 nav:auto 标记（未写入，Once-Only：绝不猜位置）' : res.project.changed ? `已更新${res.project.created ? '（新建）' : ''}` : '无变化'}`)
-        L.push(`  模型文档: ${res.modelDoc.path}`)
-        L.push(`  地图: ${res.map.path}`)
+        L.push(`  模型文档: ${res.modelDoc.path}（${res.modelDoc.bytes} 字节 · ${res.modelDoc.changed ? '已更新' : '无变化'}）`)
+        L.push(`  地图: ${res.map.path}（${res.map.bytes} 字节 · ${res.map.changed ? '已更新' : '无变化'}）`)
         if (res.project.markerMissing) L.push('  → 目标 md 里加上 <!-- nav:auto:start --> / <!-- nav:auto:end --> 两个标记后重跑。')
         return L.join('\n')
       } catch (e) { return err(e) }
@@ -382,9 +383,10 @@ export function apply(ctx, config) {
   } catch { /* 首次运行没有事件流是正常态 */ }
 }
 
-// ---- nav_graph 的 JSON 快照（只取叶子字段，绝不序列化活对象） ----
-function snapshotOf(model, rootPath, rec, mode, target) {
-  const cv = coverage(model)
+// ---- nav_graph 的 JSON 快照：与所读 mode 一一对应（不是"另一种全量"）。
+// ⚠ 这里刻意不放体积上限：上限会静默吞条目，是丢信息的路。
+// 少展示必须可见（"+N" + 取回路径）；mode=json 显式要全量，就真给全量。
+function healthSnapshot(model, rootPath, rec) {
   return {
     root: rootPath,
     builtAt: model.builtAt,
@@ -393,14 +395,44 @@ function snapshotOf(model, rootPath, rec, mode, target) {
       doing: model.vector?.doing || '', next: model.vector?.next || '',
       notDoing: model.vector?.notDoing || '', exitCondition: model.vector?.exitCondition || ''
     },
-    coverage: cv,
-    openCommits: model.openCommits.map((c) => ({ id: c.id, task: c.task, anchor: c.anchor, files: (c.files || []).length, at: c.at })),
-    stale: model.stale.slice(0, 50),
-    unregistered: model.unregistered.slice(0, 50),
-    decisions: model.decisions.map((d) => ({ id: d.id, anchor: d.anchor, at: d.at, decision: truncate(d.decision, 200) })),
+    coverage: coverage(model),
+    openCommits: model.openCommits.map((c) => ({ id: c.id, task: c.task, anchor: c.anchor, files: c.files || [], at: c.at })),
+    stale: model.stale,
+    unregistered: model.unregistered,
+    decisions: model.decisions.map((d) => ({ id: d.id, anchor: d.anchor, at: d.at, reason: d.reason, decision: d.decision, impact: d.impact || '' })),
     pressure: [...model.patchPressure.values()].filter((p) => p.sinceDecisionCount >= 1),
     lastReconcile: { closed: rec.closed.map((c) => c.commit.id), stillOpen: rec.stillOpen.map((c) => c.id) },
-    logProblems: model.log.slice(0, 20),
-    mode, target: target || null
+    logProblems: model.log
+  }
+}
+
+function snapshotOf(model, rootPath, rec, mode, target) {
+  const base = { mode, target: target || null, events: model.eventCount }
+  switch (mode) {
+    case 'coverage': return { ...base, coverage: coverage(model), staleCount: model.stale.length };
+    case 'gaps': return { ...base, unregistered: model.unregistered, stale: model.stale };
+    case 'adrs': return { ...base, total: model.decisions.length, decisions: model.decisions.map((d) => ({ id: d.id, anchor: d.anchor, at: d.at, reason: d.reason, decision: d.decision, impact: d.impact || '' })) };
+    case 'docs': return { ...base, artifacts: [...model.nodes.values()].filter((n) => n.layer === 'artifact' && n.status === 'active').map((a) => ({ id: a.id, name: a.name, path: a.path, when: a.when || '', tags: a.tags || [] })) };
+    case 'impact': {
+      const loc = locate(rootPath, model, target);
+      const files = loc.kind === 'file' ? [loc.file] : (loc.node?.files || []);
+      const inside = new Set(files.map(key));
+      const outbound = {}; const inbound = {};
+      for (const f of files) {
+        const tos = (model.edges.fileEdges.get(normSlashes(f)) || []).filter((t) => !inside.has(key(t)));
+        if (tos.length) outbound[f] = tos;
+      }
+      for (const [from, tos] of model.edges.fileEdges) {
+        const hits = tos.filter((t) => inside.has(key(t)));
+        if (hits.length) inbound[normSlashes(from)] = hits;
+      }
+      return { ...base, kind: loc.kind, name: loc.kind === 'file' ? loc.file : loc.node?.name, outbound, inbound };
+    }
+    case 'task': {
+      const loc = locate(rootPath, model, target);
+      if (loc.kind === 'unknown' || loc.kind === 'empty') return { ...base, kind: loc.kind, view: null };
+      return { ...base, kind: loc.kind, view: loc.kind === 'file' ? { file: loc.file, owners: loc.owners } : { id: loc.node?.id, name: loc.node?.name, status: loc.node?.status, files: loc.node?.files || [], module: loc.node?.module || null, project: loc.node?.project || null } };
+    }
+    default: return { ...healthSnapshot(model, rootPath, rec), mode, target: target || null };
   }
 }
