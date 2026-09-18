@@ -23,6 +23,20 @@ function truncate(s, n) {
   return t.length > n ? `${t.slice(0, n)}…` : t
 }
 
+/**
+ * 收口表里的「查证申报」单元格 —— PN-S1/E3。
+ *
+ * 与 `core/format.js` 的 `planBrief` 同形。此处**刻意重复 3 行**而不抽公共模块：
+ * 依赖方向是 `format → render`（`core/format.js:7`），render 反向 import format 会成环。
+ * 抽公共模块则要新增文件 = 架构变更（ARCHITECTURE §9）—— 为 3 行付这个代价不值得。
+ */
+function planCell(plan, n = 60) {
+  const s = String(plan ?? '').trim()
+  if (!s) return '(未填)'
+  const segs = s.split(/[；;\n]+/).filter((x) => x.trim()).length
+  return `${truncate(s, n)}（${segs} 段）`
+}
+
 function esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
@@ -201,8 +215,8 @@ export function renderModelDoc(model, { rootPath = '' } = {}) {
   if (closed.length) {
     L.push(`## 最近的收口（共 ${model.commits.filter((c) => c.closes !== undefined).length} 笔，此处最近 10；全量在事件流，结构化取回 = \`nav_graph mode=json\`）`)
     L.push('')
-    L.push('| id | 任务 | 锚点 | 收口依据 | 时间 |')
-    L.push('|---|---|---|---|---|')
+    L.push('| id | 任务 | 锚点 | 收口依据 | 时间 | 查证申报 |')
+    L.push('|---|---|---|---|---|---|')
     for (const c of closed) {
       const src = model.commits.find((x) => x.seq === c.closes)
       const o = src?.outcome || {}
@@ -214,7 +228,9 @@ export function renderModelDoc(model, { rootPath = '' } = {}) {
         if (o.vanished?.length) bits.push(`消失 ${o.vanished.length}`)
         if (!bits.length) bits.push('证据变化')
       }
-      L.push(`| ${src ? src.id : `ACT-${c.closes}`} | ${cell(truncate(src?.task, 70))} | \`${cell(src?.anchor)}\` | ${bits.join(' / ')} | ${c.at.slice(0, 19).replace('T', ' ')} |`)
+      // 申报取自**原始 open 笔**（src，:207 经 closes 回查）：闭笔事件结构性带 plan:''
+      // （core/commit.js:111 对账收口 / :186 显式归档），照抄 c.plan 会得到"永远空白"的假绿。
+      L.push(`| ${src ? src.id : `ACT-${c.closes}`} | ${cell(truncate(src?.task, 70))} | \`${cell(src?.anchor)}\` | ${bits.join(' / ')} | ${c.at.slice(0, 19).replace('T', ' ')} | ${cell(planCell(src?.plan))} |`)
     }
     L.push('')
   }

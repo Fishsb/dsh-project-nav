@@ -204,7 +204,52 @@ export function locate(rootPath, model, target) {
   // 名称/子串兜底（功能码之外的展示名）
   const hits = [...model.nodes.values()].filter((n) => key(n.name || '') === key(t) || key(n.id) === key(t))
   if (hits.length) return { kind: hits[0].layer, node: hits[0], ambiguous: hits.length > 1, hits }
-  return { kind: 'unknown', target: t }
+  // 零命中不再只丢回一个词：给**确定性候选**（PN-S2）。
+  // 候选只从模型折叠量取（nodes / fileOwners），**不扫盘** —— 扫盘实测 80ms / 4471 文件，
+  // 而"给候选"要的是廉价提示，不是精确检索。同一输入 ⇒ 同一输出（I1 可复算）。
+  return { kind: 'unknown', target: t, candidates: candidatesFor(model, t) }
+}
+
+/**
+ * 目标词的确定性候选（PN-S2）：2-gram 重叠打分。
+ *
+ * 为什么是 2-gram 而不是"模糊匹配库"：中英混排时子串匹配对中文几乎失效
+ * （实测自然语言任务 5/5 零命中），而 2-gram 是零依赖、确定性的最小改法。
+ * 不引入阈值 —— 排序后取前 N，分数原样展示给调用方判断。
+ */
+export function candidatesFor(model, target) {
+  const t2 = key(target)
+  const q = bigrams(t2)
+  const scored = []
+  // ① 落点文件的后缀命中：`fileOwners` 的键是 **root 相对路径**，
+  //    故实测 `core/log.js` MISS、`project-nav/core/log.js` HIT —— 用后缀补齐这一档。
+  if (t2.includes('/')) {
+    for (const [f, owners] of model.fileOwners) {
+      if (f === t2 || f.endsWith(`/${t2}`) || t2.endsWith(`/${f}`)) {
+        for (const o of owners) scored.push({ id: o, layer: 'file', name: f, score: 99 })
+      }
+    }
+  }
+  if (q.size) {
+    for (const n of model.nodes.values()) {
+      if (n.status === 'retired') continue
+      const hay = bigrams(key(`${n.id} ${n.name || ''}`))
+      let hit = 0
+      for (const g of q) if (hay.has(g)) hit++
+      if (hit) scored.push({ id: n.id, layer: n.layer, name: n.name || '', score: hit })
+    }
+  }
+  scored.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id))
+  // **不在此处截断**：截断是展示层的事，且必须带"共 N 条"交代（ARCHITECTURE §2②）。
+  return scored
+}
+
+/** 2-gram 集合（只保留字母/数字/汉字，去掉标点与空白 ⇒ 同输入同输出）。 */
+function bigrams(s) {
+  const t = String(s).toLowerCase().replace(/[^0-9a-z\u4e00-\u9fff]+/g, '')
+  const out = new Set()
+  for (let i = 0; i + 1 < t.length; i++) out.add(t.slice(i, i + 2))
+  return out
 }
 
 // ================= import 静态扫描（依赖图 · 确定性、零 LLM） =================

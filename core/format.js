@@ -32,6 +32,21 @@ export function truncate(s, n = 120) {
   return t.length > n ? `${t.slice(0, n)}…` : t
 }
 
+/**
+ * 查证申报（`plan` 字段）的渲染形态 —— PN-S1。
+ *
+ * 为什么不直接输出原文：`plan` 是**裸串**，`"查过了"` 与完整三段声明在任何出口上等价
+ * ⇒ 只渲原文时，"填了没有"这件事无法被断言，判据永不失败（与假绿同构）。
+ * 故同打段数：`(未填)` / `<原文>（3 段）`。段数只按 `；`/`;`/换行切分 ——
+ * 不做语义解析、不设阈值（非空率阈值口径本身就是错的：收口事件结构性带 plan:''）。
+ */
+export function planBrief(plan, n = 80) {
+  const s = String(plan ?? '').trim()
+  if (!s) return '(未填)'
+  const segs = s.split(/[；;\n]+/).filter((x) => x.trim()).length
+  return `${truncate(s, n)}（${segs} 段）`
+}
+
 export function renderHealth(model, { rootPath, opens, locks = [], inflight = [], logCheck = null } = {}) {
   const cv = coverage(model)
   const L = []
@@ -47,7 +62,7 @@ export function renderHealth(model, { rootPath, opens, locks = [], inflight = []
   L.push(`  在途改动 (${opens.length}): ${opens.length ? '' : '(无)'}`)
   for (const c of opens) {
     const age = Math.round((Date.now() - Date.parse(c.at)) / 60000)
-    L.push(`    · ${c.id} ${truncate(c.task, 70)} | anchor=${c.anchor} | ${(c.files || []).length} 文件 | ${age} 分钟前 | ${c.actor ? `actor=${String(c.actor).slice(0, 8)}` : 'actor=?'}`)
+    L.push(`    · ${c.id} ${truncate(c.task, 70)} | anchor=${c.anchor} | ${(c.files || []).length} 文件 | ${age} 分钟前 | ${c.actor ? `actor=${String(c.actor).slice(0, 8)}` : 'actor=?'} | 查证申报 ${planBrief(c.plan, 40)}`)
   }
   if (inflight.length) L.push(`    在途状态文件: ${inflight.length}（runtime 缓存，可丢）`)
   L.push('')
@@ -99,6 +114,16 @@ export function renderScopeTarget(model, loc) {
   const L = []
   if (loc.kind === 'unknown') {
     L.push(`No mapping found for "${loc.target}".`)
+    // PN-S2：零命中必须**给候选**，不是丢回一句"没有"（ARCHITECTURE §2②：少展示要可见且可取回）。
+    const cands = loc.candidates || []
+    const shown = cands.slice(0, 5)
+    if (shown.length) {
+      L.push(`  · 最接近的已登记节点（共 ${cands.length} 条候选，此处前 ${shown.length}；2-gram 重叠打分，确定性排序）：`)
+      for (const c of shown) L.push(`      ${c.id}${c.name ? ` — ${truncate(c.name, 50)}` : ''}（重叠 ${c.score}）`)
+      L.push('  · 若是其中某个：直接 nav_graph <它的 id> 取精确落点')
+    } else {
+      L.push('  · 候选 0 条 —— 目标词与任何已登记节点的 2-gram 都不重叠')
+    }
     L.push('  · 若是新功能：nav_node target=<功能码> name=… userView=… files=…（登记落点）')
     L.push('  · 若是新模块：nav_node target=<模块名> features=<功能码,功能码> project=<项目>')
     L.push('  · 若是文件但未登记：nav_node target=<功能码> set=files=<逗号分隔路径>')
@@ -334,6 +359,40 @@ export function renderCommitResult(res, model) {
   L.push(`  落点: ${res.materialized.files.length} 文件（索引 ${res.materialized.sources.fromIndex.length} / 字面量 ${res.materialized.sources.fromLiteral.length} / glob ${res.materialized.sources.fromGlob.length}）`)
   if (res.materialized.missing.length) L.push(`  ⚠ 解析未命中 (${res.materialized.missing.length}): ${res.materialized.missing.slice(0, 8).join('; ')}${res.materialized.missing.length > 8 ? ` …+${res.materialized.missing.length - 8}` : ''}`)
   if (res.materialized.unresolved.length) L.push(`  ⚠ 未登记标识 (${res.materialized.unresolved.length}): ${res.materialized.unresolved.slice(0, 8).join('; ')}${res.materialized.unresolved.length > 8 ? ` …+${res.materialized.unresolved.length - 8}` : ''}`)
+
+  // ---- PN-S1/E1：查证申报（plan）的写入侧出口 ----
+  // 此前 plan 只有写入面、零渲染出口（治理根 45 条非空 plan 对模型完全不可见）⇒ 填了等于没填。
+  // 取值必须走**重载后的 model**：res.commit 只有 {id,seq,at}（core/commit.js:170-173）。
+  const cur = model.commits.find((c) => c.seq === res.commit.seq)
+  const declared = String(cur?.plan || '').trim()
+  L.push('')
+  L.push(`  查证申报: ${planBrief(cur?.plan)}`)
+  const declWhy = []
+  if (res.materialized.missing.length) declWhy.push(`${res.materialized.missing.length} 个落点磁盘上不存在/未登记`)
+  const orphan = (res.materialized.files || []).filter((f) => !(model.fileOwners.get(key(f)) || []).length)
+  if (orphan.length) declWhy.push(`${orphan.length} 个落点未登记到任何架构节点`)
+  const press = model.patchPressure?.get(cur?.anchorKey || key(cur?.anchor))
+  if (press && press.sinceDecisionCount >= REPEAT_PATCH_THRESHOLD - 1) {
+    declWhy.push(`该锚点已有 ${press.sinceDecisionCount} 次补丁（阈值 ${REPEAT_PATCH_THRESHOLD}）`)
+  }
+  if (!declared && declWhy.length) {
+    // 只报不拦：A 路线不新增闸位 ⇒ 本行阻断不了任何写入（它不是闸，是文本）。
+    // 文案是**中性事实** —— plan 空串不可区分「没查」与「没填」，不得写成因果断言。
+    L.push(`    ⚠ 本笔未附查证申报（${declWhy.join('；')}）—— 不拦截，仅留痕。`)
+  }
+
+  // ---- PN-S3：相关既有决策点名（"不重开已经关掉的议题"）----
+  // ⚠ 施工期落点偏离会议草案（原定 gates.js:184-193 加一条纯查询）：**通过的闸其 detail 不渲染**
+  // （本函数只渲 failed 列表），挂在闸上等于死文本 —— 与本次刚修掉的"写而不渲"同型。
+  // 故点名落在可见路径上；闸门集合零变更（test/core.test.mjs 钉死七闸），也不新增参数位。
+  const rel = (model.decisions || []).filter((d) => (d.anchorKey || key(d.anchor)) === (cur?.anchorKey || key(cur?.anchor)))
+  const shownRel = rel.slice(-3)
+  for (const d of shownRel) {
+    L.push(`  相关既有决策: ${d.id}（${truncate(d.reason, 80)}）—— 动手前先读，别重开已关的议题`)
+  }
+  if (rel.length > shownRel.length) {
+    L.push(`    …共 ${rel.length} 条既有决策，此处最近 ${shownRel.length}；全量 nav_graph mode=adrs anchor=<锚点>`)
+  }
   L.push('')
   const failed = res.gates.results.filter((r) => !r.pass)
   if (!failed.length) {

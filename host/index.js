@@ -396,7 +396,7 @@ function healthSnapshot(model, rootPath, rec) {
       notDoing: model.vector?.notDoing || '', exitCondition: model.vector?.exitCondition || ''
     },
     coverage: coverage(model),
-    openCommits: model.openCommits.map((c) => ({ id: c.id, task: c.task, anchor: c.anchor, files: c.files || [], at: c.at })),
+    openCommits: model.openCommits.map((c) => ({ id: c.id, task: c.task, anchor: c.anchor, files: c.files || [], at: c.at, plan: c.plan || '' })),
     stale: model.stale,
     unregistered: model.unregistered,
     decisions: model.decisions.map((d) => ({ id: d.id, anchor: d.anchor, at: d.at, reason: d.reason, decision: d.decision, impact: d.impact || '' })),

@@ -247,3 +247,130 @@ test('nav_graph mode=impact：端到端给出依赖图两侧（我引用谁 / �
   assert.match(out, /扫 \d+ 个代码文件/)
   assert.match(out, /候选 \d+ 文件/)
 })
+
+// ============ PN-S1：查证申报（plan）的承载与可见 ============
+//
+// 背景：plan 此前**只有写入面、零渲染出口**（治理根 45 条非空 plan 对模型完全不可见）
+// ⇒ 填了等于没填。本块钉死"写了必须看得见"，并配负例：
+//   · 不阻断写入（A 路线不新增闸位 ⇒ 新判据只能是文本，不是闸）
+//   · 闭笔后仍可追回（收口事件结构性带 plan:''，必须取自原始 open 笔）
+//   · 三态可分辨（裸串无法断言"填了"，故同打段数）
+
+test('PN-S1/E1+E2：查证申报进写入回执与在途列表，且不阻断写入', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root, { files: ['src/a.js'] })
+  const marker = 'MARKER-查证-项目内已有模块X；上游库Y已存在；不复用因为Z'
+  const out = await h.call('nav_commit', {
+    task: '加一个导出', anchor: 'PN-F01', arch: '架构不变，纯局部', features: 'PN-F01', plan: marker
+  })
+  assert.match(out, /已登记 ACT-/, '附申报不得阻断写入')
+  assert.ok(out.includes('MARKER-查证-项目内已有模块X'), 'E1：回执必须能看到申报原文')
+  assert.match(out, /（3 段）/, '段数必须同打 —— 否则"填了没有"不可断言（假绿）')
+  assert.ok(out.indexOf('查证申报') < out.indexOf('收口无需动作'),
+    '位置断言：申报小节必须早于收口说明，否则等于插在末尾没人看得见')
+  const health = await h.call('nav_graph', { mode: 'health' })
+  assert.match(health, /查证申报 MARKER-查证-项目内已有模块X/, 'E2：在途列表同见')
+})
+
+test('PN-S1 负例：未附申报时只提示、绝不阻断（T1 已存在文件静默）', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root, { files: ['src/a.js'] })
+  // 夹具硬约束：seed 把 notDoing 设为 'forbidden-thing'，而 scopeGate 做 includes 互含判定，
+  // 故本用例 scope 绝不能含该串，否则撞范围闸、走不到本判据。
+  const out = await h.call('nav_commit', {
+    task: '新增一个模块', anchor: 'PN-F01', arch: '局部', files: 'src/brand-new.js'
+  })
+  assert.match(out, /已登记 ACT-/, '未附申报不得阻断写入')
+  assert.match(out, /查证申报: \(未填\)/)
+  assert.match(out, /本笔未附查证申报/, 'T2（未登记到任何架构节点的落点）必须给中性提示')
+  assert.ok(!out.includes('未检索'), '文案必须是中性事实，不得写成因果断言')
+})
+
+test('PN-S1/E3：收口之后仍能追回申报（唯一持久出口）', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root, { files: ['src/a.js'] })
+  await h.call('nav_commit', {
+    task: '改 A', anchor: 'PN-F01', arch: '局部', features: 'PN-F01', plan: 'PERSIST-MARKER-查过项目内已有等价实现'
+  })
+  touch(root, 'src/a.js', 'v2')
+  await h.call('nav_graph', { mode: 'health' })          // 任意调用按证据自动收口
+  const render = await h.call('nav_render', {})
+  assert.match(render, /投影已重生成/)
+  const doc = readFileSync(join(root, PLANE.MODEL_DOC), 'utf-8')
+  assert.match(doc, /\| 查证申报 \|/, '收口表必须新增该列')
+  assert.ok(doc.includes('PERSIST-MARKER'),
+    'E3：闭笔后仍可追回 —— 取自原始 open 笔（照抄闭笔事件的 plan 会恒空白）')
+})
+
+test('PN-S1/E4：机器取回出口（nav_graph mode=json）同见申报', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root, { files: ['src/a.js'] })
+  await h.call('nav_commit', {
+    task: '改 A', anchor: 'PN-F01', arch: '局部', features: 'PN-F01', plan: 'JSON-MARKER-已查'
+  })
+  const j = JSON.parse(await h.call('nav_graph', { mode: 'json' }))
+  assert.ok(Array.isArray(j.openCommits) && j.openCommits.length === 1, 'JSON 投影必须带 openCommits')
+  assert.match(j.openCommits[0].plan, /JSON-MARKER-已查/, 'E4：json 投影必须带 plan（此前字段集里没有它）')
+})
+
+test('PN-AC-03：事件流 kind 是白名单闭集（未知 kind 必抛，负例）', async (t) => {
+  const root = tmpRoot(t)
+  await assert.rejects(
+    () => appendEvents(root, [{ kind: 'sought', anchor: 'x' }]),
+    /unknown event kind/,
+    '新增事件 kind 必须是硬失败，否则"不新增 kind"这条约束没有机检'
+  )
+})
+
+// ============ PN-S2：零命中必须给候选（不是丢回一句"没有"） ============
+//
+// 实测原缺陷：自然语言任务 `locate` 5/5 零命中；命中时才知道分支只给"没有"+三条登记指引。
+// ARCHITECTURE §2②：任何"少展示"必须**可见且可取回**。改法零扫盘（不调 walkFiles）。
+
+test('PN-S2：自然语言目标零命中时给确定性候选 + 取回路径', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root)
+  await h.call('nav_node', { target: 'PN-F09', layer: 'feature', name: '导出功能', files: 'src/exp.js' })
+  const out = await h.call('nav_graph', { mode: 'task', target: '加一个导出功能' })
+  assert.match(out, /No mapping found/, '零命中仍必须明说没匹配上（不伪装）')
+  assert.match(out, /共 [1-9]\d* 条候选/, '必须给候选，而不是"没有"')
+  assert.match(out, /feature:pn-f09/, '候选里要认得出相关节点')
+  assert.match(out, /2-gram 重叠打分/, '口径要写清楚，别让调用方以为是精确检索')
+})
+
+test('PN-S2 负例：全不相关时明说候选 0 条（不凑候选）', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root)
+  const out = await h.call('nav_graph', { mode: 'task', target: 'zzz-nothing-qqq' })
+  assert.match(out, /候选 0 条/, '凑候选会训练出"候选不可信"，比不给更坏')
+  assert.match(out, /nav_node/, '零候选时登记指引仍须在位')
+})
+
+test('PN-S2：落点文件按后缀命中（fileOwners 的键是 root 相对路径）', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root, { files: ['project-nav/core/log.js'] })
+  const out = await h.call('nav_graph', { mode: 'task', target: 'core/log.js' })
+  assert.match(out, /共 [1-9]\d* 条候选/, '短路径必须能回溯到 root 相对路径的登记键')
+  assert.match(out, /project-nav\/core\/log\.js/, '候选要给出真实的登记键')
+})
+
+// ============ PN-S3：既有决策点名（不重开已关的议题） ============
+//
+// 施工期落点偏离会议草案（原定 gates.js 加纯查询）：通过的闸其 detail 不渲染，
+// 挂在闸上等于死文本 —— 故落在可见路径（renderCommitResult）。闸门集合零变更。
+
+test('PN-S3：本锚点已有决策时点名，且带理由摘要', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root, { files: ['src/a.js'] })
+  await h.call('nav_decide', { anchor: 'PN-F01', reason: '根因是接口错位', decision: '接口按节点粒度' })
+  const out = await h.call('nav_commit', { task: '再改 A', anchor: 'PN-F01', arch: '局部', features: 'PN-F01' })
+  assert.match(out, /相关既有决策: ADR-\d+/, '本锚点有决策时必须点名')
+  assert.match(out, /根因是接口错位/, '点名必须带理由摘要，否则等于没点名')
+})
+
+test('PN-S3 负例：无决策的锚点不得出现点名（否则每天都响＝狼来了）', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root, { files: ['src/a.js'] })
+  const out = await h.call('nav_commit', { task: '改 A', anchor: 'PN-F01', arch: '局部', features: 'PN-F01' })
+  assert.ok(!out.includes('相关既有决策'), '无决策时零输出 —— 告警必须稀缺才有信号')
+})
