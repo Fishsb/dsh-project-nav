@@ -109,27 +109,30 @@ export function apply(ctx, config) {
     ctx.logger.warn('[project-nav] systemPrompt 服务不可用 —— 在场层未装配（治理退化为仅被调用时存在）')
   }
 
-  // ---- 在场层②：写入之后，把治理状态**附在工具结果旁**（不是改结果）----
-  // 只对写入类工具触发：读操作不打扰。
-  // ⚠ 只注入、不改写：返回 { kind:'accept', additionalContexts }，原 result 一字不动。
-  // ⚠ 失败静默：治理挂掉绝不能拖垮用户的工具调用。
-  const WRITE_TOOLS = new Set(['edit', 'write', 'pwsh', 'bash', 'nav_commit', 'nav_node', 'nav_decide'])
-  if (typeof ctx.on === 'function') {
-    ctx.on('tools/post-execute', async (exec, result, next) => {
-      let decision
-      try { decision = await next() } catch (e) { throw e }
-      try {
-        if (decision?.kind === 'accept' && WRITE_TOOLS.has(String(exec?.name)) && governsAgent(exec?.agent)) {
-          const t = presenceText()
-          if (t) {
-            const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
-            return { ...decision, additionalContexts: [...(decision.additionalContexts || []), createUserMessage({ content: [{ type: 'text', text: t }] })] }
-          }
-        }
-      } catch { /* 注入失败即放行原结果 —— 治理不能成为故障点 */ }
-      return decision
-    })
-  }
+  // ================= 在场层②：**已删除**（2026-09-21，见 ADR-276） =================
+  //
+  // 0.12.0 初版在此注册 `tools/post-execute`，在写入类工具之后用 `additionalContexts`
+  // 注入一份治理摘要。**实测证明那是纯重复**，且它正是真机会话故障的载体：
+  //
+  //  ① **内容逐字重复**：P1 的 `systemPrompt.section` 的 `text` 是**函数**、**每轮组装都求值**
+  //     （dsh-plan-mode 同用法，本仓已机检）。而本处注入调的是**同一个** `presenceText()`
+  //     ⇒ 同一份文本每次模型请求已在系统提示里，这里再追加一份等于零新增信息。
+  //     实测证据（真实会话日志，2026-09-20 会话 63972fea…）：`system/message` 每轮 1 份，
+  //     而 `agent/inbox/spliced` 含同一文本 **24 条**（每次写类工具一条），累计 **~31KB** 纯冗余。
+  //     判据 = ARCHITECTURE §2①「零信息重复必删」；在场层输出**按每轮计费**，重复尤其不可接受。
+  //
+  //  ② **它是崩溃面的唯一载体**：0.12.0 初版漏传 `source` 时，下游 dsh-repeat-tool-reminder 的
+  //     `agent/pre-step` 无保护地读 `message.source.kind` ⇒ TypeError ⇒ 整轮
+  //     `turn/end {kind:'error'}`（界面："Cannot read properties of undefined (reading 'kind')"）。
+  //     ⚠ 关键结构事实：**P1 从不创建消息**（它只往系统提示里放一段文本）
+  //     ⇒ 删掉 P2 之后，本插件**结构上不再有**这条故障路径 —— 不是"改对了"，是"该路径不存在了"。
+  //     这比"补上 source"更强：补 source 是修好一个可能再次写错的点；删掉它则让整类错误无处发生。
+  //
+  // ③ **不做成"换个时机再注入"**：任何 `additionalContexts` 注入都回到同一个承重字段问题，
+  //     而系统提示每轮已带最新治理 —— 再注入一次的收益恒为 0。
+  //
+  // ⇒ 治理在场收敛为**唯一一路**：`systemPrompt.section`（上面 P1）。
+  //   机检守卫见 test/host.test.mjs「在场层只有一条注入路径」。
 
   // ---- 1. nav_graph — 读：模型查询 ----
   ctx.effect(() => ctx.tools.register(defineTool({

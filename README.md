@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.12.0-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.12.1-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-%3E%3D0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -49,7 +49,7 @@
         ┌──────────────────────┴──────────────────────┐
         ▼                                             ▼
   nav_graph 按需直出                        【在场层】每轮注入 agent 上下文
-  （闸门=查询 / 影响面 / 健康）              （systemPrompt 常驻 + 写入后附加）
+  （闸门=查询 / 影响面 / 健康）              （systemPrompt 常驻·单一注入路径）
         └──────────── 零落盘：无任何投影文件（0.12.0）────────────┘
 ```
 
@@ -99,12 +99,20 @@
 治理根登记率仅 **3%**（4747 文件 / 4600 未登记）。根因不是闸门不够，而是**治理只在被调用时存在**。
 
 落盘投影曾是"给人读"的产物；只服务 agent 之后，正确的替代物不是另一个文件，而是
-**把治理放进 agent 的上下文**：
+**把治理放进 agent 的上下文**。⚠ **只有一条注入路径**（0.12.0 修正，ADR-277）：
 
 | 出口 | 机制 | 触发 |
 |---|---|---|
 | **常驻摘要** | `ctx.systemPrompt.section({ text: (c) => … })` | **每轮组装求值**（`text` 是函数，不是静态串） |
-| **写入后附加** | `tools/post-execute` → `{kind:'accept', additionalContexts}` | 仅写入类工具；**只附加、不改写结果** |
+
+> **为什么删掉了第二条（`tools/post-execute` + `additionalContexts`）**：0.12.0 初版曾有，实测是**纯重复** ——
+> `text` 每轮组装即求值，故每次请求的系统提示里已是最新治理；再在写类工具后注入同一份文本等于零新增信息
+> （真实会话日志实测：`system/message` 每轮 1 份，而 `agent/inbox/spliced` 含同一文本 **24 条**、累计 **~31KB**）。
+> 更要紧的是它**创建消息**，而注入消息的 `source` 是**承重字段**：0.12.0 初版漏传 `source` 时，
+> 下游插件的 `agent/pre-step` 无保护地读 `message.source.kind` ⇒ TypeError ⇒ 整轮
+> `turn/end {kind:'error'}`（界面："Cannot read properties of undefined (reading 'kind')"）。
+> **`systemPrompt.section` 从不创建消息 ⇒ 结构上不可能触发它。** 故删路径比补 `source` 更根本：
+> 补字段是修一个可能再次写错的点，删掉它让**整类错误无处发生**。
 
 三条硬约束（缺一即是回退）：
 
@@ -316,8 +324,7 @@ npm run test:node-runner  # 同一批用例走 node --test
   落盘面消失后它无事可做；**留一个空工具比删掉更坏，它会让工具面说谎**）；
   ② 数据面 **3→2 层**（原「渲染投影」层退场）；③ 落盘产出面**整体消失**；④ **新增在场层**。
   **在场层是落盘投影的 agent 形态替代物**（§3.1）：`ctx.systemPrompt.section` 常驻摘要
-  （`text` 是**函数**，每轮组装求值）+ `tools/post-execute` 写入后附加
-  （`{kind:'accept', additionalContexts}`，**只附加、不改写结果**）。它直接治 0.11.0 自述的病根
+  （`text` 是**函数**，每轮组装求值）。它直接治 0.11.0 自述的病根
   ——「七闸只在 `nav_commit` 内跑 ⇒ 不调用它 = 完全绕行无痕迹」（治理根登记率仅 3%）。
   ⚠ **不是重开 0.11.0 否决的"观测层"**：那里否决的是**记录活动事实**（信息纯可派生、只能落
   `runtime/` ⇒ 违反 I1/I3）；在场层**不记录任何事实**，它把**已可派生的**状态**注入上下文** ——
@@ -332,6 +339,19 @@ npm run test:node-runner  # 同一批用例走 node --test
   ⚠ **一处对旧实现的自我纠正**：`renderModelDoc` 里那个"回查 `closes` 指向的原始笔以取 `plan`"
   实为 **no-op**（`closes` 只写在原笔自己身上；治理根 21 条带 `closes` 的记录中 `closes !== seq` 者
   **0 条**）—— 值对、注释错，契约里已改述为实测语义。
+- `0.12.0 → 0.12.1`：**修 bug（非换代）** —— 在场层收敛为**唯一一路**（ADR-277）。
+  0.12.0 初版有两条注入路径，其中 `tools/post-execute` + `additionalContexts` **是纯重复**：
+  `systemPrompt.section` 的 `text` **每轮组装即求值**，故每次请求的系统提示里已是最新治理，
+  再在写类工具后注入**同一份**文本等于零新增信息（真实会话日志实测：`system/message` 每轮 1 份，
+  而 `agent/inbox/spliced` 含同一文本 **24 条**、累计 **~31KB**）⇒ 违反 §2①「零信息重复必删」。
+  **更要紧的是它创建消息**：注入消息的 `source` 是**承重字段**（类型必填），0.12.0 初版漏传时
+  下游 `dsh-repeat-tool-reminder` 的 `agent/pre-step` 无保护地读 `message.source.kind` ⇒ TypeError
+  ⇒ 整轮 `turn/end {kind:'error'}`（界面："Cannot read properties of undefined (reading 'kind')"）。
+  **`systemPrompt.section` 从不创建消息 ⇒ 结构上不可能触发它。** ⇒ **删路径比补 `source` 更根本**：
+  补字段是修一个可能再次写错的点，删掉它让**整类错误无处发生**。
+  **架构面**：工具仍 5、闸门仍七、kind 仍 4、零新增文件、零新增状态；`inject` 仍 `['tools','systemPrompt']`。
+  新增机检：host 内不得出现 `additionalContexts` / `createUserMessage` / `'tools/post-execute'`
+  （源码级 + 行为级双重断言，含变异验证）。
 
 ## 9. 开发纪律
 

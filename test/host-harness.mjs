@@ -20,8 +20,21 @@ const HOST = join(PKG, 'host', 'index.js')
 const sha = (s) => `data:text/javascript,${encodeURIComponent(s)}`
 const TOOLS_SHIM = sha('export const defineTool = (t) => ({ __tool: true, ...t });\nexport default { defineTool };')
 // 0.12.0 在场层：post-execute 要造 UserMessage。官方 dsh-tool-jobs 同样从 dsh-llm 引（不声明为依赖），
-// 在 profile 里可解析；测试环境没有它，故用最小同形替身（只保留注入路径真正消费的字段）。
-const LLM_SHIM = sha('export const createUserMessage = (input) => ({ role: "user", ...input });')
+// 在 profile 里可解析；测试环境没有它，故用最小同形替身 —— 但**同形必须含承重字段 `source`**。
+// ⚠ 2026-09-21 真机故障的逃逸路径就是这里：旧 shim 写成 `(input) => ({ role:"user", ...input })`，
+//   既不校验也不补 `source` ⇒ 注入漏了 source 也能全绿（"探针 PASS ≠ 生效"），
+//   而真实宿主把 additionalContexts 追加为 inbox 消息后，下游 dsh-repeat-tool-reminder 的
+//   agent/pre-step 会无保护地读 `message.source.kind` ⇒ TypeError ⇒ 整轮 turn/end 记 error。
+//   ⇒ 现在**缺 source 即抛**：把这个假绿变成真闸（判据落在输出上，而不是落在"代码看起来对"）。
+const LLM_SHIM = sha([
+  'export const createUserMessage = (input) => {',
+  '  const s = input && input.source;',
+  '  if (!s || typeof s !== "object" || typeof s.kind !== "string") {',
+  '    throw new Error("[host-harness] createUserMessage 缺 source：真实宿主会让整轮 turn/end 记 error（see host/index.js 注入注释）");',
+  '  }',
+  '  return { role: "user", ...input };',
+  '};'
+].join('\n'))
 const SCHEMA_SHIM = sha([
   'const chain = (init) => {',
   '  const o = { __f: true, ...init };',

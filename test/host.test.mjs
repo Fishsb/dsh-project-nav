@@ -8,7 +8,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { tmpRoot, put, touch, seed } from './helper.mjs'
 import { mountHost } from './host-harness.mjs'
 import { appendEvents, readEvents } from '../core/log.js'
@@ -243,23 +244,40 @@ test('在场层：非治理根的会话不被注入（不污染无关项目）',
   assert.equal(out, '', '会话不在被治理 root 内 ⇒ 不注入')
 })
 
-test('在场层：post-execute 只附加上下文、不改写原结果；失败静默', async (t) => {
+test('在场层只有一条注入路径：不再有 tools/post-execute 的 inbox 注入（防重复 + 防故障面复发）', async (t) => {
+  // 这条用例**替换**了旧的「post-execute 只附加上下文…source 断言」—— 不是删判据，是换了它守的东西。
+  //
+  // 事实链（全部实测，2026-09-21）：
+  //  ① P1 `systemPrompt.section` 的 text 是**函数**、每轮组装求值 ⇒ 治理摘要已在每次请求的系统提示里；
+  //  ② 0.12.0 初版的 P2 在每次写类工具后用 `additionalContexts` 再注入**同一份**文本
+  //     ⇒ 纯重复（真实会话日志实测：`agent/inbox/spliced` 含该文本 24 条 / 累计 ~31KB，
+  //       而 `system/message` 每轮仅 1 份）—— 判据 = ARCHITECTURE §2①「零信息重复必删」；
+  //  ③ 且 P2 是那次真机会话故障（`message.source.kind` → TypeError → 整轮 turn/end error）
+  //     的**唯一载体**：P1 从不创建消息，结构上不可能触发它。
+  //
+  // ⇒ 删 P2 比"给 P2 补 source"更强：补 source 是修一个可能再写错的点；删掉它让整类错误无处发生。
+  //   本用例把"该路径不存在"钉成机检 —— 后人若重新引入 inbox 注入，测试立刻红。
   const { root, h } = await boot(t)
   await seed(root)
+
+  // 判据 1：源码级 —— host 不得再出现任何 inbox 注入面（additionalContexts / createUserMessage / post-execute）
+  const hostSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'host', 'index.js'), 'utf-8')
+  const code = hostSrc.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
+  for (const banned of [/additionalContexts/, /createUserMessage/, /'tools\/post-execute'/, /"tools\/post-execute"/]) {
+    assert.ok(!banned.test(code), `host 不得再出现 inbox 注入面（命中 ${banned}）—— 重复注入且是故障面载体`)
+  }
+
+  // 判据 2：行为级 —— 写类工具执行后不得产生任何 additionalContexts
   const exec = { name: 'edit', agent: { session: { meta: { cwd: root } } } }
   const original = { ok: true, content: 'ORIGINAL-RESULT' }
   const decision = await h.firePostExecute(exec, original)
-  assert.equal(decision.kind, 'accept', '必须是 accept（治理只提示、不阻断开发）')
-  if (decision.value !== undefined) {
-    assert.deepEqual(decision.value, original, '原结果不得被改写')
-  }
-  assert.ok(Array.isArray(decision.additionalContexts) && decision.additionalContexts.length >= 1,
-    '写入类工具后必须附加治理上下文')
-  assert.match(JSON.stringify(decision.additionalContexts), /治理在场/)
+  assert.equal(decision.additionalContexts, undefined,
+    'post-execute 不得再注入上下文（治理已在每轮系统提示里；再注入即重复）')
 
-  // 读类工具不打扰
-  const readDecision = await h.firePostExecute({ name: 'read', agent: exec.agent }, original)
-  assert.equal(readDecision.additionalContexts, undefined, '读操作不该被注入打扰')
+  // 判据 3：P1 仍在岗 —— 收敛为一路不等于把在场层删了
+  const sec = h.stub.sections.find((s) => s.name === 'project-nav:presence')
+  assert.ok(sec, '在场层必须仍由 systemPrompt.section 承载（收敛为一路，不是取消）')
+  assert.match(h.presenceText({ agent: { session: { meta: { cwd: root } } } }), /治理在场/)
 })
 
 test('端到端：七闸全绿的一笔改动 —— 登记 → 改 → 自动收口 → 机器视图可回溯', async (t) => {
