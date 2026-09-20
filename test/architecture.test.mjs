@@ -137,6 +137,36 @@ test('I2 投影不再物化：落盘出口确实不在位（防"顺手加回来"
   assert.equal(typeof render.renderTreeText, 'function', 'renderTreeText 是 nav_graph mode=map 的实现，必须留下')
 })
 
+test('发布链脚本：含非 ASCII 的 .ps1 必须 UTF-8 with BOM（否则 PS 5.1 按 GBK 解码 → 语法错）', async (t) => {
+  // 为什么值得机检：这是本仓**实测反复踩到**的边界（AGENTS.md §4），而它的后果是
+  // "脚本看起来完好、真跑却满屏 Unexpected token" —— 静态看文件内容完全正常，
+  // 只有**字节头**能区分。任何编辑工具重写文件都可能悄悄去掉 BOM（本次施工踩了两次）。
+  // 判据是结构性的（读字节头），不是度量 —— 与 §2「结构可断言，度量只能参考」同根。
+  const here = dirname(fileURLToPath(import.meta.url))
+  const pkgRoot = join(here, '..')
+  const scripts = readdirSync(pkgRoot).filter((f) => f.endsWith('.ps1'))
+  assert.ok(scripts.length > 0, '本仓必须有发布链 .ps1 脚本')
+  for (const f of scripts) {
+    const bytes = readFileSync(join(pkgRoot, f))
+    const hasBom = bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF
+    const text = bytes.toString('utf-8')
+    const nonAscii = /[^\x00-\x7F]/.test(text)
+    if (nonAscii) {
+      assert.ok(hasBom, `${f} 含非 ASCII 却无 BOM —— PS 5.1 会按 GBK 解码，脚本真跑必语法错`)
+    }
+  }
+})
+
+test('发布链脚本：包外的 .mjs/.js 不得带 BOM（node 不认 BOM）', async (t) => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const pkgRoot = join(here, '..')
+  for (const rel of ['verify-runtime.mjs', 'bootstrap.mjs', 'core/render.js', 'host/index.js', 'package.json']) {
+    const bytes = readFileSync(join(pkgRoot, rel))
+    const hasBom = bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF
+    assert.ok(!hasBom, `${rel} 不得带 BOM（node 不认）`)
+  }
+})
+
 test('I2 零写盘是结构性的：core/render.js 不得 import 任何写盘面（源码级守卫）', async (t) => {
   // 为什么扫源码而不只测行为：**零写盘**是这次换代的核心不变量，
   // 而"某次调用没写盘"只是采样；import 面一旦沾上 fs 写入，随时可能被后人加回来。

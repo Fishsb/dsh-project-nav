@@ -1,4 +1,4 @@
-# verify-install.ps1 — 独立校验安装面（**只读**，重启前就能跑）
+﻿# verify-install.ps1 — 独立校验安装面（**只读**，重启前就能跑）
 #
 # ⚠ 版本无关：版本号与产物名都从本仓 package.json 派生 —— 不再"每版一份脚本"。
 #
@@ -141,16 +141,22 @@ if (Test-Path (Join-Path $Dest 'core\render.js')) {
   if ((ReadUtf8 (Join-Path $Dest 'core\render.js')) -match 'stampArchDoc|listArchDocs|parseArchCache') { Bad 'core/render.js 仍带架构档指纹机制' }
   else { Ok '架构档指纹/新鲜度机制已移除（§2 降级为投影）' }
   # 0.12.0 换代：落盘投影出口必须不在位（留存即回退 —— "先落盘再注入"等于把删掉的投影换个名字加回来）
-  $render = ReadUtf8 (Join-Path $Dest 'core\render.js')
-  $fallen = @('renderAll','renderModelDoc','renderMapHtml','writeProjectSection','MARK_START') | Where-Object { $render -match [regex]::Escape($_) }
+  # ⚠ 同样先去注释：render.js 的头注会点名这些出口（说明它们为何退场）。
+  $renderCode = (ReadUtf8 (Join-Path $Dest 'core\render.js')) -replace '(?m)^\s*//.*$', '' -replace '(?s)/\*.*?\*/', ''
+  $fallen = @('renderAll','renderModelDoc','renderMapHtml','writeProjectSection','MARK_START') | Where-Object { $renderCode -match [regex]::Escape($_) }
   if ($fallen.Count -eq 0) { Ok '落盘投影出口已退场（render.js 零写盘）' } else { Bad ('落盘投影出口仍在: ' + ($fallen -join ', ')) }
 }
 if (Test-Path (Join-Path $Dest 'host\index.js')) {
-  if ((ReadUtf8 (Join-Path $Dest 'host\index.js')) -match "name: 'nav_render'") { Bad 'host 仍注册 nav_render —— 工具面应为 5' }
+  # ⚠ 去注释后判：host 头注与在场层注释会提到 nav_render（历史叙述）。
+  $hostCode = (ReadUtf8 (Join-Path $Dest 'host\index.js')) -replace '(?m)^\s*//.*$', '' -replace '(?s)/\*.*?\*/', ''
+  if ($hostCode -match "name: 'nav_render'") { Bad 'host 仍注册 nav_render —— 工具面应为 5' }
   else { Ok 'nav_render 已退场（工具面 = 5）' }
 }
 if (Test-Path (Join-Path $Dest 'core\paths.js')) {
-  if ((ReadUtf8 (Join-Path $Dest 'core\paths.js')) -match 'PROJECT_DOC|MODEL_DOC') { Bad 'core/paths.js 仍带落盘投影平面常量（数据面应为 2 层）' }
+  # ⚠ 必须**去注释后**再判：paths.js 的头注里就写着这两个常量名（说明它们为何退场），
+  # 直接 grep 整份源码会打到注释 ⇒ 假红。判据要打在**代码**上，不能打在说明文字上。
+  $pathsCode = (ReadUtf8 (Join-Path $Dest 'core\paths.js')) -replace '(?m)^\s*//.*$', '' -replace '(?s)/\*.*?\*/', ''
+  if ($pathsCode -match 'PROJECT_DOC|MODEL_DOC') { Bad 'core/paths.js 仍带落盘投影平面常量（数据面应为 2 层）' }
   else { Ok '数据面 = 2 层（落盘投影平面已退场）' }
 }
 
