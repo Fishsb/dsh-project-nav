@@ -6,6 +6,11 @@
 #   全部失效。按「能删才不留假 STALE」收敛为单一忽略规则，不保留空承诺。
 .internal/
 
+# .roundtable/ —— 圆桌会议插件运行时数据（会议记录里 kbPath 是开会时选的**本机绝对路径**）
+#   判据同 shoucang 仓（2026-09-16 已确立）：这类过程产物**永不入库**，靠 .gitignore 显式排除，
+#   否则"未被跟踪"只是巧合 —— git add -A 就会带进去。
+.roundtable/
+
 node_modules/
 *.tgz
 .workbuddy/
