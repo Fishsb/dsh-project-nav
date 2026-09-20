@@ -1,20 +1,22 @@
-// core/paths.js — 平面契约（ARCHITECTURE §2）
+// core/paths.js — 平面契约（ARCHITECTURE §3）
 //
-// 只有三个平面。任何"我想再存一个文件"的冲动都必须先回答：它是事件，还是渲染？
+// 只有两个平面（0.12.0 起）。任何"我想再存一个文件"的冲动都必须先回答：它是事件，还是渲染？
 // 两者都不是 → 它不该存在（I1：不存在第二个手写真相）。
+//
+// ⚠ 0.12.0 换代：原先的**第三个平面「落盘投影」**（PROJECT.md 标记区 / ARCH-MODEL.md / 地图）
+// 已整体退场 —— 它们的唯一读者是人，而定案是「只服务 agent」。其 agent 形态的替代物是
+// **在场层**（每轮注入上下文，零落盘，见 host/index.js）与 `nav_graph` 按需直出。
+// 故 `PROJECT_DOC` / `MODEL_DOC` 两个常量不存在了：留着它们就是留一份永远不再被写的承诺。
 
 import { resolve, relative, isAbsolute } from 'node:path'
 import { existsSync } from 'node:fs'
 
-/** 三层数据面。删掉 RUNTIME 必须零损失（I3）。 */
+/** 两层数据面。删掉 RUNTIME 必须零损失（I3）。 */
 export const PLANE = {
   /** 唯一事实源：append-only 事件流（永久 · 进版本控制） */
   EVENTS: '.internal/events.jsonl',
   /** 可丢弃缓存 / 在途 / 锁 / 诊断（短命 · 不进版本控制） */
   RUNTIME: '.internal/runtime',
-  /** 渲染投影（可再生产物） */
-  PROJECT_DOC: 'PROJECT.md',
-  MODEL_DOC: '.internal/ARCH-MODEL.md',
   /** 旧账本归档（只读 · 迁移后不再被读写） */
   LEGACY: '.internal/legacy'
 }
@@ -37,8 +39,6 @@ export const paths = {
   model: (root) => p(root, PLANE.RUNTIME, RUNTIME_FILES.MODEL),
   inflightDir: (root) => p(root, PLANE.RUNTIME, RUNTIME_FILES.INFLIGHT),
   locksDir: (root) => p(root, PLANE.RUNTIME, RUNTIME_FILES.LOCKS),
-  projectDoc: (root) => p(root, PLANE.PROJECT_DOC),
-  modelDoc: (root) => p(root, PLANE.MODEL_DOC),
   archDir: (root) => p(root, '.internal', 'arch'),
   legacyDir: (root) => p(root, PLANE.LEGACY)
 }

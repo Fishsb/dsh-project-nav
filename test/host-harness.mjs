@@ -19,6 +19,9 @@ const HOST = join(PKG, 'host', 'index.js')
 
 const sha = (s) => `data:text/javascript,${encodeURIComponent(s)}`
 const TOOLS_SHIM = sha('export const defineTool = (t) => ({ __tool: true, ...t });\nexport default { defineTool };')
+// 0.12.0 在场层：post-execute 要造 UserMessage。官方 dsh-tool-jobs 同样从 dsh-llm 引（不声明为依赖），
+// 在 profile 里可解析；测试环境没有它，故用最小同形替身（只保留注入路径真正消费的字段）。
+const LLM_SHIM = sha('export const createUserMessage = (input) => ({ role: "user", ...input });')
 const SCHEMA_SHIM = sha([
   'const chain = (init) => {',
   '  const o = { __f: true, ...init };',
@@ -47,6 +50,7 @@ export async function loadHost() {
   src = src
     .replace(/from '@deepseek-ai\/dsh-tools'/g, `from '${TOOLS_SHIM}'`)
     .replace(/from '@deepseek-ai\/schemastery'/g, `from '${SCHEMA_SHIM}'`)
+    .replace(/import\('@deepseek-ai\/dsh-llm'\)/g, `import('${LLM_SHIM}')`)
   // ../core/*.js → 绝对 file: URL（临时文件目录里没有相对结构）
   src = src.replace(/from '(\.\.\/core\/[^']+)'/g, (_m, rel) => `from '${pathToFileURL(resolve(dirname(HOST), rel)).href}'`)
 
@@ -65,6 +69,7 @@ export function stubCtx({ logs = [], services = {} } = {}) {
   const registered = []
   const effects = []
   const listeners = new Map()
+  const sections = []        // 0.12.0 在场层：收集 systemPrompt.section 注册
   const ctx = {
     logger: {
       info: (m) => logs.push(`info: ${m}`),
@@ -73,6 +78,14 @@ export function stubCtx({ logs = [], services = {} } = {}) {
     },
     tools: {
       register(tool) { registered.push(tool); return () => { const i = registered.indexOf(tool); if (i >= 0) registered.splice(i, 1) } }
+    },
+    // 在场层（0.12.0）：桩替身只记录注册，返回真实 disposer（与官方 section() 同形）。
+    systemPrompt: {
+      section(sec) {
+        sections.push(sec)
+        return () => { const i = sections.indexOf(sec); if (i >= 0) sections.splice(i, 1) }
+      },
+      getSectionOrder: () => 10200
     },
     effect(fn) {
       const d = fn()
@@ -90,8 +103,24 @@ export function stubCtx({ logs = [], services = {} } = {}) {
     }
   }
   return {
-    ctx, registered, effects, listeners,
+    ctx, registered, effects, listeners, sections,
     byName: (n) => registered.find((t) => t.name === n),
+    /** 在场层文本：取第一个 section 的实参，按组装上下文求值（模拟 DSH 每轮组装）。 */
+    presenceText: (assembleCtx = { agent: { session: { meta: {} } } }) => {
+      const s = sections.find((x) => x.name === 'project-nav:presence')
+      if (!s) return null
+      return typeof s.text === 'function' ? s.text(assembleCtx) : s.text
+    },
+    /** 触发 post-execute 监听器（waterfall 语义：next() 给原结果）。 */
+    firePostExecute: async (exec, result) => {
+      const handlers = listeners.get('tools/post-execute') || []
+      let decision = { kind: 'accept', value: result }
+      for (const handler of handlers) {
+        const prev = decision
+        decision = await handler(exec, result, async () => prev)
+      }
+      return decision
+    },
     disposeAll: () => { for (const d of effects) if (typeof d === 'function') d() }
   }
 }
@@ -109,6 +138,10 @@ export async function mountHost(root, { config = {}, logs = [], services = {} } 
       if (!t) throw new Error(`tool ${name} not registered (registered: ${stub.registered.map((x) => x.name).join(', ')})`)
       return t
     },
+    /** 在场层（0.12.0）：取注入文本（按组装上下文求值）。 */
+    presenceText: (assembleCtx) => stub.presenceText(assembleCtx),
+    /** 在场层（0.12.0）：触发 post-execute。（见 stubCtx.firePostExecute） */
+    firePostExecute: (exec, result) => stub.firePostExecute(exec, result),
     /** 真调用（host 的 execute 返回字符串或字符串数组） */
     call: async (name, args = {}, exec = { agent: { id: 'test-session-0001' } }) => {
       const t = stub.byName(name)

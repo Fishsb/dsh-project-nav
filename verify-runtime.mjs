@@ -101,6 +101,28 @@ try {
   const render = fs.readFileSync(`${BASE}/core/render.js`, 'utf-8')
   if (/stampArchDoc|listArchDocs|parseArchCache/.test(render)) bad('core/render.js 仍带架构档指纹机制')
   else ok('架构档指纹机制已移除')
+
+  // 0.12.0 换代：落盘投影整体退场（ADR-268）。
+  // 判据是**已删机制不在位** —— 留存即是回退（"先落盘再注入"就等于把删掉的投影换个名字加回来）。
+  const fallen = ['renderAll', 'renderModelDoc', 'renderMapHtml', 'writeProjectSection', 'MARK_START']
+    .filter((n) => render.includes(n))
+  if (fallen.length) bad(`落盘投影出口仍在 core/render.js: ${fallen.join(', ')} —— 换代未生效`)
+  else ok('落盘投影出口已退场（render.js 零写盘）')
+  if (typeof (await import(url('core/render.js'))).renderTreeText !== 'function') bad('renderTreeText 缺失（nav_graph mode=map 会坏）')
+  else ok('renderTreeText 在位（按需渲染保留）')
+
+  // 在场层：诊断该暴露的能力必须在位。
+  const fmt = fs.readFileSync(`${BASE}/core/format.js`, 'utf-8')
+  if (!/export function renderPresence/.test(fmt)) bad('core/format.js 缺 renderPresence（在场层文本成形）')
+  else ok('renderPresence 在位（在场层）')
+  const mdl = fs.readFileSync(`${BASE}/core/model.js`, 'utf-8')
+  if (!/export function foldOnly/.test(mdl)) bad('core/model.js 缺 foldOnly（在场层廉价路径）')
+  else ok('foldOnly 在位（纯事件流折叠，不扫盘）')
+  const host = fs.readFileSync(`${BASE}/host/index.js`, 'utf-8')
+  if (/name: 'nav_render'/.test(host)) bad('host 仍注册 nav_render —— 工具面应为 5')
+  else ok('nav_render 已退场（工具面 = 5）')
+  if (!/systemPrompt\.section\(/.test(host)) bad('host 未装配 systemPrompt 在场层 —— 治理退回"只在被调用时存在"')
+  else ok('在场层已装配（systemPrompt.section）')
 } catch (e) { bad('换代面检查失败: ' + e.message) }
 
 // ---------- 汇总（先收失败，再给结论 —— 纪律 ②） ----------

@@ -166,6 +166,38 @@ export function attachAnchorKeys(folded) {
   return folded
 }
 
+/**
+ * 在场层（0.12.0）的**廉价折叠**：只有事件流，不碰磁盘。
+ *
+ * 为什么单独开一条路径：`systemPrompt.section` 的 text provider **每轮组装都要跑**
+ * （dsh-plan-mode 实证），若那里调 `loadModel`/`buildModel`，每轮要付
+ * `walkFiles` + `scanImports` 的磁盘扫描（治理根实测 **177ms/次**）；
+ * 而纯事件流折叠实测 **5.1ms/次**（79 节点，约 35×）。
+ *
+ * ⚠ 它**不是**第二个真相（I1）：字段全部由事件流派生，与 `buildModel` 的折叠段**同一实现**
+ * （`foldEvents` + `attachAnchorKeys`），只是省掉磁盘实况部分。故它给不出 STALE/缺口/依赖图
+ * ——那些是磁盘派生，只有 `buildModel` 有。在场层因此**只报事件流能证明的事**（主线/在途/补丁计数/
+ * 决策），不报磁盘实况（这正是"不谎报"的形态：不知道的事不说）。
+ *
+ * ⚠ 本函数**零写盘**（I3）：不落 runtime，不建锁。
+ */
+export function foldOnly(rootPath) {
+  const { events, corrupt } = readEvents(rootPath)
+  const base = attachAnchorKeys(foldEvents(events))
+  const { patchPressure, openCommits } = pressureFrom(base)
+  return {
+    rootPath,
+    eventCount: events.length,
+    nodes: base.nodes,
+    vector: base.vector,
+    decisions: base.decisions,
+    commits: base.commits,
+    openCommits,
+    patchPressure,
+    log: [...base.log, ...corrupt.map((c) => ({ seq: null, problem: `corrupt event line ${c.line}: ${c.reason}` }))]
+  }
+}
+
 function fileOwnersOf(nodes) {
   const fileOwners = new Map()
   for (const n of nodes.values()) {

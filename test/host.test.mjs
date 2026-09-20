@@ -7,7 +7,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpRoot, put, touch, seed } from './helper.mjs'
 import { mountHost } from './host-harness.mjs'
@@ -23,19 +23,22 @@ async function boot(t, { config = {} } = {}) {
   return { root, h }
 }
 
-test('装配面：恰好注册 6 个工具，名字与架构文档一致', async (t) => {
+test('装配面：恰好注册 5 个工具，名字与架构文档一致（0.12.0：nav_render 退场）', async (t) => {
   const { h } = await boot(t)
   const names = h.stub.registered.map((x) => x.name).sort()
   assert.deepEqual(names, NEW_TOOL_NAMES.slice().sort())
-  assert.equal(names.length, 6)
+  assert.equal(names.length, 5)
 })
 
 test('装配面：每个工具都是 ctx.effect 挂载的（卸载即净）', async (t) => {
   const { h } = await boot(t)
-  assert.equal(h.stub.effects.length, 6, '每个工具一个 effect')
-  assert.equal(h.stub.registered.length, 6)
+  // 5 个工具各一个 effect + 1 个在场层 section 的 effect（0.12.0）
+  assert.equal(h.stub.effects.length, 6, '5 个工具的 effect + 在场层 section 的 effect')
+  assert.equal(h.stub.registered.length, 5)
+  assert.equal(h.stub.sections.length, 1, '在场层必须注册 1 个 section')
   h.stub.disposeAll()
   assert.equal(h.stub.registered.length, 0, '释放 effect 后工具注册必须全部撤销')
+  assert.equal(h.stub.sections.length, 0, '释放 effect 后在场层 section 必须一并撤销（卸载即净）')
 })
 
 test('nav_node：登记节点 → 模型与事件流都落地', async (t) => {
@@ -188,25 +191,78 @@ test('nav_graph：json 模式返回可序列化快照（不含活对象）', asy
   assert.ok(typeof j.events === 'number')
 })
 
-test('nav_render：三个投影全生成；标记缺失时明确拒绝而不是猜', async (t) => {
+test('在场层：治理摘要已注册，text 是函数（每轮求值），且零落盘', async (t) => {
+  // 0.12.0 的心脏：接替被删的落盘投影 —— 治理改为**注入 agent 上下文**。
+  // 原 `nav_render：三个投影全生成` 用例随落盘面退场而删除（其所测能力已不存在）。
   const { root, h } = await boot(t)
   await seed(root)
-  // 无标记的 PROJECT.md → 拒绝写入自动区
-  writeFileSync(join(root, 'PROJECT.md'), '# 没有标记\n', 'utf-8')
-  const out1 = await h.call('nav_render', {})
-  assert.match(out1, /找不到 nav:auto 标记/)
-  assert.equal(readFileSync(join(root, 'PROJECT.md'), 'utf-8'), '# 没有标记\n')
-  assert.ok(existsSync(join(root, PLANE.MODEL_DOC)))
-  // 有标记 → 正常写入
-  writeFileSync(join(root, 'PROJECT.md'), `# 标题\n\n<!-- nav:auto:start -->\nold\n<!-- nav:auto:end -->\n\n手写结尾\n`, 'utf-8')
-  const out2 = await h.call('nav_render', {})
-  assert.match(out2, /PROJECT.md 标记区: 已更新/)
-  const text = readFileSync(join(root, 'PROJECT.md'), 'utf-8')
-  assert.ok(text.includes('手写结尾'), '标记外内容零触碰')
-  assert.ok(!text.includes('\nold\n'), '标记内必须被重渲染')
+  const sec = h.stub.sections.find((s) => s.name === 'project-nav:presence')
+  assert.ok(sec, '在场层必须注册 systemPrompt.section（否则治理又退回"只在被调用时存在"）')
+  assert.equal(typeof sec.text, 'function', 'text 必须是函数 —— 静态串会变成 spawn 期快照，治理状态一改就过期')
+
+  const text = h.presenceText({ agent: { session: { meta: { cwd: root } } } })
+  assert.match(text, /治理在场/)
+  assert.match(text, /doing=/, '摘要必须带主线向量')
+
+  // 零落盘：注入过程**不得新增任何文件**（I3）。
+  // ⚠ 不能断言 runtime/ 不存在 —— seed 阶段的 appendEvents 走 withLock，必然建 runtime/locks。
+  // 正确判据是**前后快照比对**（"没有新增"才是零落盘）。
+  const snap = () => {
+    const out = []
+    const walk = (d) => {
+      if (!existsSync(d)) return
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        const f = join(d, e.name)
+        if (e.isDirectory()) walk(f)
+        else out.push(f)
+      }
+    }
+    walk(join(root, '.internal'))
+    return out.sort()
+  }
+  const before = snap()
+  h.presenceText({ agent: { session: { meta: { cwd: root } } } })
+  assert.deepEqual(snap(), before, '在场层必须零落盘（含 runtime 缓存）—— 落盘就是把删掉的投影换个名字加回来')
 })
 
-test('端到端：七闸全绿的一笔改动 —— 登记 → 改 → 自动收口 → 投影', async (t) => {
+test('在场层：事件流变化 ⇒ 下一次组装给出不同文本（证明确实每轮求值，不是快照）', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root)
+  const ctxA = { agent: { session: { meta: { cwd: root } } } }
+  const before = h.presenceText(ctxA)
+  await appendEvents(root, [{ kind: 'set', vector: { doing: 'PRESENCE-MARKER', next: 'n', notDoing: '', exitCondition: '' } }])
+  const after = h.presenceText(ctxA)
+  assert.notEqual(before, after, '事件流改变后注入文本必须随之改变（否则是死快照）')
+  assert.match(after, /PRESENCE-MARKER/)
+})
+
+test('在场层：非治理根的会话不被注入（不污染无关项目）', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root)
+  const out = h.presenceText({ agent: { session: { meta: { cwd: 'C:/somewhere/else' } } } })
+  assert.equal(out, '', '会话不在被治理 root 内 ⇒ 不注入')
+})
+
+test('在场层：post-execute 只附加上下文、不改写原结果；失败静默', async (t) => {
+  const { root, h } = await boot(t)
+  await seed(root)
+  const exec = { name: 'edit', agent: { session: { meta: { cwd: root } } } }
+  const original = { ok: true, content: 'ORIGINAL-RESULT' }
+  const decision = await h.firePostExecute(exec, original)
+  assert.equal(decision.kind, 'accept', '必须是 accept（治理只提示、不阻断开发）')
+  if (decision.value !== undefined) {
+    assert.deepEqual(decision.value, original, '原结果不得被改写')
+  }
+  assert.ok(Array.isArray(decision.additionalContexts) && decision.additionalContexts.length >= 1,
+    '写入类工具后必须附加治理上下文')
+  assert.match(JSON.stringify(decision.additionalContexts), /治理在场/)
+
+  // 读类工具不打扰
+  const readDecision = await h.firePostExecute({ name: 'read', agent: exec.agent }, original)
+  assert.equal(readDecision.additionalContexts, undefined, '读操作不该被注入打扰')
+})
+
+test('端到端：七闸全绿的一笔改动 —— 登记 → 改 → 自动收口 → 机器视图可回溯', async (t) => {
   const { root, h } = await boot(t)
   await seed(root, { files: ['src/a.js'] })
   const commit = await h.call('nav_commit', { task: '给 A 加一层', anchor: 'PN-F01', arch: '架构不变，纯局部', features: 'PN-F01' })
@@ -220,16 +276,15 @@ test('端到端：七闸全绿的一笔改动 —— 登记 → 改 → 自动�
   touch(root, 'src/a.js', 'v2')
   const dec = await h.call('nav_decide', { anchor: 'PN-F01', reason: '根因是接口错位', decision: '接口按节点粒度' })
   assert.match(dec, /ADR-/)
-  const render = await h.call('nav_render', {})
-  assert.match(render, /投影已重生成/)
   const health = await h.call('nav_graph', { mode: 'health' })
   assert.match(health, /在途改动 \(0\)/)
   assert.match(health, /架构决策: 1 条/)
-  const proj = readFileSync(join(root, PLANE.MODEL_DOC), 'utf-8')
-  assert.match(proj, /\| ADR · `ADR-\d+` · `feature:pn-f01` \|/, '决策必须进投影索引，且挂在节点上')
-  assert.match(proj, /接口按节点粒度/)
-  assert.match(proj, /给 A 加一层/, '已收口的改动必须在人类可读投影里可回溯')
-  assert.match(proj, /## 最近的收口/)
+  // ⚠ 换代换靶（ADR-268）：原断言读 PLANE.MODEL_DOC（落盘投影，已退场）→ 现读 mode=json 的机器视图。
+  // 判据内容一字不改：**已收口的改动与决策必须可回溯**，只换载体。
+  const j = JSON.parse(await h.call('nav_graph', { mode: 'json' }))
+  assert.ok(j.decisions.some((d) => d.anchor === 'feature:pn-f01' && /接口按节点粒度/.test(d.decision)),
+    '决策必须挂到节点上且可在机器视图回溯')
+  assert.ok(j.commits.some((c) => /给 A 加一层/.test(c.task)), '已收口的改动必须可回溯')
 })
 
 test('nav_graph mode=impact：端到端给出依赖图两侧（我引用谁 / 谁引用我）', async (t) => {
@@ -286,20 +341,32 @@ test('PN-S1 负例：未附申报时只提示、绝不阻断（T1 已存在文�
   assert.ok(!out.includes('未检索'), '文案必须是中性事实，不得写成因果断言')
 })
 
-test('PN-S1/E3：收口之后仍能追回申报（唯一持久出口）', async (t) => {
+test('PN-S1/E3：收口之后仍能追回申报（唯一持久出口 —— 0.12.0 换靶到机器视图）', async (t) => {
+  // ⚠ 换代换靶（ADR-268）：原出口是 renderModelDoc 的收口表（落盘投影，已退场）。
+  // **判据内容一字不改**：闭笔之后仍必须能追回 plan —— 只换成 nav_graph mode=json 的 commits[]。
+  // 若这里也丢了，PN-S1 就整体回退成"写而不渲"（0.10.6 刚修掉的那个洞）。
+  //
+  // ⚠ 变异验证（0.12.0 实测踩到）：本条必须能对"plan 被丢掉"变红。
+  // 曾经写成 `commits.filter(c => /MARKER/.test(c.plan))` —— 那只证明"某条有"，删掉 plan 字段也照样绿。
+  // 真正的判据是**配对**：载有该意图的那条 commit，收口后 plan 必须仍在原文（不得被回执的空串覆盖）。
   const { root, h } = await boot(t)
   await seed(root, { files: ['src/a.js'] })
-  await h.call('nav_commit', {
-    task: '改 A', anchor: 'PN-F01', arch: '局部', features: 'PN-F01', plan: 'PERSIST-MARKER-查过项目内已有等价实现'
-  })
+  const plan = 'PERSIST-MARKER-查过项目内已有等价实现'
+  await h.call('nav_commit', { task: '改 A', anchor: 'PN-F01', arch: '局部', features: 'PN-F01', plan })
   touch(root, 'src/a.js', 'v2')
   await h.call('nav_graph', { mode: 'health' })          // 任意调用按证据自动收口
-  const render = await h.call('nav_render', {})
-  assert.match(render, /投影已重生成/)
-  const doc = readFileSync(join(root, PLANE.MODEL_DOC), 'utf-8')
-  assert.match(doc, /\| 查证申报 \|/, '收口表必须新增该列')
-  assert.ok(doc.includes('PERSIST-MARKER'),
-    'E3：闭笔后仍可追回 —— 取自原始 open 笔（照抄闭笔事件的 plan 会恒空白）')
+  const j = JSON.parse(await h.call('nav_graph', { mode: 'json' }))
+
+  const planned = j.commits.filter((c) => (c.plan || '').includes('PERSIST-MARKER'))
+  assert.equal(planned.length, 1, '承载原始申报的 commit 必须恰好一条（收口不得把它复制/清空）')
+  assert.equal(planned[0].plan, plan, 'plan 必须逐字保留（截断或改写都算丢失）')
+
+  // 关键配对：同一条 commit 必须已被收口（phase=closed）—— 否则"收口后仍可追回"没被验到
+  assert.equal(planned[0].phase, 'closed', '该笔必须已按证据收口，否则这条判据没走到"收口之后"')
+  assert.ok(planned[0].closedIntent === true, '收口后原笔应标记 closedIntent（closes 指向自身）')
+  // 收口回执不得顶替原笔：回执的 plan 结构性为空
+  const receipt = j.commits.find((c) => c.receipt === true && c.task === '改 A')
+  assert.ok(!receipt || receipt.plan === '', '收口回执的 plan 结构性为空 —— 消费方须靠 closedIntent 找到原笔')
 })
 
 test('PN-S1/E4：机器取回出口（nav_graph mode=json）同见申报', async (t) => {

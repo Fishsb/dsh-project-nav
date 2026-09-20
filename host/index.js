@@ -7,10 +7,10 @@
 // 架构（见 ARCHITECTURE.md）：
 //   ① 事件流 .internal/events.jsonl  —— 唯一事实源（append-only）
 //   ② 模型   .internal/runtime/…     —— 事件流的折叠（可丢弃，I3）
-//   ③ 投影   PROJECT.md / ARCH-MODEL.md / 地图 / 架构档指针 —— 全部渲染（I2）
+//   ③ 在场层 —— **零落盘**：治理摘要每轮注入 agent 上下文（0.12.0，接替落盘投影）
 //   闸门 = 对模型的查询（七闸，全部在 nav_commit 内）
 //
-// 工具面 6：nav_graph / nav_commit / nav_decide / nav_node / nav_render / nav_set
+// 工具面 5：nav_graph / nav_commit / nav_decide / nav_node / nav_set
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
@@ -18,20 +18,20 @@ import { resolve } from 'node:path'
 import {
   paths, normSlashes, key
 } from '../core/paths.js'
-import { loadModel, normalizeAnchor, pressureFor, coverage, REPEAT_PATCH_THRESHOLD } from '../core/model.js'
+import { loadModel, normalizeAnchor, pressureFor, coverage, REPEAT_PATCH_THRESHOLD, foldOnly } from '../core/model.js'
 import { appendEvents, verifyLog, readEvents } from '../core/log.js'
 import { reconcile, commitIntent, archiveIntent, inflightView, materialize } from '../core/commit.js'
 import { locate, resolveScope, evidenceOf } from '../core/scope.js'
-import { renderAll, renderMapHtml, renderTreeText } from '../core/render.js'
+import { renderTreeText } from '../core/render.js'
 import { listLocks } from '../core/lock.js'
 import {
   splitList, parseKv, truncate, renderHealth, renderScopeTarget, renderGaps,
-  renderDocs, renderAdrs, renderMap, renderCommitResult, renderImpact
+  renderDocs, renderAdrs, renderMap, renderCommitResult, renderImpact, renderPresence
 } from '../core/format.js'
 export const name = '@dsh-external/project-nav'
-// `tools` 是唯一依赖：6 个工具全部经 ctx.tools.register 注册。
-// 沙箱/权限是宿主原生能力（dsh-sandbox-policy / dsh-permission-presets），本插件不设、不切、不探。
-export const inject = ['tools']
+// `tools` 是工具注册面；`systemPrompt` 是**在场层**（0.12.0）——治理不再只等被调用，
+// 而是每轮组装时把治理摘要注入 agent 上下文。两者都必须显式声明（Cordis 服务注入）。
+export const inject = ['tools', 'systemPrompt']
 
 export const Config = z.object({
   root: z.string().default('')
@@ -67,6 +67,69 @@ export function apply(ctx, config) {
   // 的三档预设 + UI 切换入口），本插件不再代宿主切换会话模式，也不再做可执行性探针。
   // 事故事实（v0.8.1 判据错导致永不绑 / v0.8.4 竞态把 fail-safe 变永久惰性）保留在
   // HANDOFF.md 与 docs/ 下的历史档，不再有活代码；依赖面从 ['tools','shell'] 收回 ['tools']。
+
+  // ================= 在场层（0.12.0）：治理不再只等被调用 =================
+  //
+  // 病根（README §8 · 0.11.0 自述）：七闸只在 nav_commit 内跑 ⇒ **不调用它 = 完全绕行无痕迹**，
+  // 治理根登记率仅 3%。根因不是闸门不够，而是治理只在被调用时存在。
+  //
+  // 落盘投影（PROJECT.md 标记区 / ARCH-MODEL.md / 地图）的唯一读者是人 ⇒ 定案「只服务 agent」
+  // 后它们失去理由。其 agent 形态的替代物就是下面的**注入面**：把治理摘要直接放进 agent 上下文。
+  //
+  // 三条硬约束（缺一即是回退）：
+  //  ① 走 foldOnly（纯事件流 5.1ms），**绝不**在组装期跑 buildModel（磁盘扫描 177ms，每轮白付）；
+  //  ② **零写盘**（不落 runtime、不建锁、不追加事件）；
+  //  ③ **不碰 0.11.0 已否决的观测层**：那里是"订阅并**记录活动事实**"（信息纯可派生、只能落 runtime
+  //     ⇒ 违反 I1/I3）。这里是"把**已可派生的**状态**注入上下文**"，不记录、不落盘。
+  //     **同一份信息，被消费 ≠ 被存储。**
+  const presenceText = () => {
+    try {
+      return renderPresence(foldOnly(root))
+    } catch {
+      // 治理绝不能拖垮用户的会话：注入失败即静默降级为"不注入"。
+      return ''
+    }
+  }
+  /** 该会话是否在被治理的 root 里工作（不污染无关项目）。 */
+  const governsAgent = (agent) => {
+    const cwd = agent?.session?.meta?.cwd
+    if (!cwd || !root) return true // 拿不到 cwd 时不拦：宁可注入，也不因宿主差异而静默失效
+    return normSlashes(String(cwd)).toLowerCase().startsWith(normSlashes(root).toLowerCase())
+  }
+
+  if (ctx.systemPrompt?.section) {
+    ctx.effect(() => ctx.systemPrompt.section({
+      name: 'project-nav:presence',
+      // 与 DEPLOYMENT_PERSONA_SUFFIX 同区：人设之后、工具说明之前，属"部署级常驻指导"。
+      order: 10200,
+      // ⚠ 必须是**函数**：每轮组装求值（静态串会变成 spawn 期快照，治理状态一改就过期）。
+      text: (c) => (c?.agent === undefined ? '' : (governsAgent(c.agent) ? presenceText() : ''))
+    }), 'project-nav: presence section')
+  } else if (ctx.logger?.warn) {
+    ctx.logger.warn('[project-nav] systemPrompt 服务不可用 —— 在场层未装配（治理退化为仅被调用时存在）')
+  }
+
+  // ---- 在场层②：写入之后，把治理状态**附在工具结果旁**（不是改结果）----
+  // 只对写入类工具触发：读操作不打扰。
+  // ⚠ 只注入、不改写：返回 { kind:'accept', additionalContexts }，原 result 一字不动。
+  // ⚠ 失败静默：治理挂掉绝不能拖垮用户的工具调用。
+  const WRITE_TOOLS = new Set(['edit', 'write', 'pwsh', 'bash', 'nav_commit', 'nav_node', 'nav_decide'])
+  if (typeof ctx.on === 'function') {
+    ctx.on('tools/post-execute', async (exec, result, next) => {
+      let decision
+      try { decision = await next() } catch (e) { throw e }
+      try {
+        if (decision?.kind === 'accept' && WRITE_TOOLS.has(String(exec?.name)) && governsAgent(exec?.agent)) {
+          const t = presenceText()
+          if (t) {
+            const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
+            return { ...decision, additionalContexts: [...(decision.additionalContexts || []), createUserMessage({ content: [{ type: 'text', text: t }] })] }
+          }
+        }
+      } catch { /* 注入失败即放行原结果 —— 治理不能成为故障点 */ }
+      return decision
+    })
+  }
 
   // ---- 1. nav_graph — 读：模型查询 ----
   ctx.effect(() => ctx.tools.register(defineTool({
@@ -254,7 +317,7 @@ export function apply(ctx, config) {
           }
           const casc = hit.layer === 'feature' ? `文件映射 ${(hit.files || []).length} 条随之消失${hit.module ? `，从模块 ${hit.module} 摘除` : ''}`
             : hit.layer === 'module' ? `项目归属 ${hit.project || '(none)'} 摘除；其 ${(hit.features || []).length} 个功能存活（失去模块）`
-              : `其模块被摘除而非删除（变为 unattached，会在地图上暴露出来）`
+              : `其模块被摘除而非删除（变为 unattached，会在导航树里暴露出来）`
           return [`✓ 已退役 ${hit.layer} ${hit.name}（事件 seq ${w.seq}，状态已核验 = retired）`, `  级联: ${casc}`, `  现在 active 节点 ${[...after.nodes.values()].filter((n) => n.status === 'active').length} 个。`, '  退役语义保留是 F3/F8 的要求：能删才不会永远留假 STALE。'].join('\n')
         }
 
@@ -311,35 +374,13 @@ export function apply(ctx, config) {
         }
         if (layer === 'module' && now.project) L.push(`  项目: ${now.project}`)
         L.push('')
-        L.push('下一步: nav_render 重生成投影（PROJECT.md 标记区 / ARCH-MODEL.md / 地图）。')
+        L.push('下一步: 改完文件后下一次任意工具调用会按证据自动收口；治理摘要已常驻你的上下文。')
         return L.join('\n')
       } catch (e) { return err(e) }
     }
   })), 'project-nav: nav_node')
 
-  // ---- 5. nav_render — 写：重生成全部投影（I2） ----
-  ctx.effect(() => ctx.tools.register(defineTool({
-    name: 'nav_render',
-    description: 'Regenerate every projection from the model: PROJECT.md marker section (outside the markers is never touched), .internal/ARCH-MODEL.md (the human-readable model snapshot), the HTML map. Deterministic: an unchanged model re-renders to identical bytes.',
-    parameters: {
-      path: { type: 'string', description: 'Optional: PROJECT.md path override (default PROJECT.md at the governed root)' }
-    },
-    output: OUTPUT,
-    async execute(args) {
-      try {
-        const model = await refresh()
-        const res = renderAll(root, model)
-        const L = ['✓ 投影已重生成（全部来自模型，零手写）:']
-        L.push(`  PROJECT.md 标记区: ${res.project.markerMissing ? '⛔ 找不到 nav:auto 标记（未写入，Once-Only：绝不猜位置）' : res.project.changed ? `已更新${res.project.created ? '（新建）' : ''}` : '无变化'}`)
-        L.push(`  模型文档: ${res.modelDoc.path}（${res.modelDoc.bytes} 字节 · ${res.modelDoc.changed ? '已更新' : '无变化'}）`)
-        L.push(`  地图: ${res.map.path}（${res.map.bytes} 字节 · ${res.map.changed ? '已更新' : '无变化'}）`)
-        if (res.project.markerMissing) L.push('  → 目标 md 里加上 <!-- nav:auto:start --> / <!-- nav:auto:end --> 两个标记后重跑。')
-        return L.join('\n')
-      } catch (e) { return err(e) }
-    }
-  })), 'project-nav: nav_render')
-
-  // ---- 6. nav_set — 写：根元数据 / 主线向量 ----
+  // ---- 5. nav_set — 写：根元数据 / 主线向量 ----
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'nav_set',
     description: 'Set the mainline vector (doing / next / notDoing / exitCondition). Omitted fields keep their current value. The vector is an event, so it is versioned with the repository and read fresh by every tool call.',
@@ -370,7 +411,7 @@ export function apply(ctx, config) {
           `  notDoing: ${vector.notDoing || '(unset)'}`,
           `  exitCondition: ${vector.exitCondition || '(unset)'}`,
           changed.length ? '' : '  (无字段变化)',
-          changed.length ? '下一步: nav_render 把它写进 PROJECT.md 自动区。' : ''
+          changed.length ? '下一步: 向量已变更，下一次任意工具调用即按新向量治理（无需额外的渲染动作）。' : ''
         ].filter(Boolean).join('\n')
       } catch (e) { return err(e) }
     }
@@ -396,7 +437,38 @@ function healthSnapshot(model, rootPath, rec) {
       notDoing: model.vector?.notDoing || '', exitCondition: model.vector?.exitCondition || ''
     },
     coverage: coverage(model),
+    // ---- 全量节点清单（0.12.0）----
+    // 接替被删除的 ARCH-MODEL.md 节点表：那是落盘投影时代**唯一**的"一次拿全节点"出口，
+    // 删掉它而不补这里 ⇒ agent 只能逐个 nav_graph <target> 猜（可观测性倒退）。
+    // 刻意不 slice：少展示必须可见且可取回（ARCHITECTURE §2②）；退役节点**在列**（标灰不消失）。
+    nodes: [...model.nodes.values()].map((n) => ({
+      id: n.id, layer: n.layer, name: n.name, status: n.status,
+      project: n.project || null, module: n.module || null,
+      files: n.files || [], when: n.when || '', updatedAt: n.updatedAt || null
+    })),
     openCommits: model.openCommits.map((c) => ({ id: c.id, task: c.task, anchor: c.anchor, files: c.files || [], at: c.at, plan: c.plan || '' })),
+    // ---- 改动流水（0.12.0）----
+    // 接替被删除的 renderModelDoc 收口表 —— 那是 **PN-S1/E3「唯一持久出口」**（README §8）。
+    // ⚠ 折叠语义（**实测**，core/model.js:121-141）：收口时**原 open 笔被就地标 closed 并挂 `closes` = 自己的 seq**；
+    // 而收口回执是**另一条 commit**（phase=closed，`closes` 为 undefined，`plan` 结构性为空串）。
+    // 故：
+    //   · `closes === seq` ⇒ 载有原始意图的笔（`plan` 就留在它身上，折叠不会覆盖）
+    //   · `closes === undefined && phase==='closed'` ⇒ 回执，或 0.9 迁移来的历史已完成记录
+    // ⚠ 不要用"回查 `closes` 指向的原始笔"来取 plan：`closes` 只写在**原笔自己**身上，
+    // 那个"回查"恒等于取自己（0.12.0 实测：治理根 21 条带 closes 的记录里，`closes !== seq` 者 **0 条**）。
+    // 旧版 renderModelDoc 的同名回查同属 no-op —— 值对、注释错。这里直取 `c.plan` 并把真相写明白。
+    //
+    // 本视图**不丢条目**（I1：真相可复算）；回执也保留，仅带 `receipt` 标记供消费方过滤。
+    commits: model.commits.map((c) => ({
+      id: `ACT-${c.seq}`, seq: c.seq, at: c.at, phase: c.phase || 'open',
+      closes: c.closes ?? null,
+      receipt: (c.phase === 'closed') && c.closes === undefined,
+      closedIntent: c.closes !== undefined && c.closes === c.seq,
+      anchor: c.anchor, task: c.task,
+      plan: c.plan || '',
+      files: c.files || [], scope: c.scope || null, arch: c.arch ?? null,
+      outcome: c.outcome || null
+    })),
     stale: model.stale,
     unregistered: model.unregistered,
     decisions: model.decisions.map((d) => ({ id: d.id, anchor: d.anchor, at: d.at, reason: d.reason, decision: d.decision, impact: d.impact || '' })),

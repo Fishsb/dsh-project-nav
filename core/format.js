@@ -384,6 +384,70 @@ export function renderMap(model, { target = '' } = {}) {
   return renderTreeText(model, { target })
 }
 
+/**
+ * 在场层（0.12.0）：**注入 agent 上下文的治理摘要**，零落盘。
+ *
+ * 这是被删除的落盘投影（PROJECT.md 标记区 / ARCH-MODEL.md / 地图）的 **agent 形态替代物**：
+ * 那些文件的唯一读者是人，而 agent 不需要文件 —— 它需要**上下文里一直有治理**。
+ *
+ * ⚠ 三条硬约束（照抄可施工）：
+ *  ① **只吃 `foldOnly` 的模型**（纯事件流，5.1ms），绝不 `buildModel`/`loadModel`
+ *     —— 本函数在**每轮组装**时被调用，磁盘扫描（177ms）会拖慢每一次请求。
+ *  ② **零写盘**：不落 runtime、不建锁、不追加事件（I3：删 runtime 零损失）。
+ *  ③ **不知道的不说**：磁盘实况（STALE / 缺口 / 依赖图）不在廉价模型里，
+ *     故这里**不报**它们 —— 报一个没算过的数就是假绿。
+ *
+ * 输出刻意短：常驻注入的内容按**每轮**计费，长文会挤掉真正的工作上下文。
+ * 省略一律带 `共N` 交代（ARCHITECTURE §2②：少展示必须可见且可取回）。
+ */
+export function renderPresence(m) {
+  if (!m) return ''
+  const L = []
+  const doing = m.vector?.doing || '(unset)'
+  const next = m.vector?.next || '(unset)'
+  L.push('【project-nav · 治理在场】')
+  L.push(`  主线: doing=${doing} | next=${next}`)
+  if (m.vector?.notDoing) L.push(`  反目标(notDoing): ${m.vector.notDoing}`)
+  if (m.vector?.exitCondition) L.push(`  完成判据: ${m.vector.exitCondition}`)
+
+  const opens = m.openCommits || []
+  if (opens.length) {
+    L.push(`  在途改动 (${opens.length}) —— 改前先看是否与你重叠:`)
+    for (const c of opens.slice(0, 5)) {
+      L.push(`    · ${c.id} ${truncate(c.task, 60)} | anchor=${c.anchor}`)
+    }
+    if (opens.length > 5) L.push(`    …(+${opens.length - 5}，全量 = nav_graph mode=health)`)
+  } else {
+    L.push('  在途改动 (0)')
+  }
+
+  // 计数闸压力：同一锚点反复补丁 = 该出架构决策了（第一性原理触发器）。
+  const pressure = [...(m.patchPressure?.values() || [])].filter((p) => {
+    if (p.sinceDecisionCount < 2) return false
+    const n = m.nodes.get(p.anchor)
+    return !(n && n.status === 'retired')
+  })
+  if (pressure.length) {
+    L.push('  ⚠ 计数闸压力（同锚点反复补丁 ⇒ 该走 nav_decide 了）:')
+    // 截断必须可在别处取回（ARCHITECTURE §2②；仓内 architecture.test.mjs 的"无静默截断"扫描器会扫这里）。
+    const shownP = pressure.slice(0, 3)
+    for (const p of shownP) L.push(`    · ${p.anchor} ${p.sinceDecisionCount}/${REPEAT_PATCH_THRESHOLD}`)
+    if (pressure.length > shownP.length) {
+      L.push(`    …(+${pressure.length - shownP.length}，共 ${pressure.length} 条；全量 = nav_graph mode=health)`)
+    }
+  }
+
+  if (m.decisions?.length) {
+    const last = m.decisions[m.decisions.length - 1]
+    L.push(`  架构决策: ${m.decisions.length} 条（最近 ${last.id} @ ${last.anchor}）`)
+  }
+  // 模型自身的问题不吞（与 renderHealth 同一纪律）。
+  if (m.log?.length) L.push(`  ⛔ 事件流异常 ${m.log.length} 处（全量 = nav_graph mode=health）`)
+
+  L.push('  → 动手前: nav_commit(task, anchor, arch=) 登记；收口无需第二次调用（按证据自动收口）。')
+  return L.join('\n')
+}
+
 /** 一笔 nav_commit 的结果文本（登记 / 被拒 / 自动收口）。 */
 export function renderCommitResult(res, model) {
   const L = []

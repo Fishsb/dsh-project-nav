@@ -1,11 +1,13 @@
 // bootstrap.mjs — 让 project-nav 治理它自己（一次性运行）
 //
-// 为什么要有这一步：I2 说"一切产出都是渲染"。如果本仓自己都没有 PROJECT.md 自动区、
-// 没有 ARCH-MODEL.md，那这套架构就只是对别人生效的口号。
+// 为什么要有这一步：治理要先能治理自己，否则这套架构就只是对别人生效的口号。
 //
-// 这里做两件事：
-//   ① 把本仓的架构（模块/功能/落点）折叠成事件 —— 从此它就是可引用、可校验的模型对象
-//   ② 用 nav_render 的同一批渲染函数产出 PROJECT.md 标记区 / ARCH-MODEL.md / 地图
+// 这里做一件事：
+//   把本仓的架构（模块/功能/落点）折叠成事件 —— 从此它就是可引用、可校验的模型对象
+//
+// ⚠ 0.12.0 换代（ADR-268）：原先的 ②「用 nav_render 的同一批渲染函数产出 PROJECT.md 标记区 /
+// ARCH-MODEL.md / 地图」**已删除** —— 落盘投影整体退场（唯一读者是人，而定案是「只服务 agent」）。
+// 现在不需要任何"产出文件"的动作：治理经 nav_graph 按需直出 + 在场层每轮注入。
 //
 // **一次性**：事件流是 append-only 的，重复引导只会造出重复节点与重复决策 ——
 // 所以本脚本发现事件流非空就拒绝运行。要重来请先删掉 .internal/events.jsonl 与
@@ -13,11 +15,10 @@
 //
 // 用法：node bootstrap.mjs
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { appendEvents, readEvents, verifyLog } from './core/log.js'
 import { buildModel, loadModel } from './core/model.js'
-import { renderAll } from './core/render.js'
 
 const ROOT = process.cwd()
 
@@ -36,8 +37,8 @@ const MODULES = [
 const FEATURES = [
   {
     id: 'PN-F01', name: '平面契约', module: 'core-plane', files: ['core/paths.js'],
-    userView: '只有三层数据面（事件流/运行时/投影），任何新状态都必须先回答"它是事件还是渲染"',
-    systemView: 'PLANE 常量 + 路径解析 + 规范化；不存在第四层的落点'
+    userView: '只有两层数据面（事件流/运行时），任何新状态都必须先回答"它是事件还是渲染"',
+    systemView: 'PLANE 常量 + 路径解析 + 规范化；不存在第三层的落点（0.12.0：落盘投影面已退场）'
   },
   {
     id: 'PN-F02', name: '事件流', module: 'core-log', files: ['core/log.js', 'core/lock.js'],
@@ -55,26 +56,26 @@ const FEATURES = [
     systemView: '七个纯函数返回 {pass,severity,detail,hint}；影响面闸用文件精度判「跨节点牵动」；runGates 汇总 blocked/warnings'
   },
   {
-    id: 'PN-F05', name: '渲染投影', module: 'core-render', files: ['core/render.js', 'core/format.js'],
-    userView: '地图 / PROJECT.md 标记区 / ARCH-MODEL.md 全部由模型生成，手改即被覆盖',
-    systemView: 'renderAll + writeProjectSection（标记外零触碰）；架构档已按 §2 降级为按需投影，不再有指纹契约'
+    id: 'PN-F05', name: '按需渲染与在场层', module: 'core-render', files: ['core/render.js', 'core/format.js'],
+    userView: '治理不再落盘：nav_graph 按需直出 + 每轮把治理摘要注入 agent 上下文',
+    systemView: 'renderTreeText（纯计算零写盘）+ renderPresence（在场层文本，吃 foldOnly 廉价模型）；0.12.0 删去三个落盘投影'
   },
   {
     id: 'PN-F08', name: '装配面与工具', module: 'host-face', files: ['host/index.js'],
-    userView: '6 个工具：nav_graph / nav_commit / nav_decide / nav_node / nav_render / nav_set',
-    systemView: '唯一 host 面：工具注册（ctx.effect）+ 工作区边界告警与绑定 + 启动自检'
+    userView: '5 个工具：nav_graph / nav_commit / nav_decide / nav_node / nav_set',
+    systemView: '唯一 host 面：工具注册（ctx.effect）+ systemPrompt 在场层注入 + tools/post-execute 写入后在场 + 启动自检'
   },
   {
     // 落点用 glob：新文件自动纳入，不必每次手工登记（否则治理本身又变成堆叠）
     id: 'PN-F09', name: '测试与契约面', module: 'host-face',
     files: [
-      'test/*', 'ARCHITECTURE.md', 'AGENTS.md', 'README.md', 'README.en.md', 'PROJECT.md', 'HANDOFF.md',
+      'test/*', 'ARCHITECTURE.md', 'AGENTS.md', 'README.md', 'README.en.md',
       'bootstrap.mjs', 'LICENSE', 'package.json', '.gitignore',
       'host/cordis.patch.yml', 'docs/*', 'docs/**/*',
-      'install-0.9.0.ps1', 'verify-0.9.0-install.ps1'
+      'install.ps1', 'verify-install.ps1', 'verify-runtime.mjs'
     ],
-    userView: '不变量有可机检的用例；架构契约与项目主档对人类可读',
-    systemView: '四个套件（core/architecture/concurrency/host）+ ARCHITECTURE.md 契约 + PROJECT.md 渲染投影'
+    userView: '不变量有可机检的用例；架构契约对人类可读（0.12.0：不再有渲染投影给人读）',
+    systemView: '四个套件（core/architecture/concurrency/host）+ ARCHITECTURE.md 契约；投影面已退场，产出改为在场注入 + 按需直出'
   }
 ]
 
@@ -142,27 +143,8 @@ async function main() {
   const model = loadModel(ROOT, { useCache: false })
   console.log(`✓ 模型：${model.nodes.size} 节点 / ${model.decisions.length} 决策 / ${model.openCommits.length} 在途`)
 
-  // PROJECT.md：不存在则创建骨架（标记内是渲染物，标记外留给人写）
-  const docPath = join(ROOT, 'PROJECT.md')
-  if (!existsSync(docPath)) {
-    writeFileSync(docPath, [
-      '# project-nav — 项目主档',
-      '',
-      '> 标记区内由 `nav_render` 从事件流生成，**永不手写**；标记外任意书写。',
-      '',
-      '## 这个仓是什么',
-      '',
-      'DSH 的项目治理插件。核心理念与架构契约见 [`ARCHITECTURE.md`](./ARCHITECTURE.md)。',
-      '',
-      '<!-- nav:auto:start -->',
-      '<!-- nav:auto:end -->',
-      ''
-    ].join('\n'), 'utf-8')
-    console.log('✓ 已创建 PROJECT.md（含标记骨架）')
-  }
-
-  const res = renderAll(ROOT, model)
-  console.log(`✓ 投影已重生成：PROJECT.md=${res.project.changed ? 'updated' : 'unchanged'} · ${res.modelDoc.path} · ${res.map.path}`)
+  // ⚠ 0.12.0：PROJECT.md 骨架创建与 renderAll 投影重生成**已删除**（落盘投影退场，ADR-268）。
+  // 本脚本现在只做"把架构折叠成事件"这一件事 —— 产出面已无文件可写。
 
   const after = buildModel(ROOT)
   console.log(`✓ 复算校验：节点 ${after.nodes.size} · 缺口文件 ${after.unregistered.length} · STALE ${after.stale.length}`)

@@ -11,11 +11,15 @@ import { fileURLToPath } from 'node:url'
 const here = dirname(fileURLToPath(import.meta.url))
 const HOST = join(here, '..', 'host', 'index.js')
 
-export const NEW_TOOL_NAMES = ['nav_graph', 'nav_commit', 'nav_decide', 'nav_node', 'nav_render', 'nav_set']
+// 0.12.0 换代：工具面 6 → 5（nav_render 随落盘投影一起退场，ADR-268）。
+export const NEW_TOOL_NAMES = ['nav_graph', 'nav_commit', 'nav_decide', 'nav_node', 'nav_set']
 export const OLD_TOOL_NAMES = [
   'nav_query', 'nav_plan', 'nav_mark', 'nav_update', 'nav_docs',
   'nav_map', 'nav_sync_docs', 'nav_status', 'nav_set_vector', 'nav_adr', 'nav_arch',
-  'nav_add_feature', 'nav_add_module', 'nav_add_doc', 'nav_scan'
+  'nav_add_feature', 'nav_add_module', 'nav_add_doc', 'nav_scan',
+  // 0.12.0 换代退役：nav_render 的唯一操作是"重生成落盘投影"，落盘面退场后它无事可做（ADR-268）。
+  // 归入历史名：README/契约里提到它是**历史叙述**，不是"示例照抄即错"。
+  'nav_render'
 ]
 
 /** 扫描 host 源码里真正注册的工具（识别 defineTool({ name: 'nav_x'）。 */

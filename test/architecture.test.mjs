@@ -12,11 +12,11 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { tmpRoot, put, touch, seed } from './helper.mjs'
 import { appendEvents, readEvents, verifyLog, rewriteVerified } from '../core/log.js'
-import { loadModel, buildModel, coverage, pressureFor, filePressure, normalizeAnchor, governanceSovereignty, governanceVitality } from '../core/model.js'
+import { loadModel, buildModel, foldOnly, coverage, pressureFor, filePressure, normalizeAnchor, governanceSovereignty, governanceVitality } from '../core/model.js'
 import { commitIntent, reconcile, archiveIntent } from '../core/commit.js'
 import { paths, PLANE } from '../core/paths.js'
-import { renderAll, writeProjectSection, renderModelDoc, renderMapHtml, MARK_START, MARK_END } from '../core/render.js'
-import { renderHealth } from '../core/format.js'
+import { renderTreeText } from '../core/render.js'
+import { renderHealth, renderPresence } from '../core/format.js'
 import { scanTools, effectMountedTools, OLD_TOOL_NAMES, NEW_TOOL_NAMES } from './tools-list.mjs'
 
 // ============ I1 单源 ============
@@ -72,70 +72,83 @@ test('I1 事件流自身带完整性判据（seq 连续），断裂必须报', a
   assert.match(v.problems.join(' '), /seq gap/)
 })
 
-// ============ I2 渲染 ============
+// ============ I2 渲染（0.12.0 换代后：按需渲染 + 在场注入，零落盘）============
+//
+// ⚠ 换代说明（ADR-268）：原先这三条 I2 用例测的是**落盘投影**
+//   （PROJECT.md 标记区重渲染 / 手改渲染物被覆盖 / 找不到标记拒绝写入）。
+// 定案「只服务 agent」后落盘投影整体退场 ⇒ 那三条所测的**能力已不存在**，故删除。
+// 但 I2 这条**不变式**没有废 —— 它只是换了载体：一切机器可读产出仍是**对模型的纯函数派生**。
+// 下面的用例就是它的新靶：**零落盘**（更强的判据）与**按需/注入可得**。
 
-test('I2 PROJECT.md 标记区重渲染；标记外的手写叙事零触碰', async (t) => {
-  const root = tmpRoot(t)
-  await seed(root)
-  const doc = join(root, 'PROJECT.md')
-  writeFileSync(doc, [
-    '# 手写标题（必须保留）',
-    '',
-    '手写叙事段落，绝不能被工具改写。',
-    '',
-    MARK_START,
-    '',
-    MARK_END,
-    '',
-    '结尾手写补充。'
-  ].join('\n'), 'utf-8')
-  const m = buildModel(root)
-  const r = writeProjectSection(root, m)
-  assert.equal(r.changed, true)
-  const text = readFileSync(doc, 'utf-8')
-  assert.ok(text.startsWith('# 手写标题（必须保留）'))
-  assert.ok(text.includes('手写叙事段落，绝不能被工具改写。'))
-  assert.ok(text.includes('结尾手写补充。'))
-  assert.ok(text.includes('core'), '自动区应含模块名')
-  assert.ok(text.includes('nav:auto:start'))
-})
-
-test('I2 手改渲染物 ⇒ 下一次渲染覆盖它（这是 I2 的验法）', async (t) => {
+test('I2 按需渲染可得：树文本由模型纯函数产出，且零落盘', async (t) => {
   const root = tmpRoot(t)
   await seed(root)
   const m = buildModel(root)
-  renderAll(root, m, { now: Date.parse(m.builtAt) })
-  const modelDoc = join(root, PLANE.MODEL_DOC)
-  const original = readFileSync(modelDoc, 'utf-8')
-  writeFileSync(modelDoc, '# 我手改的模型文档\n', 'utf-8')
-  renderAll(root, m)
-  const after = readFileSync(modelDoc, 'utf-8')
-  assert.ok(after.startsWith(original.split('\n').slice(0, 3).join('\n')), '渲染物必须回到由模型生成的形态')
-  assert.ok(!after.includes('我手改的'), '手写内容不得残留')
-  assert.ok(after.includes('## 主线向量'), '渲染必须完整重建，而不是打补丁')
+  const text = renderTreeText(m)
+  assert.ok(text.includes('Mainline:'), '树文本必须直出主线')
+  assert.ok(text.includes('core'), '树文本必须含模块名')
+
+  // 零落盘：渲染本身不写任何文件 —— 这是换代后的**新不变量**（旧版靠"写盘再比对"，现在根本不该写）
+  const before = readdirSync(root).sort()
+  renderTreeText(m)
+  renderPresence(m)
+  assert.deepEqual(readdirSync(root).sort(), before, '按需渲染不得在治理根留下任何文件')
 })
 
-test('I2 找不到标记时拒绝写入（Once-Only：绝不猜位置）', async (t) => {
+test('I2 在场层：治理摘要由纯事件流派生，且**不落盘、不扫盘**', async (t) => {
   const root = tmpRoot(t)
   await seed(root)
-  writeFileSync(join(root, 'PROJECT.md'), '# 没有标记的文件\n', 'utf-8')
-  const r = writeProjectSection(root, buildModel(root))
-  assert.equal(r.markerMissing, true)
-  assert.equal(r.changed, false)
-  assert.equal(readFileSync(join(root, 'PROJECT.md'), 'utf-8'), '# 没有标记的文件\n', '拒绝写入必须真的没写')
+  const before = existsSync(join(root, '.internal', 'runtime'))
+  const t0 = Date.now()
+  const folded = foldOnly(root)
+  const text = renderPresence(folded)
+  const ms = Date.now() - t0
+
+  assert.ok(text.includes('治理在场'), '在场摘要必须有可识别的抬头')
+  assert.ok(text.includes('doing='), '在场摘要必须带主线（agent 需要知道现在在做什么）')
+  // 廉价路径：纯事件流折叠不应建 runtime（buildModel/loadModel 才会落）
+  assert.equal(existsSync(join(root, '.internal', 'runtime')), before,
+    'foldOnly/renderPresence 不得创建 runtime（I3：删 runtime 零损失）')
+  assert.ok(ms < 200, `在场摘要必须廉价（实测 ${ms}ms；不得走磁盘扫描的 buildModel）`)
 })
 
-test('I2 投影全部可生成：地图 / 模型文档 / PROJECT.md 自动区', async (t) => {
+test('I2 在场层不知道的不说：磁盘实况（STALE/缺口）不在廉价模型里 ⇒ 不得出现在摘要里', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  // 造一个 STALE：登记一个磁盘上不存在的落点
+  await appendEvents(root, [
+    { kind: 'node', op: 'upsert', layer: 'feature', id: 'PN-F99', fields: { name: 'PN-F99', files: ['src/ghost.js'] } }
+  ])
+  const text = renderPresence(foldOnly(root))
+  // foldOnly 不扫盘 ⇒ 它**证明不了** STALE；报一个没算过的数就是假绿。
+  assert.ok(!/STALE/.test(text), '在场摘要不得报磁盘实况（它没算过）')
+  assert.ok(!/未登记/.test(text), '在场摘要不得报未登记缺口（它没算过）')
+})
+
+test('I2 投影不再物化：落盘出口确实不在位（防"顺手加回来"）', async (t) => {
   const root = tmpRoot(t)
   await seed(root)
   const m = buildModel(root)
-  const res = renderAll(root, m)
-  assert.ok(existsSync(join(root, PLANE.MODEL_DOC)))
-  assert.ok(existsSync(join(root, res.map.path)))
-  const html = readFileSync(join(root, res.map.path), 'utf-8')
-  assert.ok(html.startsWith('<!doctype html>'))
-  assert.ok(html.includes('永不手改'), '渲染物必须自带"别手改"的声明')
-  assert.ok(renderModelDoc(m).includes('真相是'))
+  // 落盘面删除后，这些出口不应再存在 —— 存在即是回退。
+  const render = await import('../core/render.js')
+  for (const gone of ['renderAll', 'renderModelDoc', 'renderMapHtml', 'writeProjectSection', 'MARK_START']) {
+    assert.equal(render[gone], undefined, `${gone} 应随落盘投影一并退场（ADR-268）`)
+  }
+  assert.equal(typeof render.renderTreeText, 'function', 'renderTreeText 是 nav_graph mode=map 的实现，必须留下')
+})
+
+test('I2 零写盘是结构性的：core/render.js 不得 import 任何写盘面（源码级守卫）', async (t) => {
+  // 为什么扫源码而不只测行为：**零写盘**是这次换代的核心不变量，
+  // 而"某次调用没写盘"只是采样；import 面一旦沾上 fs 写入，随时可能被后人加回来。
+  // 判据取**依赖面**（结构可断言），与 ARCHITECTURE §2「结构可断言，度量只能参考」同根。
+  const here = dirname(fileURLToPath(import.meta.url))
+  const src = readFileSync(join(here, '..', 'core', 'render.js'), 'utf-8')
+  // 去掉注释再判（否则本文件自己的说明文字会误伤 —— 实测踩过）
+  const code = src.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
+  const banned = [/(^|[^.\w])writeFileSync\s*\(/, /rewriteVerified/, /from\s+'\.\/log\.js'/, /from\s+'node:fs'/]
+  for (const re of banned) {
+    assert.ok(!re.test(code), `core/render.js 不得出现写盘面（命中 ${re}）—— 治理面必须零落盘`)
+  }
 })
 
 test('I3 删掉整个 runtime/ → 治理零损失（查询结果逐字节一致）', async (t) => {
@@ -226,10 +239,10 @@ test('A1 并发收口多笔意图：每笔恰好收口一次（跨会话 + 跨�
 
 // ============ A4 / A5 / A6 ============
 
-test('A6 工具面 = 6 个工具，且一个不少', () => {
+test('A6 工具面 = 5 个工具，且一个不少（0.12.0：nav_render 随落盘投影退场）', () => {
   const tools = scanTools()
   assert.deepEqual(tools.names.slice().sort(), NEW_TOOL_NAMES.slice().sort(), `实际注册: ${tools.names.join(', ')}`)
-  assert.equal(tools.names.length, 6)
+  assert.equal(tools.names.length, 5)
 })
 
 test('A6 旧工具名不再出现在工具注册里（描述里提及历史是允许的，注册不行）', () => {
@@ -242,7 +255,7 @@ test('A6 旧工具名不再出现在工具注册里（描述里提及历史是�
 
 test('A6 每个工具都注册在 ctx.effect 内（否则卸载卸不干净）', () => {
   const { total, mounted } = effectMountedTools()
-  assert.equal(total, 6, `工具注册点应为 6，实际 ${total}`)
+  assert.equal(total, 5, `工具注册点应为 5，实际 ${total}`)
   assert.equal(mounted, total, `挂在 ctx.effect 内的工具 ${mounted}/${total} —— 有工具未挂 effect，卸载会留下残留监听/工具`)
 })
 
@@ -323,9 +336,13 @@ test('A4 七闸在 host 的写入路径上是强制的（闸门不在流程里�
 
 // ============ 平面契约 ============
 
-test('平面契约：长期资产只有一个事件流文件（数据面 7 → 3）', async (t) => {
+test('平面契约：两层数据面（0.12.0 换代）；长期资产只有事件流一个文件', async (t) => {
   const root = tmpRoot(t)
   assert.equal(PLANE.EVENTS, '.internal/events.jsonl')
+  assert.equal(PLANE.RUNTIME, '.internal/runtime')
+  // 换代判据：落盘投影面整体退场 ⇒ 它的两个路径常量必须不存在（留着就是留一份永不再写的承诺）
+  assert.equal('PROJECT_DOC' in PLANE, false, 'PROJECT.md 随落盘投影退场（ADR-268）')
+  assert.equal('MODEL_DOC' in PLANE, false, 'ARCH-MODEL.md 随落盘投影退场（ADR-268）')
   await seed(root)
   const internal = readdirSync(join(root, '.internal'))
   const longLived = internal.filter((f) => f.endsWith('.json') || f.endsWith('.jsonl'))
@@ -385,7 +402,9 @@ test('文件职责压力：一个文件被 3 个节点登记为落点即报 over
 
 // ============ 信息可达性（省 token 只能靠压缩去冗余，禁止静默丢条目） ============
 
-test('投影索引完整性：每个节点与每条 ADR 都必须被点名（退役的标灰但不消失）', async (t) => {
+test('节点索引完整性：每个节点与每条 ADR 都必须被点名（退役的标灰但不消失）', async (t) => {
+  // ⚠ 换代换靶（ADR-268）：原靶是 renderModelDoc（落盘投影，已退场）。
+  // **判据内容一字不改** —— 只换载体：现在是 nav_graph mode=json 的 nodes[]/decisions[]。
   const root = tmpRoot(t)
   await seed(root)
   await appendEvents(root, [
@@ -394,31 +413,36 @@ test('投影索引完整性：每个节点与每条 ADR 都必须被点名（退
     { kind: 'decide', anchor: 'PN-F01', reason: 'r3', decision: 'd3' },
     { kind: 'node', op: 'retire', layer: 'feature', id: 'PN-F01' }
   ])
+  const { mountHost } = await import('./host-harness.mjs')
+  const h = await mountHost(root, { config: {} })
+  t.after(() => h.dispose())
+  const j = JSON.parse(await h.call('nav_graph', { mode: 'json' }))
+
   const m = buildModel(root)
-  const doc = renderModelDoc(m)
+  const ids = j.nodes.map((n) => n.id)
   for (const n of m.nodes.values()) {
-    assert.ok(doc.includes(n.id), `节点 ${n.id} 必须在投影里点名 —— 条目不得被无声省略（含退役）`)
+    assert.ok(ids.includes(n.id), `节点 ${n.id} 必须在索引里点名 —— 条目不得被无声省略（含退役）`)
   }
-  assert.ok(doc.includes('**(退役)**'), '退役节点必须标灰而不是消失')
+  assert.equal(ids.length, m.nodes.size, '节点索引必须完整（不得 slice）')
+  assert.ok(j.nodes.some((n) => n.status === 'retired'), '退役节点必须在列而不是消失')
   for (const d of m.decisions) {
-    assert.ok(doc.includes(d.id), `ADR ${d.id} 必须在投影索引里 —— 老决策不得整条消失`)
+    assert.ok(j.decisions.some((x) => x.id === d.id), `ADR ${d.id} 必须在索引里 —— 老决策不得整条消失`)
   }
-  assert.ok(/全部 3 条/.test(doc), 'ADR 索引必须自报总量')
+  assert.equal(j.decisions.length, m.decisions.length, 'ADR 索引必须全量（不得只给最近 N 条）')
 })
 
-test('确定性渲染：同一模型重渲染 ⇒ 逐字节相同 ⇒ 第二次写盘整个跳过（零 diff）', async (t) => {
+test('确定性渲染：同一模型 ⇒ 同一文本（纯函数，不得含时间戳等第二输入）', async (t) => {
+  // ⚠ 换代换靶：原靶 renderModelDoc/renderMapHtml（落盘投影）→ renderTreeText/renderPresence。
+  // 判据本质未变：**同模型必同输出**。旧版还要断言"第二次写盘被跳过"，现在零落盘 ⇒ 该断言无标的。
   const root = tmpRoot(t)
   await seed(root)
   await appendEvents(root, [{ kind: 'decide', anchor: 'PN-F01', reason: 'r', decision: 'd' }])
   const m = buildModel(root)
-  assert.equal(renderModelDoc(m), renderModelDoc(m), 'renderModelDoc 必须是纯函数（不得含时间戳等第二输入）')
-  assert.equal(renderMapHtml(m), renderMapHtml(m))
-  const first = renderAll(root, m)
-  assert.equal(first.modelDoc.changed, true)
-  const second = renderAll(root, m)
-  assert.equal(second.modelDoc.changed, false, '模型未变 ⇒ 投影无变化 ⇒ 不写盘（无事件就没有 diff）')
-  assert.equal(second.map.changed, false)
-  assert.ok(Number.isInteger(first.modelDoc.bytes) && first.modelDoc.bytes > 0, '投影体积必须自报（信号，不是裁决）')
+  assert.equal(renderTreeText(m), renderTreeText(m), 'renderTreeText 必须是纯函数')
+  assert.equal(renderPresence(m), renderPresence(m), 'renderPresence 必须是纯函数')
+  // 在场层走廉价折叠：同一事件流两次折叠必须给出同一摘要（否则每轮注入都会抖）
+  assert.equal(renderPresence(foldOnly(root)), renderPresence(foldOnly(root)),
+    'foldOnly + renderPresence 必须是确定性的（同事件流 ⇒ 同摘要）')
 })
 
 test('无静默列表截断：源码里每处定长 slice 丢弃条目的，同一输出必须带 +N/共N 交代或总量自报', async (t) => {

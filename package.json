@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/project-nav",
-  "version": "0.11.0",
-  "description": "DSH plugin: architecture-first project governance. v0.10.0 makes the model a TREE + GRAPH — the containment tree (who belongs to whom) now sits beside a dependency graph (who imports whom), and the graph is DERIVED from a static import scan: never registered, never hand-written, never stale. Seven gates (anchor / scope / mainline / impact / repeat-patch / decision / completion) are pure queries inside the single write entry point nav_commit, so there is no begin/done lifecycle and no orphan state: closure is decided by EVIDENCE (did the scope files change?), never by session identity — kill a session and its intent still closes (A1). Governance surface is minimal by construction: anything that would rot when code changes must be a PROJECTION, not a document — hand-written surface is two contracts (ARCHITECTURE.md / AGENTS.md), and .internal/arch/*.md dropped its sha1-fingerprint/freshness machinery to become an on-demand projection. ONE append-only event log (.internal/events.jsonl) remains the single source of truth; the runtime model (incl. the dependency graph) is disposable — delete runtime/ and governance loses nothing (I3). Tool face 6: nav_graph (read, incl. mode=impact) / nav_commit (intent) / nav_decide (ADR) / nav_node (nodes) / nav_render (projections) / nav_set (mainline vector).",
+  "version": "0.12.0",
+  "description": "DSH plugin: architecture-first project governance, FOR AGENTS ONLY. v0.12.0 makes governance PRESENT instead of merely callable: the three persisted projections (PROJECT.md marker section / .internal/ARCH-MODEL.md / HTML map) are gone — their only reader was a human — and governance moved into the agent's context via a presence layer (a systemPrompt section evaluated EVERY turn, plus tools/post-execute context attached after writes). Output is now zero-on-disk: nav_graph computes on demand and the presence layer injects a summary, both pure derivations of the model. The presence layer reads ONLY the event-log fold (measured 5.1ms vs 177ms for the full disk-scanning buildModel, 35x), never writes runtime/, and refuses to report disk facts it did not compute. Data plane 3 -> 2 layers, tool face 6 -> 5 (nav_render retired with the projections). The model is a TREE + GRAPH — the containment tree (who belongs to whom) sits beside a dependency graph (who imports whom) DERIVED from a static import scan: never registered, never hand-written, never stale. Seven gates (anchor / scope / mainline / impact / repeat-patch / decision / completion) are pure queries inside the single write entry point nav_commit, so there is no begin/done lifecycle and no orphan state: closure is decided by EVIDENCE (did the scope files change?), never by session identity — kill a session and its intent still closes (A1). ONE append-only event log (.internal/events.jsonl) is the single source of truth; the runtime model (incl. the dependency graph) is disposable — delete runtime/ and governance loses nothing (I3). Tool face 5: nav_graph (read, incl. mode=impact / mode=json) / nav_commit (intent) / nav_decide (ADR) / nav_node (nodes) / nav_set (mainline vector).",
   "type": "module",
   "main": "./host/index.js",
   "exports": {
@@ -24,7 +24,8 @@
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": ">=0.1.2-rc.1 <0.2.0"
+    "@deepseek-ai/dsh-tools": ">=0.1.2-rc.1 <0.2.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1 <0.2.0"
   },
   "keywords": [
     "dsh",

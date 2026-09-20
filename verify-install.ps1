@@ -1,4 +1,4 @@
-﻿# verify-install.ps1 — 独立校验安装面（**只读**，重启前就能跑）
+# verify-install.ps1 — 独立校验安装面（**只读**，重启前就能跑）
 #
 # ⚠ 版本无关：版本号与产物名都从本仓 package.json 派生 —— 不再"每版一份脚本"。
 #
@@ -123,6 +123,10 @@ $checks = @(
   @{ f='core\model.js';  has='export function impactOf';      msg='impactOf 在位（文件精度影响面）' },
   @{ f='core\gates.js';  has='export function impactGate';    msg='impactGate 在位（第七闸）' },
   @{ f='core\model.js';  has='export function filePressure';  msg='filePressure 在位（文件职责只读信号）' },
+  @{ f='core\model.js';  has='export function foldOnly';      msg='foldOnly 在位（在场层廉价路径：纯事件流折叠）' },
+  @{ f='core\format.js'; has='export function renderPresence'; msg='renderPresence 在位（在场层文本成形）' },
+  @{ f='core\render.js'; has='export function renderTreeText'; msg='renderTreeText 在位（按需渲染保留）' },
+  @{ f='host\index.js';  has='systemPrompt.section(';          msg='在场层已装配（治理每轮注入，不只等被调用）' },
   @{ f='core\model.js';  has='const direct = model.nodes.get'; msg='锚点归一支持完整节点 id（0.10.2 修）' }
 )
 foreach ($c in $checks) {
@@ -136,6 +140,18 @@ foreach ($gone in @('core\legacy.js')) {
 if (Test-Path (Join-Path $Dest 'core\render.js')) {
   if ((ReadUtf8 (Join-Path $Dest 'core\render.js')) -match 'stampArchDoc|listArchDocs|parseArchCache') { Bad 'core/render.js 仍带架构档指纹机制' }
   else { Ok '架构档指纹/新鲜度机制已移除（§2 降级为投影）' }
+  # 0.12.0 换代：落盘投影出口必须不在位（留存即回退 —— "先落盘再注入"等于把删掉的投影换个名字加回来）
+  $render = ReadUtf8 (Join-Path $Dest 'core\render.js')
+  $fallen = @('renderAll','renderModelDoc','renderMapHtml','writeProjectSection','MARK_START') | Where-Object { $render -match [regex]::Escape($_) }
+  if ($fallen.Count -eq 0) { Ok '落盘投影出口已退场（render.js 零写盘）' } else { Bad ('落盘投影出口仍在: ' + ($fallen -join ', ')) }
+}
+if (Test-Path (Join-Path $Dest 'host\index.js')) {
+  if ((ReadUtf8 (Join-Path $Dest 'host\index.js')) -match "name: 'nav_render'") { Bad 'host 仍注册 nav_render —— 工具面应为 5' }
+  else { Ok 'nav_render 已退场（工具面 = 5）' }
+}
+if (Test-Path (Join-Path $Dest 'core\paths.js')) {
+  if ((ReadUtf8 (Join-Path $Dest 'core\paths.js')) -match 'PROJECT_DOC|MODEL_DOC') { Bad 'core/paths.js 仍带落盘投影平面常量（数据面应为 2 层）' }
+  else { Ok '数据面 = 2 层（落盘投影平面已退场）' }
 }
 
 # ---------- ⑤ 运行时面（静态对得上 ≠ 能加载） ----------
