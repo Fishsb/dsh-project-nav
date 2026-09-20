@@ -137,6 +137,29 @@ test('I2 投影不再物化：落盘出口确实不在位（防"顺手加回来"
   assert.equal(typeof render.renderTreeText, 'function', 'renderTreeText 是 nav_graph mode=map 的实现，必须留下')
 })
 
+test('README 声称"已删除"的东西必须真的不在（防假删除记录）', async (t) => {
+  // 判例（2026-09-21 实测）：README 的 0.11.0 条目曾写「profile 里的死配置键
+  // autoBindWorkspace / boundaryWorkspaces 已删除」，而实测**两个键仍在** profile 的
+  // cordis.patch.yml 里、零消费者、且 schemastery 会保留未知键并传给插件
+  // ⇒ 那是一句**假记录**。判例同 0.10.3「死投影携带假事实」：效果是训练人相信错的东西。
+  //
+  // 判据取**可被机械核对的那些声称**：源码里不得再出现这两个键名（源码是仓内可判的），
+  // 且 README 若提到它们，必须同时出现"曾声称/假记录/实测"这类**对账措辞**，
+  // 不得再是干净的既成事实句。profile 不在仓内、无法在此断言 —— 那一条由人工/本仓流程保证。
+  const here = dirname(fileURLToPath(import.meta.url))
+  const pkgRoot = join(here, '..')
+  const readme = readFileSync(join(pkgRoot, 'README.md'), 'utf-8')
+  if (/autoBindWorkspace|boundaryWorkspaces/.test(readme)) {
+    assert.match(readme, /假记录|曾声称|实测那是/,
+      'README 提到这两个死键时必须是"对账"叙述（它们曾经没被删），不得再写成既成事实')
+  }
+  // 源码面：这两个键零消费者 ⇒ core/ 与 host/ 里都不得出现
+  for (const rel of ['core/paths.js', 'core/model.js', 'core/scope.js', 'host/index.js']) {
+    const src = readFileSync(join(pkgRoot, rel), 'utf-8').replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
+    assert.ok(!/autoBindWorkspace|boundaryWorkspaces/.test(src), `${rel} 不得再出现已移除的边界配置键`)
+  }
+})
+
 test('发布链脚本：含非 ASCII 的 .ps1 必须 UTF-8 with BOM（否则 PS 5.1 按 GBK 解码 → 语法错）', async (t) => {
   // 为什么值得机检：这是本仓**实测反复踩到**的边界（AGENTS.md §4），而它的后果是
   // "脚本看起来完好、真跑却满屏 Unexpected token" —— 静态看文件内容完全正常，

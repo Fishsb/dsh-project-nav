@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.12.1-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.12.2-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-%3E%3D0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -315,7 +315,12 @@ npm run test:node-runner  # 同一批用例走 node --test
   ⇒ **取消**，三层收敛为两层。这是减法：**能被丢掉的那份不可能是真相**（I1）。
   另修三处门面漂移：版本三处不一致（0.10.6/0.10.4/0.10.5）、README 写死测试项数（实测不符）、
   示例里的 5 个已删工具名（`nav_query` 等）——三条均已加**机检守卫**（含变异验证）。
-  profile 里的死配置键 `autoBindWorkspace` / `boundaryWorkspaces`（代码零消费）已删除。
+  ⚠ **配置面对账（2026-09-21 复核）**：本条目**曾声称** profile 里的
+  `autoBindWorkspace` / `boundaryWorkspaces` 两个死键「已删除」—— **实测那是假记录**：
+  两个键一直留在 profile 的 `cordis.patch.yml` 里（且 schemastery 会把未知键**保留并传给插件**，
+  并非静默丢弃）。现已真正清除（备份 `cordis.patch.yml.bak-deadkeys2-2026*`）。
+  **判例同 0.10.3**（"死投影携带假事实"）：文档声称一件事已做，而实测它没做 ——
+  效果与"训练人相信一份错的东西"相同。**声称"已删除"必须先实测它不在。**
 - `0.11.0 → 0.12.0`：**换代** —— 治理面收敛为「**只服务 agent**」。
   判因（实测）：落盘投影（`PROJECT.md` 标记区 / `.internal/ARCH-MODEL.md` / 地图 HTML）的
   **唯一读者是人**，而定案是治理面只服务 agent；全仓 grep 零机器读者；且 `ARCH-MODEL.md` 自述的
@@ -352,6 +357,15 @@ npm run test:node-runner  # 同一批用例走 node --test
   **架构面**：工具仍 5、闸门仍七、kind 仍 4、零新增文件、零新增状态；`inject` 仍 `['tools','systemPrompt']`。
   新增机检：host 内不得出现 `additionalContexts` / `createUserMessage` / `'tools/post-execute'`
   （源码级 + 行为级双重断言，含变异验证）。
+- `0.12.1 → 0.12.2`：**记录面对账（非换代、非功能）** —— 清掉 profile 里两个真正的死配置键
+  （`autoBindWorkspace` / `boundaryWorkspaces`，全装机零消费者、插件 `Config` 只消费 `root`），
+  并**修正 README 的一条假记录**：0.11.0 条目曾声称这两个键「已删除」，实测它们一直留在
+  profile 的 `cordis.patch.yml` 里（且 schemastery 会**保留未知键并传给插件**，并非静默丢弃）。
+  **判例同 0.10.3**（"死投影携带假事实"）：文档声称一件事已做而实测没做，效果是同一种 ——
+  **训练人相信一份错的东西**。新增机检：README 若提到这两个键，必须是对账叙述而非既成事实句，
+  且 `core/` + `host/` 源码不得再出现它们（含变异验证）。
+  **不进包**（`README.md` / `test/` 均不在 `files` 内）⇒ 除版本号外包内容与 0.12.1 相同，
+  但按 §2 口径**仍走一次版本号**（不设"太小不必升"的口子）。
 
 ## 9. 开发纪律
 
