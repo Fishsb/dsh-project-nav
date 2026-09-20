@@ -11,7 +11,8 @@
 import { createHash } from 'node:crypto'
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { join, dirname, extname } from 'node:path'
-import { normSlashes, key, relToRoot, insideRoot } from './paths.js'
+import { normSlashes, key, relToRoot, insideRoot, PLANE, p, RUNTIME_FILES } from './paths.js'
+import { rewriteVerified } from './log.js'
 
 const SKIP_DIRS = new Set(['.git', 'node_modules', '.internal', 'dist', 'build', '.next', 'coverage', '.dsh-vision-toolkit', '.npm-cache'])
 const GLOB_MAX = 400
@@ -373,4 +374,77 @@ export function scanImports(rootPath, files = null, { maxFiles = 4000, maxBytes 
   }
 
   return { edges, external, unresolved: [...new Set(unresolved)].sort(), skipped: skipped.sort(), scanned }
+}
+
+// ---- 依赖图扫描缓存（0.11.0 · 治理接管 P0-1） ----
+//
+// 为什么要有它：`scanImports` 是**纯磁盘派生**的重活（实测治理根 2730 个代码文件 ≈ 360ms），
+// 而每次工具调用都会重建模型 ⇒ 每次都白付这一笔。
+//
+// 为什么它可以缓存：它是 `事件流 + 磁盘实况` 里的**磁盘实况**那一半 —— 只要"磁盘没变"，
+// 结论必然不变。所以失效判据必须是**磁盘指纹**，而不是时间、不是次数。
+//
+// ⚠ 缓存**不是第二个真相**（I1）的保证在于：指纹覆盖**文件清单 + 每个被扫文件的 size + mtimeMs**。
+//   任何一项变了 ⇒ 整份缓存作废重扫。若指纹漏项（例如只看清单不看内容），
+//   改了 import 却命中旧缓存 ⇒ 依赖图变旧 ⇒ 影响面闸误判。**这是本函数唯一的风险点。**
+//
+// 落点：`runtime/`（可丢，I3）。删掉它只是重算，不是数据丢失。
+
+const SCAN_CACHE_FILE = RUNTIME_FILES.SCAN_CACHE
+
+/** 扫描缓存指纹：文件清单 + 每个被扫代码文件的 size/mtimeMs（确定性排序）。 */
+function scanFingerprint(rootPath, files) {
+  const code = files.filter(isCodeFile).map(normSlashes).sort()
+  const parts = []
+  for (const rel of code) {
+    try {
+      const s = statSync(join(rootPath, rel))
+      parts.push(`${rel}:${s.size}:${Math.round(s.mtimeMs)}`)
+    } catch {
+      parts.push(`${rel}:gone`)           // 读不到也要进指纹：它的出现/消失本身就是变化
+    }
+  }
+  return { count: code.length, digest: parts.join('\n') }
+}
+
+/**
+ * 带缓存的 `scanImports`：磁盘未变则复用 `runtime/` 里的上次结果。
+ *
+ * @returns {{result: object, fromCache: boolean, fingerprint: object}}
+ *   `fromCache` 是**可确定断言**的命中标志 —— 判据用它，不用耗时（耗时是代理指标，会漂）。
+ */
+export function scanImportsCached(rootPath, files = null, opts = {}) {
+  const all = files || walkFiles(rootPath)
+  const fp = scanFingerprint(rootPath, all)
+  const cachePath = p(rootPath, PLANE.RUNTIME, SCAN_CACHE_FILE)
+
+  try {
+    const cached = JSON.parse(readFileSync(cachePath, 'utf-8'))
+    if (cached?.fingerprint?.digest === fp.digest && cached?.fingerprint?.count === fp.count) {
+      return {
+        fromCache: true,
+        fingerprint: fp,
+        result: {
+          edges: new Map(cached.edges || []),
+          external: new Map(cached.external || []),
+          unresolved: cached.unresolved || [],
+          skipped: cached.skipped || [],
+          scanned: cached.scanned || 0
+        }
+      }
+    }
+  } catch { /* 缓存缺失/损坏 ⇒ 重扫（这就是缓存的语义：随时可丢） */ }
+
+  const result = scanImports(rootPath, all, opts)
+  try {
+    rewriteVerified(cachePath, JSON.stringify({
+      fingerprint: fp,
+      edges: [...result.edges],
+      external: [...result.external],
+      unresolved: result.unresolved,
+      skipped: result.skipped,
+      scanned: result.scanned
+    }, null, 2))
+  } catch { /* 缓存写失败不影响正确性（与 model 缓存同策略） */ }
+  return { fromCache: false, fingerprint: fp, result }
 }

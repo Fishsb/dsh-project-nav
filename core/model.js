@@ -5,10 +5,12 @@
 //
 // 一切"当前状态"都只能从这里查询 —— 没有第二处读盘拼装。
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { key, normSlashes, paths, nowIso } from './paths.js'
 import { readEvents, rewriteVerified, logStamp } from './log.js'
-import { walkFiles, globToRegExp, scanImports } from './scope.js'
+import { walkFiles, globToRegExp, scanImports, scanImportsCached } from './scope.js'
 
 export const LAYERS = ['project', 'module', 'feature', 'artifact']
 /** 补丁计数闸阈值（同一锚点连续 3 次补丁 → 强制先出决策） */
@@ -238,7 +240,7 @@ function pressureFrom(folded) {
  *   deps       nodeId → Set(nodeId)：我引用谁
  *   dependents nodeId → Set(nodeId)：谁引用我（= 改动的影响面）
  */
-function buildEdges(rootPath, diskFiles, fileOwners, projectDirs = []) {
+function buildEdges(rootPath, diskFiles, fileOwners, projectDirs = [], { useScanCache = false } = {}) {
   const dirs = projectDirs.filter(Boolean)
   const inScope = (f) => {
     if (!dirs.length) return true
@@ -249,7 +251,12 @@ function buildEdges(rootPath, diskFiles, fileOwners, projectDirs = []) {
     return false
   }
   const within = diskFiles.filter(inScope)
-  const scan = scanImports(rootPath, within)
+  // P0-1：扫缓存。`scanImports` 是纯磁盘派生（实测 2730 个代码文件 ≈ 360ms），
+  // 每次工具调用都重建模型 ⇒ 每次都白付。缓存指纹 = 传入清单 + size/mtime，
+  // 任何一项变了即失效 ⇒ 它仍只是"磁盘实况"的加速器，不是第二个真相（I1）。
+  const scan = useScanCache
+    ? scanImportsCached(rootPath, within).result
+    : scanImports(rootPath, within)
   const deps = new Map()
   const dependents = new Map()
   for (const [from, tos] of scan.edges) {
@@ -342,8 +349,13 @@ function projectDirsOf(nodes) {
 
 /**
  * 完整模型 = 折叠 + 磁盘实况（I1：模型的每个属性都能由这两者复算）。
+ *
+ * `useScanCache` 默认 **false**：`buildModel` 是**纯重算**（内存里，不落盘），
+ * 而扫描缓存是一份 **runtime 资产**。把写盘副作用塞进纯重算会破坏 I3 的可机检性
+ * ——「删掉 runtime/ 后重建不留下资产」那条用例正是这么抓住它的（0.11.0 现场）。
+ * 故：只有 `loadModel`（明确允许落 runtime 的路径）才开缓存。
  */
-export function buildModel(rootPath, { now = Date.now() } = {}) {
+export function buildModel(rootPath, { now = Date.now(), useScanCache = false } = {}) {
   const { events, corrupt } = readEvents(rootPath)
   const base = attachAnchorKeys(foldEvents(events))
 
@@ -392,7 +404,7 @@ export function buildModel(rootPath, { now = Date.now() } = {}) {
   }
 
   // 磁盘实况：依赖图（谁引用谁）—— ARCHITECTURE §1 / §3。复用上面走出的 diskFiles，不重复走盘。
-  const edges = buildEdges(rootPath, diskFiles, fileOwners, projectDirs)
+  const edges = buildEdges(rootPath, diskFiles, fileOwners, projectDirs, { useScanCache })
 
   // 最近决策 + 锚点补丁计数（计数闸的数据源）—— 与缓存路径共用同一实现
   const { patchPressure, openCommits } = pressureFrom(base)
@@ -544,6 +556,264 @@ export function coverage(model) {
   }
 }
 
+// ---- 治理主权探针（0.11.0 · GTP P2；原 P1 观测层被实测取消，见落地文档 §2.4） ----
+//
+// 要回答的问题：**项目是不是在插件之外自建了一套治理？**
+//
+// 为什么不需要事件订阅（这是本探针的架构依据）：
+//   自建治理件就在**磁盘上**；"最近改动是否晚于最近一次治理登记"由 **mtime + 事件流** 即可判定。
+//   订阅产出只能落 `runtime/`（可丢，I3）—— 能被丢掉的那份不可能是真相（I1）。
+//   故本探针**零订阅、零新状态**：纯函数，输入是模型 + 磁盘，输出是事实。
+
+/** 治理类文件名特征：命中即"疑似自建门禁"。词表刻意保守 —— 误报会腐蚀信号（F3）。 */
+const GOVERNANCE_NAME_RE = /(check|gate|audit|guard|lint|verify|ratchet|threshold|budget)/i
+
+/** 已知的"并行账本"文件名：它们是插件之外的第二本账。 */
+const PARALLEL_LEDGERS = ['CHANGELOG.md', 'OPEN-ITEMS.md', 'AGENTS.md', 'CONTRIBUTING.md']
+
+/**
+ * 只看**脚本**文件：`.mjs/.cjs/.js` 一律算；`.ts/.tsx` 只在 `scripts/` 目录下才算。
+ *
+ * 为什么对 .ts 加目录条件（0.11.0 夹具暴露的真问题）：`src/audit-source.ts` 是**产品源码**
+ * （它实现的功能叫"蒸馏审计"），只因文件名含 audit 就被词表命中 ⇒ 报成"自建门禁"是误报。
+ * 治理件的形态是**可执行脚本**，而 `.ts` 在 `src/` 下通常是模块源码；在 `scripts/` 下才是脚本。
+ */
+const CODE_RE = /\.(mjs|cjs|js)$/i
+const TS_SCRIPT_RE = /(^|\/)scripts\/[^/]+\.(ts|tsx|mts|cts)$/i
+
+/**
+ * 声明文件不算治理件：`.d.ts` 是**类型声明产物**，与 0.10.1 修掉的「`.d.ts` 被当代码扫」同一类错
+ * （那条 bug 的判据可复用：类型声明没有可执行的门禁语义）。
+ */
+const DECL_RE = /\.d\.(ts|mts|cts)$/i
+
+/**
+ * 生成物不算自建治理：`lib/*.js` 常是 `src/*.ts` 的编译产物，而 `lib/audit-source.js` 是**产品代码**
+ * （shoucang 实测：它是"蒸馏审计的双源读"，只因名字带 audit 被词表命中）。
+ *
+ * 判据用**结构**（同名 TS 源码存在 ⇒ 是产物），而不是继续调词表 —— 调词表是无底洞，
+ * 且每次放宽都会重新引入漏报。这条与 `TEST_LIKE_RE` 同源：**宁可漏报，不可误报**（F3）。
+ */
+const BUILT_RE = /(^|\/)(lib|dist|out|build|release)\//i
+
+/**
+ * 测试文件不算"自建门禁"：`deploy-guard.test.cjs` 是在**测**某个守卫，不是守卫本身。
+ * 不排除它们会把测试名里的 guard/verify 全算成外来治理件 —— 那是"假警报腐蚀信号"（F3），
+ * 与 0.10.1 修掉的计数闸退化同源。判据必须**窄**：宁可漏报，不可误报。
+ */
+const TEST_LIKE_RE = /(^|\/)(test|tests|__tests__|spec)\/|\.(test|spec)\.[cm]?[jt]sx?$/i
+
+/** 顶层目录黑名单：与 walkFiles 同源（噪声目录不进统计，否则计数没有意义）。 */
+const GOV_SKIP_DIRS = new Set([
+  '.git', 'node_modules', '.internal', 'dist', 'build', '.next', 'coverage',
+  '.dsh-vision-toolkit', '.npm-cache', '.roundtable',
+  // 基准/夹具目录：它们是**测试用的模拟仓**，不是被治理项目的自建治理。
+  // 不排除会把 40 个 smoke 夹具的 AGENTS.md 全算成"并行账本"——计数立刻失去意义（0.11.0 实测）。
+  '.gov-bench', 'fixtures', '__fixtures__', 'tmp', 'temp'
+])
+
+/**
+ * 治理入口识别：一批 check-*.mjs 通常**由一个 runner 统一驱动**（实测 shoucang：91 个脚本挂在
+ * `scripts/check-runner.mjs` 一个入口下）。
+ *
+ * 为什么按入口聚合而不是逐个脚本：**治理的单元是入口，不是实现细节**。
+ * 逐个登记 91 个脚本＝91 条事件，而登记 1 个 runner 就覆盖了它驱动的全部脚本 ——
+ * 后者才是"接管"的正确粒度（ARCHITECTURE §2②：计数守恒，但聚合与取回路径必须给出）。
+ */
+const RUNNER_NAME_RE = /(^|\/)(check-runner|run-checks|verify|ci|gate-runner)\.(mjs|cjs|js|ts)$/i
+
+/** 本插件自己的包名（用于把"插件自身文件"从"外来治理件"里排除）。读不到就返回空串（判据失效而非误报）。 */
+function ownPackageName() {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    return String(JSON.parse(readFileSync(`${here}/../package.json`, 'utf-8')).name || '')
+  } catch { return '' }
+}
+
+/**
+ * 治理主权探针。
+ *
+ * @returns {{
+ *   foreignScripts: string[],   项目自建的治理类脚本（root 相对路径）
+ *   runners: string[],          治理**入口**（真正该被接管的单元；驱动多个 check-*.mjs）
+ *   parallelLedgers: string[],  并行账本文件（插件之外的第二本账）
+ *   exempted: string[],         已登记豁免的项（opt-out 声明）
+ *   sovereign: boolean          是否"插件独占治理"（无未豁免的外来件）
+ * }}
+ */
+export function governanceSovereignty(model, { maxDepth = 4 } = {}) {
+  const rootPath = model.rootPath
+  // 排除插件自身：本插件就住在被治理根下时，`project-nav/core/gates.js`、`verify-runtime.mjs`
+  // 会被自己的名字匹配规则命中 —— 把自己的文件报成"外来治理件"是纯粹的假警报（0.11.0 实测踩到）。
+  //
+  // 判据**不硬编码路径**（源码仓 / profile 安装副本 / 改名都要成立），而是问：
+  // "离这个文件最近的 package.json，是不是本插件自己？" —— 按包名识别，路径无关、版本无关。
+  const selfName = ownPackageName()
+  const pkgCache = new Map()
+  const nearestPackageName = (rel) => {
+    let dir = normSlashes(rel).split('/').slice(0, -1).join('/')
+    const seen = []
+    for (;;) {
+      if (pkgCache.has(dir)) { const hit = pkgCache.get(dir); for (const s of seen) pkgCache.set(s, hit); return hit }
+      seen.push(dir)
+      try {
+        const pj = JSON.parse(readFileSync(`${rootPath}/${dir ? `${dir}/` : ''}package.json`, 'utf-8'))
+        const name = String(pj.name || '')
+        for (const s of seen) pkgCache.set(s, name)
+        return name
+      } catch {
+        if (!dir) { for (const s of seen) pkgCache.set(s, ''); return '' }
+        dir = dir.split('/').slice(0, -1).join('/')
+      }
+    }
+  }
+  const isSelf = (f) => selfName !== '' && nearestPackageName(f) === selfName
+
+  const found = []
+  const walk = (dir, rel, depth) => {
+    if (depth > maxDepth) return
+    let entries = []
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (GOV_SKIP_DIRS.has(e.name)) continue
+        walk(`${dir}/${e.name}`, rel ? `${rel}/${e.name}` : e.name, depth + 1)
+      } else if (e.isFile()) {
+        found.push(rel ? `${rel}/${e.name}` : e.name)
+      }
+    }
+  }
+  walk(rootPath, '', 0)
+
+  // 产物判定：处在构建目录（lib/dist/out/build/release）下，且**同一根内存在同名 TS 源码**
+  // ⇒ 它是编译产物，不是独立的治理件。
+  //
+  // 为什么按 basename 而非同路径匹配：`lib/x.js` 的源码是 `src/x.ts`（**不同目录**），
+  // 要求同路径会永远判不出（0.11.0 实测：`lib/audit-source.js` 因此漏过排除，被当成自建门禁）。
+  // 判据仍保守：只在构建目录内生效 + 必须有同名 TS 源码 —— 两个条件都满足才排除（宁可漏报，F3）。
+  const tsBasenames = new Set(
+    found.filter((f) => /\.(ts|mts|tsx)$/i.test(f))
+      .map((f) => normSlashes(f).split('/').pop().replace(/\.(ts|mts|tsx)$/i, '').toLowerCase())
+  )
+  const isBuildOutput = (f) => {
+    if (!BUILT_RE.test(f)) return false
+    const bare = normSlashes(f).split('/').pop().replace(/\.(js|cjs|mjs)$/i, '').toLowerCase()
+    return tsBasenames.has(bare)
+  }
+
+  const candidates = found
+    .filter((f) => (CODE_RE.test(f) || TS_SCRIPT_RE.test(f))
+      && !DECL_RE.test(f)
+      && !TEST_LIKE_RE.test(f)
+      && !isSelf(f)
+      && !isBuildOutput(f)
+      && GOVERNANCE_NAME_RE.test(f.split('/').pop()))
+    .map(normSlashes)
+    .sort()
+  // 入口与实现分开报：入口是**接管单元**，实现是它驱动的细节。
+  const runners = candidates.filter((f) => RUNNER_NAME_RE.test(f))
+  const foreignScripts = candidates.filter((f) => !RUNNER_NAME_RE.test(f))
+
+  // 并行账本：只算**实际存在**的那些（根级或子项目级），并区分层级。
+  //
+  // ⚠ 0.11.0 施工实测的假警报：先前实现用 `found.some(f => f.endsWith('/'+name))` 判定，
+  //   于是根下并不存在的 `CHANGELOG.md` 只因**某个子项目**有它就被报成根级账本 ——
+  //   报出的是"根有 4 本账"，实际根只有 1 本（AGENTS.md）。账本层级错位会让"接管面"整个失准。
+  // 判据改为：**该路径确实存在于 found 里**，并保留完整相对路径（层级即真相）。
+  const parallelLedgers = found
+    .filter((f) => PARALLEL_LEDGERS.includes(normSlashes(f).split('/').pop()) && !isSelf(f))
+    .map(normSlashes)
+    .sort()
+
+  // 已登记治理件：**登记即接管**（三档语义，对标 Allstar 的动作分级 log/issue/fix）。
+  //
+  //   ① exempt   —— 确认保留，退出告警（理由在 when 里，可审计）；
+  //   ② refs     —— 领域适应度函数（管的是别的领域，不是元治理重复），登记后**退出"未知外来件"**，
+  //                 但仍可经 nav_graph mode=docs 被路由检索到；
+  //   ③ competing—— 确认与插件职能重叠的"第二本账"，登记后**仍保留告警**（它确实该被收敛），
+  //                 但告警文案从"未知外来件"升级为"已接管·待收敛"，并给出移交路径。
+  //
+  // 为什么必须分档：只做"登记即静音"会让 competing 项伪装成已解决（假绿）；
+  // 只做"一律告警"则登记毫无收益，没人有动机登记。判据是**登记改变了什么**，而不是"登记了就没事"。
+  //
+  // ⚠ 字段位置是**顶层** `path` / `when`，不是 `meta.*` —— 折叠时 artifact 的这两个字段落在节点根部
+  //   （0.11.0 施工实测：读 `meta.when` 会恒空 ⇒ 豁免永不生效，且看起来"功能已实现"）。
+  //   这类"读错字段名"的静默失效比报错更坏，故此处**同时**兜 meta 以便未来归一。
+  // ⚠ **只认 when 的起始前缀**，不做全文匹配（0.11.0 施工实测的判定冲突）：
+  //   先前用全文正则，于是某条 when 里为了**说明移交路径**而提到 "exempt" 二字，
+  //   该件就被同时算成 competing 与 exempt —— 两档语义打架，且结果取决于措辞。
+  //   改判前缀后，语义只由**第一个词**决定，与正文措辞无关（判据稳定，可断言）。
+  //   这是"描述现状的契约"的另一面：**声明字段必须是机器可判的，不能靠人读整句**。
+  const DECL_KIND_RE = /^\s*(exempt|refs|competing)\b/i
+  const declared = { exempt: [], refs: [], competing: [] }
+  const declare = { exempt: new Set(), refs: new Set(), competing: new Set() }
+  const addDecl = (kind, p) => {
+    const k = key(p)
+    if (!k || declare[kind].has(k)) return
+    declare[kind].add(k)
+    declared[kind].push(k)
+  }
+  for (const n of model.nodes.values()) {
+    if (n.layer !== 'artifact' || n.status !== 'active') continue
+    const when = String(n.when ?? n.meta?.when ?? '')
+    const m = when.match(DECL_KIND_RE)
+    if (!m) continue
+    const p = normSlashes(String(n.path ?? n.meta?.path ?? n.name ?? ''))
+    if (!p) continue
+    addDecl(m[1].toLowerCase(), p)
+  }
+  const hit = (set, f) => set.has(key(f)) || set.has(key(String(f).split('/').pop()))
+  const isExempt = (f) => hit(declare.exempt, f) || hit(declare.refs, f)
+  const isCompeting = (f) => hit(declare.competing, f)
+  const unexemptedScripts = foreignScripts.filter((f) => !isExempt(f))
+  const unexemptedRunners = runners.filter((f) => !isExempt(f))
+  const unexemptedLedgers = parallelLedgers.filter((f) => !isExempt(f))
+  // 待收敛 = 已登记 competing、但仍占着外来件名额的那些（告警保留，但语义已升级）。
+  const pendingConvergence = [...new Set([...foreignScripts, ...runners, ...parallelLedgers])].filter((f) => isCompeting(f))
+
+  return {
+    // 入口在前：**接管单元是入口**（一个 runner 驱动 N 个 check），实现细节在后。
+    runners: unexemptedRunners,
+    foreignScripts: unexemptedScripts,
+    parallelLedgers: unexemptedLedgers,
+    exempted: [...declared.exempt],
+    /** 已登记为领域适应度函数（不再算未知外来件） */
+    referenced: [...declared.refs],
+    /** 已接管但仍需收敛的竞争项（告警保留，带移交路径） */
+    pendingConvergence,
+    sovereign: unexemptedRunners.length === 0 && unexemptedScripts.length === 0 && unexemptedLedgers.length === 0
+  }
+}
+
+/**
+ * 治理活力：**最近一次改动是否晚于最近一次治理登记** —— "治理被绕过"的只读信号。
+ *
+ * 判据全部来自已有真相：`mtime`（磁盘实况）+ 最近 commit 时间（事件流）。零新状态。
+ * ⚠ 只读信号，**不做闸门、不拒绝写入**（ARCHITECTURE §10 同一判例：代理指标做成闸门必然退化）。
+ */
+export function governanceVitality(model) {
+  const rootPath = model.rootPath
+  const lastCommitAt = model.commits.length ? model.commits[model.commits.length - 1].at : null
+  let newest = null
+  for (const f of model.fileOwners.keys()) {
+    try {
+      const s = statSync(`${rootPath}/${f}`)
+      if (!newest || s.mtimeMs > newest.mtimeMs) newest = { file: normSlashes(f), mtimeMs: s.mtimeMs }
+    } catch { /* 落点已消失 ⇒ 由 STALE 报告，这里不重复报 */ }
+  }
+  if (!newest) return { lastCommitAt, newestFile: null, newestAt: null, bypassedMs: null, bypassed: false }
+  const commitMs = lastCommitAt ? Date.parse(lastCommitAt) : 0
+  const bypassedMs = commitMs ? newest.mtimeMs - commitMs : null
+  return {
+    lastCommitAt,
+    newestFile: newest.file,
+    newestAt: new Date(newest.mtimeMs).toISOString(),
+    bypassedMs,
+    // 容差 60s：同一次操作里"先改文件后登记"是正常顺序，不算绕过（否则必然狼来了）。
+    bypassed: bypassedMs !== null && bypassedMs > 60_000
+  }
+}
+
 // ---- 运行时缓存（I3：可删可重建） ----
 
 /**
@@ -565,7 +835,8 @@ export function loadModel(rootPath, { useCache = false, now = Date.now() } = {})
       if (sameSource && stamp.lines > 0) return buildModelFromPlain(cached, rootPath)
     } catch { /* 缓存不可用 → 重算（这就是 cache 的语义：随时可丢） */ }
   }
-  const model = buildModel(rootPath, { now })
+  // 只有这条路径允许落 runtime ⇒ 只有它开扫描缓存（buildModel 保持纯重算，见其注释）
+  const model = buildModel(rootPath, { now, useScanCache: true })
   model.stamp = stamp
   try { persistModel(rootPath, model) } catch { /* 缓存写失败不影响正确性 */ }
   return model
@@ -604,7 +875,9 @@ function buildModelFromPlain(plain, rootPath) {
     stale: plain.stale || [], unregistered: plain.unregistered || [],
     // 依赖图**不缓存、每次重算**：它是磁盘派生，事件流的戳证明不了磁盘 import 还新鲜。
     // 两条路径走同一实现 ⇒ 结果必然一致（I1：同一份真相不允许两个答案）。
-    edges: buildEdges(rootPath, walkFiles(rootPath), fileOwners, projectDirsOf(nodes)),
+    // （P0-1）重算走 `scanImportsCached`：它的指纹是**磁盘**（清单+size+mtime），不是事件流戳，
+    // 所以"不缓存依赖图"与"缓存扫描结果"不矛盾 —— 前者说的是不拿事件流戳当新鲜度证明。
+    edges: buildEdges(rootPath, walkFiles(rootPath), fileOwners, projectDirsOf(nodes), { useScanCache: true }),
     patchPressure, log: folded.log, eventCount: plain.eventCount || 0, extras: {},
     stamp: plain.stamp
   }

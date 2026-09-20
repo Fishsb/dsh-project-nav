@@ -10,7 +10,7 @@ import { join } from 'node:path'
 import { tmpRoot, put, touch, seed } from './helper.mjs'
 import { appendEvents, readEvents, verifyLog, logStamp } from '../core/log.js'
 import { buildModel, loadModel, normalizeAnchor, coverage, pressureFor, nodeId, impactOf } from '../core/model.js'
-import { resolveScope, evidenceOf, diffEvidence, globToRegExp, scanImports, extractSpecifiers, walkFiles, isTestPath } from '../core/scope.js'
+import { resolveScope, evidenceOf, diffEvidence, globToRegExp, scanImports, scanImportsCached, extractSpecifiers, walkFiles, isTestPath } from '../core/scope.js'
 import { anchorGate, scopeGate, mainlineGate, countGate, decisionGate, runGates, impactGate } from '../core/gates.js'
 import { commitIntent, reconcile, archiveIntent } from '../core/commit.js'
 import { paths } from '../core/paths.js'
@@ -504,4 +504,70 @@ test('影响面闸：跨节点牵动 → 告警；引用方也在 scope 内 → 
   assert.equal(same.pass, true, '引用方也在 scope 内 ⇒ 已覆盖，不告警')
 
   assert.equal(impactGate(m, { scope: {}, materialized: { files: [] } }).pass, true, 'scope 为空不误报')
+})
+
+// ============ 依赖图扫描缓存（0.11.0 · 治理接管 P0-1） ============
+//
+// 为什么要缓存：实测治理根 4747 文件中 2730 个代码文件，`scanImports` 单次 **360ms**，
+// 而每次工具调用都重建模型 ⇒ 每次调用白付这一笔（ARCHITECTURE §2「治理开销的收敛方式」）。
+// 校验成本（walk 52ms + stat 27ms = 79ms）远低于重扫（412ms），实测省 **333ms / 81%**。
+//
+// ⚠ 判据用**缓存命中/失效**这种可确定断言的量，**不用耗时**：耗时是代理指标，机器一忙就漂
+// （本仓 ARCHITECTURE §10 同一判例）。耗时只作参考基线记录，不进断言。
+
+test('P0-1 扫描缓存：同一输入第二次命中缓存（且结果与首次逐字节一致）', async (t) => {
+  const root = tmpRoot(t)
+  put(root, 'src/a.js', "import './b.js'\n")
+  put(root, 'src/b.js', 'export const b = 1\n')
+  const one = scanImportsCached(root, walkFiles(root))
+  assert.equal(one.fromCache, false, '首次必然是 miss（缓存还不存在）')
+  const two = scanImportsCached(root, walkFiles(root))
+  assert.equal(two.fromCache, true, '文件未变 ⇒ 第二次必须命中缓存')
+  assert.deepEqual([...two.result.edges], [...one.result.edges], '缓存结果必须与首次逐字节一致')
+  assert.deepEqual(two.result.unresolved, one.result.unresolved)
+})
+
+test('P0-1 缓存失效完备：任一被扫文件内容变更 ⇒ 必须失效（防"缓存成第二真相"，I1）', async (t) => {
+  const root = tmpRoot(t)
+  put(root, 'src/a.js', "import './b.js'\n")
+  put(root, 'src/b.js', 'export const b = 1\n')
+  scanImportsCached(root, walkFiles(root))                    // 填缓存
+  put(root, 'src/a.js', "import './c.js'\n")                  // 改 import 目标
+  put(root, 'src/c.js', 'export const c = 1\n')               // 新增文件
+  const after = scanImportsCached(root, walkFiles(root))
+  assert.equal(after.fromCache, false, '内容变了 ⇒ 必须重扫')
+  assert.deepEqual(after.result.edges.get('src/a.js'), ['src/c.js'], '依赖图必须反映新 import')
+})
+
+test('P0-1 缓存失效完备：新增/删除文件也失效（文件清单变了）', async (t) => {
+  const root = tmpRoot(t)
+  put(root, 'src/a.js', "import './b.js'\n")
+  put(root, 'src/b.js', 'export const b = 1\n')
+  scanImportsCached(root, walkFiles(root))
+  rmSync(join(root, 'src/b.js'))                              // 删掉被引用文件
+  const after = scanImportsCached(root, walkFiles(root))
+  assert.equal(after.fromCache, false, '文件清单变了 ⇒ 必须重扫')
+  assert.equal(after.result.edges.has('src/a.js'), false, 'b 没了 ⇒ a 的出边不该还在')
+})
+
+test('P0-1 缓存可丢弃：删掉 runtime/ 后重算结果一致（I3 不破）', async (t) => {
+  const root = tmpRoot(t)
+  put(root, 'src/a.js', "import './b.js'\n")
+  put(root, 'src/b.js', 'export const b = 1\n')
+  const one = scanImportsCached(root, walkFiles(root))
+  rmSync(paths.runtime(root), { recursive: true, force: true })
+  const two = scanImportsCached(root, walkFiles(root))
+  assert.equal(two.fromCache, false, 'runtime 删了 ⇒ 缓存也就没了（它不是真相）')
+  assert.deepEqual([...two.result.edges], [...one.result.edges], '重算必须无损')
+})
+
+test('P0-1 缓存不得写进事件流（它只能落 runtime/）', async (t) => {
+  const root = tmpRoot(t)
+  put(root, 'src/a.js', "import './b.js'\n")
+  put(root, 'src/b.js', 'export const b = 1\n')
+  await seed(root)                                            // 先有事件流
+  const before = readEvents(root).events.length
+  scanImportsCached(root, walkFiles(root))
+  scanImportsCached(root, walkFiles(root))
+  assert.equal(readEvents(root).events.length, before, '缓存不是事件，不得污染唯一事实源')
 })

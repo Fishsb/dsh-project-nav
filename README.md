@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.10.4-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.11.0-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-%3E%3D0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -131,9 +131,14 @@ File: core/model.js  —  1 个落点文件
 `nav_graph mode=health` 里除了闸门压力，还有一节**文件职责**：一个落点文件被**几个不同架构节点**登记。
 
 ```
-文件职责（登记落点派生 · 只读）：96 个落点文件 · ⚠ 6 个被 ≥3 个节点共用
-  ⚠ project-nav/core/model.js — 归属 5（nav_query / nav_update / nav_docs / nav_status / nav_set_vector）· 被引 9 · 引用 3
+文件职责（登记落点派生 · 只读）：143 个落点文件 · ⚠ 1 个被 ≥3 个节点共用
+  ⚠ deepseek/prompt-enhancer-release/lib/index.cjs — 归属 3 · 被引 2 · 引用 9
 ```
+
+> ⚠ **示例必须取自真实输出**：本节先前引用的示例里写着 `nav_query` / `nav_update` / `nav_docs` /
+> `nav_status` / `nav_set_vector` 五个工具名，而它们在 0.10.0 之后**已不存在**（工具面收敛为 6 个）。
+> 门面上的失效示例与代码里的失效守卫同害：**它训练人相信一份错的契约**。
+> 上例为治理根实测输出，跑 `nav_graph mode=health` 即得。
 
 **为什么不用行数红线**：行数是代理指标。长文件未必坏，短文件照样能混三个职责；而一旦把行数做成闸门，
 它必然退化成"狼来了"——与 0.10.0 修掉的计数闸退化（每笔改动被计两次、阈值 3 实际 ~1.5 就触发）是同一类错。
@@ -247,7 +252,27 @@ npm run test:node-runner  # 同一批用例走 node --test
   （PN-S3 的施工落点由草案的 `gates.js` 移到可见路径：通过的闸其 detail 不渲染，挂闸上等于死文本）。
   新增机检 10 条（可见性三出口 marker〔**变异验证**：三处打回原状即三条变红〕/ 未附申报不阻断 /
   闭笔后可追回 / json 见 plan / 未知 kind 必抛 / 零命中给候选 / 零候选不凑 / 后缀命中 /
-  有决策点名 / 无决策不点名），测试 **101 → 113 pass**。
+  有决策点名 / 无决策不点名），测试项数跑一次即得（**不写死在这里** —— 那是会漂移的数字，见 §7）。
+- `0.10.6 → 0.11.0`：**换代** —— 治理面从「被调用的工具包」升级为「在场的治理层」。
+  判据来自实测：插件当时**零事件监听、零外来治理探测**，七闸只在 `nav_commit` 内跑 ⇒ 不调用它 = 完全绕行、
+  无痕迹。治理根实测登记率仅 3%（4747 文件 / 4600 未登记），而它治理的 `shoucang` 自建了 **105 个治理脚本
+  + 3 本并行账本** ⇒ 插件根本不知道项目在自己建治理。本次换代补齐四件：
+  ① **响应性**（`runtime/scan-cache.json`）：`scanImports` 是纯磁盘重活（2730 代码文件 ≈ 360ms），
+  每次调用白付；缓存指纹 = 文件清单 + `size/mtimeMs`，实测 `loadModel` **193ms → 70ms（省 64%）**。
+  ⚠ 判据取 `fromCache` 布尔，**不用耗时**（耗时是代理指标会漂）。
+  ② **治理主权**（`governanceSovereignty`）：纯磁盘派生，报外来治理脚本与并行账本；**只报告不处置**
+  （删除属危险操作，且产品/构建脚本与治理脚本同名相似）。`artifact` 的 `when` 写 `exempt` 即退出告警
+  （对标 Allstar 的 opt-out 策略，撤销后复现）。
+  ③ **治理活力**（`governanceVitality`）：`mtime` + 事件流派生"改动是否晚于治理登记"（容差 60s，否则狼来了）。
+  ④ **健康三层**：`nav_graph mode=health` 分 **覆盖 / 主权 / 活力** 报告。
+  ⚠ **架构面变更**：闸门仍七、事件 kind 仍 4、工具仍 6、**无新增文件**；`scope → log` 依赖收紧
+  （扫描缓存要落 `runtime/`，而 runtime 文件的唯一写法是 `rewriteVerified`，复制第二份写法即下一个两处真相）。
+  ⚠ **一处架构自我否决**：原方案设"观测层"（订阅 `tools/post-execute` / `fs/write-intent`）记录活动事实，
+  实测证明其**信息量为零**（主权与绕过信号纯由磁盘+事件流派生），且订阅产出只能落 `runtime/`（可丢）
+  ⇒ **取消**，三层收敛为两层。这是减法：**能被丢掉的那份不可能是真相**（I1）。
+  另修三处门面漂移：版本三处不一致（0.10.6/0.10.4/0.10.5）、README 写死测试项数（实测不符）、
+  示例里的 5 个已删工具名（`nav_query` 等）——三条均已加**机检守卫**（含变异验证）。
+  profile 里的死配置键 `autoBindWorkspace` / `boundaryWorkspaces`（代码零消费）已删除。
 
 ## 9. 开发纪律
 

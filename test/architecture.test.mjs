@@ -7,15 +7,16 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, readdirSync, utimesSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { tmpRoot, put, touch, seed } from './helper.mjs'
 import { appendEvents, readEvents, verifyLog, rewriteVerified } from '../core/log.js'
-import { loadModel, buildModel, coverage, pressureFor, filePressure, normalizeAnchor } from '../core/model.js'
+import { loadModel, buildModel, coverage, pressureFor, filePressure, normalizeAnchor, governanceSovereignty, governanceVitality } from '../core/model.js'
 import { commitIntent, reconcile, archiveIntent } from '../core/commit.js'
 import { paths, PLANE } from '../core/paths.js'
 import { renderAll, writeProjectSection, renderModelDoc, renderMapHtml, MARK_START, MARK_END } from '../core/render.js'
+import { renderHealth } from '../core/format.js'
 import { scanTools, effectMountedTools, OLD_TOOL_NAMES, NEW_TOOL_NAMES } from './tools-list.mjs'
 
 // ============ I1 单源 ============
@@ -245,6 +246,55 @@ test('A6 每个工具都注册在 ctx.effect 内（否则卸载卸不干净）',
   assert.equal(mounted, total, `挂在 ctx.effect 内的工具 ${mounted}/${total} —— 有工具未挂 effect，卸载会留下残留监听/工具`)
 })
 
+// ============ 门面一致性（0.11.0 · 治理接管 P0-3/P0-4） ============
+//
+// 为什么这三条要机检：它们是**已在真实事故中发生的漂移**，且都不需要人肉眼发现——
+//   · 版本三处不一致：实测 package.json=0.10.6 / README 徽章=0.10.4 / ARCHITECTURE 头=0.10.5；
+//   · README 写死"113 pass"：实测 111，而本仓纪律明写"测试数不写在这里"；
+//   · README 示例里 5 个工具名（nav_query 等）在 0.10.0 后已不存在。
+// 门面挂着失效契约与代码里的失效守卫同害：**它训练人相信一份错的东西**。
+
+test('P0-3 版本三处一致：package.json / README 徽章 / ARCHITECTURE 头部', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'))
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf-8')
+  const arch = readFileSync(new URL('../ARCHITECTURE.md', import.meta.url), 'utf-8')
+
+  const badge = readme.match(/badge\/version-([\d.]+)/)
+  assert.ok(badge, 'README 必须有 version 徽章')
+  const archHead = arch.match(/架构（v([\d.]+)/)
+  assert.ok(archHead, 'ARCHITECTURE.md 头部必须有 架构（vX.Y.Z）')
+
+  assert.equal(badge[1], pkg.version, `README 徽章 ${badge[1]} ≠ package.json ${pkg.version}`)
+  assert.equal(archHead[1], pkg.version, `ARCHITECTURE.md 头 ${archHead[1]} ≠ package.json ${pkg.version}`)
+})
+
+test('P0-4 README 不得写死测试项数（本仓纪律：那是会漂移的数字）', () => {
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf-8')
+  // 抓 "NNN pass" / "N → M pass" 这类写死形态
+  const hits = readme.match(/\d+\s*(?:→|->)\s*\d+\s*pass|\b\d{2,}\s*pass\b/g) || []
+  assert.deepEqual(hits, [], `README 写死了测试项数: ${hits.join(' / ')} —— 跑一次即得的数字不该进文档`)
+})
+
+test('P0-4 README 示例里的工具名必须真实存在（不得留已删工具的残影）', () => {
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf-8')
+  const live = new Set(scanTools().names)
+  const mentioned = new Set((readme.match(/nav_[a-z_]+/g) || []))
+  const ghosts = [...mentioned].filter((n) => !live.has(n) && !OLD_TOOL_NAMES.includes(n))
+  // OLD_TOOL_NAMES 允许出现在"历史说明"里（如本节的反例注解），但**不得**出现在示例输出里。
+  // 判据取"当前不在册且非已知历史名"—— 已知历史名由本用例下方单独断言其不在示例块中。
+  assert.deepEqual(ghosts, [], `README 出现不存在的工具名: ${ghosts.join(', ')}`)
+
+  // 更硬的一条：示例代码块（``` 围栏内）不得含任何不在册的工具名 —— 示例是"照抄即错"的地方。
+  const blocks = [...readme.matchAll(/```[\s\S]*?```/g)].map((m) => m[0])
+  const offenders = []
+  for (const b of blocks) {
+    for (const n of (b.match(/nav_[a-z_]+/g) || [])) {
+      if (!live.has(n)) offenders.push(n)
+    }
+  }
+  assert.deepEqual([...new Set(offenders)], [], `README 示例块里出现已不存在的工具名: ${[...new Set(offenders)].join(', ')}`)
+})
+
 test('A5 模型面字段数 ≤ 4（锚点 / scope / arch= / 理由）', () => {
   const tools = scanTools()
   const commit = tools.schemas.find((s) => s.name === 'nav_commit')
@@ -412,4 +462,198 @@ test('文件职责压力是磁盘 + 事件流派生：删掉 runtime/ 后逐字�
   const a = JSON.stringify(filePressure(buildModel(root)))
   const b = JSON.stringify(filePressure(buildModel(root)))
   assert.equal(a, b, '派生量不得依赖可丢弃缓存')
+})
+
+// ============ 治理主权与活力（0.11.0 · GTP P2/P3） ============
+//
+// 这两组回答的是"项目是不是在插件之外自建了治理"与"治理有没有被绕过"。
+// **全部纯派生**（磁盘实况 + 事件流），零事件订阅 —— 订阅产出只能落 runtime/（可丢），
+// 而"能被丢掉的那份不可能是真相"（I1）。故这组用例同时是"无新增状态"的守卫。
+
+test('P2 主权探针：外来治理脚本被发现（变异验证：无则报 0）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  const clean = governanceSovereignty(buildModel(root))
+  assert.equal(clean.foreignScripts.length, 0, '未放治理件时必须报 0（成对断言，缺一视为未验）')
+
+  put(root, 'scripts/check-fake.mjs', '// a gate')
+  const dirty = governanceSovereignty(buildModel(root))
+  assert.deepEqual(dirty.foreignScripts, ['scripts/check-fake.mjs'])
+  assert.equal(dirty.sovereign, false, '有未豁免外来件 ⇒ 主权不完整')
+})
+
+test('P2 主权探针：纯产品脚本不误伤（边界用例 —— 误报会腐蚀信号，F3）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, 'scripts/build.mjs', 'export const build = 1')
+  put(root, 'scripts/sync-runtime.mjs', 'export const s = 1')
+  put(root, 'src/index.js', 'export const i = 1')
+  const sov = governanceSovereignty(buildModel(root))
+  assert.deepEqual(sov.foreignScripts, [], '无治理词的脚本不得计入外来治理件')
+})
+
+test('P2 主权探针：测试文件不算自建门禁（deploy-guard.test.cjs 是在测守卫，不是守卫）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, 'test/deploy-guard.test.cjs', '// tests the guard')
+  put(root, 'test/update-gate.test.cjs', '// tests the gate')
+  const sov = governanceSovereignty(buildModel(root))
+  assert.deepEqual(sov.foreignScripts, [], '测试文件名里的 guard/gate 不得算成外来治理件')
+})
+
+test('P2 主权探针：插件自身文件不算外来件（判据按包名，不硬编码路径）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  // 造一个与插件同名包：它的文件不得被报成"外来治理件"
+  put(root, 'project-nav/package.json', JSON.stringify({ name: '@dsh-external/project-nav', version: '0.0.0' }))
+  put(root, 'project-nav/core/gates.js', '// our own gate implementation')
+  put(root, 'project-nav/verify-runtime.mjs', '// our own verifier')
+  const sov = governanceSovereignty(buildModel(root))
+  assert.deepEqual(sov.foreignScripts, [], '插件自己的 gates.js / verify-runtime.mjs 不得被算成外来治理件')
+})
+
+test('P2 主权探针：夹具目录不算（.gov-bench / fixtures 里的模拟仓）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, '.gov-bench/smoke/nav/CHANGELOG.md', '# fixture')
+  put(root, '.gov-bench/smoke/nav/check-fake.mjs', '// fixture')
+  put(root, 'fixtures/check-x.mjs', '// fixture')
+  const sov = governanceSovereignty(buildModel(root))
+  assert.deepEqual(sov.foreignScripts, [], '夹具里的治理件不得计入真实主权面')
+  assert.deepEqual(sov.parallelLedgers, [], '夹具里的账本不得计入')
+})
+
+test('P2 主权探针：编译产物不算（lib/x.js 有 src/x.ts 同名源码）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, 'src/audit-source.ts', 'export const x = 1')
+  put(root, 'lib/audit-source.js', '// compiled output of src/audit-source.ts')
+  put(root, 'lib/types/audit-source.d.ts', 'export declare const x: number')
+  const sov = governanceSovereignty(buildModel(root))
+  assert.deepEqual(sov.foreignScripts, [], '有 TS 源码的 lib 产物、以及 .d.ts 声明，都不得算治理件')
+})
+
+test('P2 主权探针：治理入口与实现分开报（接管单元是入口，不是每个 check）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, 'scripts/check-runner.mjs', "import './check-a.mjs'")
+  put(root, 'scripts/check-a.mjs', '// one check')
+  put(root, 'scripts/check-b.mjs', '// another check')
+  const sov = governanceSovereignty(buildModel(root))
+  assert.deepEqual(sov.runners, ['scripts/check-runner.mjs'], 'runner 必须被识别为入口')
+  assert.equal(sov.foreignScripts.length, 2, 'check-a/b 是实现，不算入口')
+})
+
+test('P2 主权探针：并行账本被发现（项目自有 CHANGELOG / AGENTS 等）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, 'CHANGELOG.md', '# changes')
+  put(root, 'OPEN-ITEMS.md', '# open')
+  const sov = governanceSovereignty(buildModel(root))
+  assert.deepEqual(sov.parallelLedgers, ['CHANGELOG.md', 'OPEN-ITEMS.md'])
+  assert.equal(sov.sovereign, false)
+})
+
+test('P3 opt-out 双向：登记 artifact + when 含 exempt ⇒ 告警消失；撤销 ⇒ 复现', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, 'scripts/check-mine.mjs', '// my own check')
+
+  const before = governanceSovereignty(buildModel(root))
+  assert.equal(before.foreignScripts.length, 1, '声明前必须报出')
+
+  // 声明豁免
+  await appendEvents(root, [{ kind: 'node', op: 'upsert', layer: 'artifact', id: 'E-A1',
+    fields: { name: 'E-A1', path: 'scripts/check-mine.mjs', when: 'exempt: 本项目自建且已并入插件治理' } }])
+  const after = governanceSovereignty(buildModel(root))
+  assert.equal(after.foreignScripts.length, 0, '声明豁免后必须退出告警')
+  assert.ok(after.exempted.length >= 1, '豁免项必须留痕（可审计）')
+
+  // 撤销豁免（改 when 去掉 exempt 首词）
+  await appendEvents(root, [{ kind: 'node', op: 'upsert', layer: 'artifact', id: 'E-A1',
+    fields: { name: 'E-A1', path: 'scripts/check-mine.mjs', when: '仅供查阅' } }])
+  const revoked = governanceSovereignty(buildModel(root))
+  assert.equal(revoked.foreignScripts.length, 1, '撤销豁免后必须复现告警（双向验证）')
+})
+
+test('P3 声明三档语义：前缀判定，且 competing 保留告警（不做"登记即静音"）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, 'scripts/check-a.mjs', '// a')
+  put(root, 'scripts/check-b.mjs', '// b')
+  put(root, 'CHANGELOG.md', '# ledger')
+
+  await appendEvents(root, [
+    { kind: 'node', op: 'upsert', layer: 'artifact', id: 'E-R1',
+      fields: { name: 'E-R1', path: 'scripts/check-a.mjs', when: 'refs: 领域适应度函数' } },
+    { kind: 'node', op: 'upsert', layer: 'artifact', id: 'E-C1',
+      fields: { name: 'E-C1', path: 'scripts/check-b.mjs', when: 'competing: 第二本账，待收敛' } },
+    { kind: 'node', op: 'upsert', layer: 'artifact', id: 'E-C2',
+      fields: { name: 'E-C2', path: 'CHANGELOG.md', when: 'competing: 与事件流重叠' } }
+  ])
+  const s = governanceSovereignty(buildModel(root))
+  assert.ok(s.referenced.includes('scripts/check-a.mjs'), 'refs 档应记为已接管')
+  assert.ok(!s.foreignScripts.includes('scripts/check-a.mjs'), 'refs 档应退出"未知外来件"')
+  assert.ok(s.foreignScripts.includes('scripts/check-b.mjs'), 'competing 档必须**保留告警**（否则登记=假绿）')
+  assert.ok(s.pendingConvergence.length >= 2, 'competing 项应进"待收敛"清单（带移交路径）')
+})
+
+test('P3 声明只认首词：正文提到 exempt 二字不得改变档位（判据稳定，与措辞无关）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, 'scripts/check-x.mjs', '// x')
+  // 正文里出现 exempt 一词，但首词是 competing ⇒ 必须仍算 competing（不得被静音）
+  await appendEvents(root, [{ kind: 'node', op: 'upsert', layer: 'artifact', id: 'E-Z1',
+    fields: { name: 'E-Z1', path: 'scripts/check-x.mjs', when: 'competing: 移交路径 A 或标 exempt' } }])
+  const s = governanceSovereignty(buildModel(root))
+  assert.ok(s.foreignScripts.includes('scripts/check-x.mjs'), '正文里的 exempt 不得把它静音（否则判据取决于措辞）')
+  assert.equal(s.exempted.length, 0)
+})
+
+test('P3 主权探针是纯派生：删掉 runtime/ 后结果逐字节一致（零新增状态，I3/I1）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, 'scripts/check-x.mjs', '// x')
+  const a = JSON.stringify(governanceSovereignty(buildModel(root)))
+  rmSync(join(root, '.internal', 'runtime'), { recursive: true, force: true })
+  const b = JSON.stringify(governanceSovereignty(buildModel(root)))
+  assert.equal(a, b, '主权探测不得依赖任何可丢弃状态 —— 这正是它取消事件订阅的理由')
+})
+
+test('P3 活力：改动晚于治理登记 ⇒ 报绕过；容差内不报（否则必然狼来了）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  await commitIntent(root, { task: 't', anchor: 'PN-F01', arch: 'a', scope: { features: ['PN-F01'] } })
+
+  // 刚登记完，文件未新改 ⇒ 不算绕过
+  const fresh = governanceVitality(buildModel(root))
+  assert.equal(fresh.bypassed, false, '刚登记完不得报绕过（容差 60s）')
+
+  // 把落点文件的 mtime 推到未来 5 分钟 ⇒ 必须报绕过
+  const future = Date.now() + 5 * 60_000
+  const f = join(root, 'src/a.js')
+  utimesSync(f, new Date(future), new Date(future))
+  const stale = governanceVitality(buildModel(root))
+  assert.equal(stale.bypassed, true, '改动显著晚于登记 ⇒ 必须报绕过')
+  assert.ok(stale.bypassedMs > 60_000)
+})
+
+test('P3 健康三层齐备：覆盖 / 主权 / 活力 三节都在（G3）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  const out = renderHealth(buildModel(root), { rootPath: root, opens: [], locks: [], inflight: [], logCheck: null })
+  assert.match(out, /【覆盖】/, '缺覆盖层')
+  assert.match(out, /【主权】/, '缺主权层')
+  assert.match(out, /【活力】/, '缺活力层')
+})
+
+test('P3 健康分不拦截：主权告警 + 绕过告警并存时，nav_commit 仍必须成功（MUST-NOT）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, 'scripts/check-x.mjs', '// foreign')
+  const future = Date.now() + 5 * 60_000
+  utimesSync(join(root, 'src/a.js'), new Date(future), new Date(future))
+
+  const r = await commitIntent(root, { task: 't', anchor: 'PN-F01', arch: 'a', scope: { features: ['PN-F01'] } })
+  assert.notEqual(r.status, 'blocked', '健康信号绝不得变成写入闸门（ARCHITECTURE §10）')
 })

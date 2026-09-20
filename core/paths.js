@@ -22,7 +22,9 @@ export const PLANE = {
 export const RUNTIME_FILES = {
   MODEL: 'arch-model.json',
   INFLIGHT: 'inflight',
-  LOCKS: 'locks'
+  LOCKS: 'locks',
+  /** 依赖图扫描缓存（0.11.0）：纯磁盘派生的加速器，指纹 = 文件清单 + size/mtime。删了即重算。 */
+  SCAN_CACHE: 'scan-cache.json'
 }
 
 export function p(root, ...parts) {

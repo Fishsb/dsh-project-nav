@@ -3,7 +3,7 @@
 // 一切"说给模型看"的文本都在这里成形，避免 host 里散落字符串模板。
 
 import { key, normSlashes } from './paths.js'
-import { coverage, moduleBelongsTo, filePressure, REPEAT_PATCH_THRESHOLD } from './model.js'
+import { coverage, moduleBelongsTo, filePressure, governanceSovereignty, governanceVitality, REPEAT_PATCH_THRESHOLD } from './model.js'
 import { renderTreeText } from './render.js'
 
 /** health 里「文件职责」一节最多显示多少个落点文件（排序在模型层，确定性）。 */
@@ -53,6 +53,9 @@ export function renderHealth(model, { rootPath, opens, locks = [], inflight = []
   L.push('Health')
   L.push(`  Root: ${rootPath}`)
   L.push(`  事件流: ${model.eventCount} 事件${logCheck ? (logCheck.ok ? '（seq 连续 ✓）' : `（⛔ ${logCheck.problems.length} 处异常）`) : ''}`)
+  // ---- 层①：覆盖 ----
+  L.push('')
+  L.push('  【覆盖】')
   L.push(`  模型: 项目 ${cv.projects} · 模块 ${cv.modules} · 功能 ${cv.features} · 文档工件 ${cv.artifacts} · 已退役 ${cv.retired}`)
   L.push(`  落点: 登记文件 ${cv.registeredFiles} · 未登记 ${cv.unregisteredFiles} · STALE ${model.stale.length}`)
   L.push(`  主线: doing=${model.vector?.doing || '(unset)'} | next=${model.vector?.next || '(unset)'}`)
@@ -106,6 +109,61 @@ export function renderHealth(model, { rootPath, opens, locks = [], inflight = []
     L.push('')
     L.push(`  runtime 锁 (${locks.length}):`)
     for (const l of locks) L.push(`    · ${l.name} age=${Math.round(l.ageMs / 1000)}s pid=${l.pid ?? '?'}`)
+  }
+
+  // ---- 层②：主权（0.11.0 · 纯派生，零订阅） ----
+  // 回答"项目是不是在插件之外自建了一套治理"。**只读上报，不删除、不拒绝写入**：
+  // 删除是危险操作；接管的正确形态是"登记 + 通报 + 收敛"，不是破坏性抢占。
+  const sov = governanceSovereignty(model)
+  L.push('')
+  L.push('  【主权】插件应独占治理；以下为插件之外的治理件（只读信号）')
+  if (sov.sovereign) {
+    L.push('  ✓ 未发现外来治理件——治理主权完整')
+  } else {
+    if (sov.runners.length) {
+      L.push(`  ⚠ 外来治理入口 ${sov.runners.length} 个（**接管单元是入口**，不是它驱动的每个脚本）:`)
+      for (const f of sov.runners.slice(0, 8)) L.push(`    · ${f}`)
+    }
+    if (sov.foreignScripts.length) {
+      L.push(`  ⚠ 外来治理脚本 ${sov.foreignScripts.length} 件（疑似自建门禁）:`)
+      for (const f of sov.foreignScripts.slice(0, 8)) L.push(`    · ${f}`)
+      if (sov.foreignScripts.length > 8) L.push(`    …(+${sov.foreignScripts.length - 8}，全量 = nav_graph mode=json)`)
+    }
+    if (sov.parallelLedgers.length) {
+      L.push(`  ⚠ 并行账本 ${sov.parallelLedgers.length} 件（插件之外的第二本账）:`)
+      for (const f of sov.parallelLedgers.slice(0, 8)) L.push(`    · ${f}`)
+    }
+    L.push('  → 登记即接管（三档，按 when 的**首词**判定）：')
+    L.push('      exempt    —— 确认保留，退出告警（理由可审计）')
+    L.push('      refs      —— 领域适应度函数（管的是别的领域），退出"未知外来件"')
+    L.push('      competing —— 确认与插件重叠的"第二本账"，**告警保留**但升级为"已接管·待收敛"')
+    L.push('    ⚠ 本项只报告不处置：删除属危险操作，且产品/构建脚本常与治理脚本同名相似。')
+  }
+  if (sov.referenced.length || sov.exempted.length || sov.pendingConvergence.length) {
+    L.push('')
+    L.push(`  已接管登记: refs ${sov.referenced.length} · exempt ${sov.exempted.length} · competing（待收敛）${sov.pendingConvergence.length}`)
+    for (const f of sov.pendingConvergence.slice(0, 6)) L.push(`    · 待收敛 ${f}`)
+    if (sov.pendingConvergence.length > 6) L.push(`    …(+${sov.pendingConvergence.length - 6}，全量 = nav_graph mode=json)`)
+  }
+
+  // ---- 层③：活力（"治理被绕过"的只读信号） ----
+  const vit = governanceVitality(model)
+  L.push('')
+  L.push('  【活力】')
+  if (!vit.newestFile) {
+    L.push('  最近改动: (无可判落点文件)')
+  } else {
+    L.push(`  最近改动: ${vit.newestFile} @ ${vit.newestAt}`)
+    L.push(`  上次治理登记: ${vit.lastCommitAt || '(从未登记)'}`)
+    if (vit.bypassed) {
+      const mins = Math.round(vit.bypassedMs / 60000)
+      L.push(`  ⚠ 治理可能被绕过：改动晚于登记 ${mins} 分钟（容差 60s，只读信号不拒写入）`)
+      L.push('    → 若这次改动确实该登记，跑 nav_commit；若属未登记范围，先 nav_node 补登记。')
+    } else if (vit.bypassedMs === null) {
+      L.push('  · 尚无治理登记，无法判定绕过')
+    } else {
+      L.push('  ✓ 最近改动未晚于治理登记（无绕过迹象）')
+    }
   }
   return L.join('\n')
 }
