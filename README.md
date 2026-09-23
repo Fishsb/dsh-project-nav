@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.12.2-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.12.3-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-%3E%3D0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -369,6 +369,19 @@ npm run test:node-runner  # 同一批用例走 node --test
   ⚠ 施工中我曾误判为"不进包、除版本号外相同"——「不在 `files` 里」**不等于**「不进包」：
   `README` / `LICENSE` / `package.json` 是 npm 的自动成员。这类判断只能靠**解包逐文件比对**，
   不能靠读 `files` 白名单推断（本仓第 N 次同类教训：判据打在实测上，不打在推断上）。
+- `0.12.2 → 0.12.3`：**修 bug（非换代）** —— 主线向量的**缺席不可观测**（ADR-372）。
+  病根不是"少显示一行"：同一份向量曾在**四个渲染站点各自手写**，对"未填"给出**四种语义**
+  —— `nav_set` 回执四字段全显式 `(unset)`；`renderHealth` / `renderPresence` 只显式 `doing`/`next`，
+  `notDoing`/`exitCondition` **整行消失**；`renderTreeText` 干脆不渲染 `exitCondition`。
+  于是「新增字段漏改一处」与「某字段从未被渲染」都**不产生任何信号**
+  （实测：全仓 `exitCondition` 13 处命中中消费面仅 2 处打印、**七闸无一读取它**）。
+  这与本仓 2026-09-23 刚治过的 ACT-341「空扫不得判绿」**同族**：失败不可观测。
+  **修法**：格式化收敛为**单一权威** `vectorFields()`（`core/render.js` 导出，四站点全走它）；
+  缺席一律显式 `(unset)`。**判据从模型派生**（`Object.keys(model.vector)` 排除 `updatedAt`）
+  ⇒ 向量长出新字段而无人渲染时**自动失败**，无需人维护。
+  **架构面**：工具仍 5、闸门仍七、kind 仍 4、**零新增文件、零新增状态**、vector 形状不变；
+  **显示态与数据/判定态分离** —— JSON 快照缺席仍是空串（`''`），`gates.js` 谓词仍取空串，
+  `(unset)` 只存在于给 agent 看的文本里。新增机检用例带**变异验证**（删掉一处理染 ⇒ 必须变红）。
 
 ## 9. 开发纪律
 

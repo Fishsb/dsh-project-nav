@@ -4,7 +4,7 @@
 
 import { key, normSlashes } from './paths.js'
 import { coverage, moduleBelongsTo, filePressure, governanceSovereignty, governanceVitality, REPEAT_PATCH_THRESHOLD } from './model.js'
-import { renderTreeText } from './render.js'
+import { renderTreeText, vectorFields } from './render.js'
 
 /** health 里「文件职责」一节最多显示多少个落点文件（排序在模型层，确定性）。 */
 const FILE_PRESSURE_TOP = 8
@@ -58,9 +58,11 @@ export function renderHealth(model, { rootPath, opens, locks = [], inflight = []
   L.push('  【覆盖】')
   L.push(`  模型: 项目 ${cv.projects} · 模块 ${cv.modules} · 功能 ${cv.features} · 文档工件 ${cv.artifacts} · 已退役 ${cv.retired}`)
   L.push(`  落点: 登记文件 ${cv.registeredFiles} · 未登记 ${cv.unregisteredFiles} · STALE ${model.stale.length}`)
-  L.push(`  主线: doing=${model.vector?.doing || '(unset)'} | next=${model.vector?.next || '(unset)'}`)
-  if (model.vector?.notDoing) L.push(`  反目标: ${model.vector.notDoing}`)
-  if (model.vector?.exitCondition) L.push(`  完成判据: ${model.vector.exitCondition}`)
+  // 四字段一律显式（唯一权威 = render.js 的 vectorFields）：缺席必须可分辨。
+  const vf = vectorFields(model.vector)
+  L.push(`  主线: doing=${vf.doing} | next=${vf.next}`)
+  L.push(`  反目标(notDoing): ${vf.notDoing}`)
+  L.push(`  完成判据(exitCondition): ${vf.exitCondition}`)
   L.push('')
   L.push(`  在途改动 (${opens.length}): ${opens.length ? '' : '(无)'}`)
   for (const c of opens) {
@@ -403,12 +405,11 @@ export function renderMap(model, { target = '' } = {}) {
 export function renderPresence(m) {
   if (!m) return ''
   const L = []
-  const doing = m.vector?.doing || '(unset)'
-  const next = m.vector?.next || '(unset)'
+  const vf = vectorFields(m.vector)
   L.push('【project-nav · 治理在场】')
-  L.push(`  主线: doing=${doing} | next=${next}`)
-  if (m.vector?.notDoing) L.push(`  反目标(notDoing): ${m.vector.notDoing}`)
-  if (m.vector?.exitCondition) L.push(`  完成判据: ${m.vector.exitCondition}`)
+  L.push(`  主线: doing=${vf.doing} | next=${vf.next}`)
+  L.push(`  反目标(notDoing): ${vf.notDoing}`)
+  L.push(`  完成判据(exitCondition): ${vf.exitCondition}`)
 
   const opens = m.openCommits || []
   if (opens.length) {

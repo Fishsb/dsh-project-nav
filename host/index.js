@@ -22,7 +22,7 @@ import { loadModel, normalizeAnchor, pressureFor, coverage, REPEAT_PATCH_THRESHO
 import { appendEvents, verifyLog, readEvents } from '../core/log.js'
 import { reconcile, commitIntent, archiveIntent, inflightView, materialize } from '../core/commit.js'
 import { locate, resolveScope, evidenceOf } from '../core/scope.js'
-import { renderTreeText } from '../core/render.js'
+import { renderTreeText, vectorFields } from '../core/render.js'
 import { listLocks } from '../core/lock.js'
 import {
   splitList, parseKv, truncate, renderHealth, renderScopeTarget, renderGaps,
@@ -407,12 +407,13 @@ export function apply(ctx, config) {
         const [w] = await appendEvents(root, [{ kind: 'set', vector }])
         const after = loadModel(root)
         const changed = Object.keys(vector).filter((k) => String(vector[k]) !== String(prev[k] ?? '') && !(k === 'exitCondition' && args.exit === undefined))
+        const vf = vectorFields(vector)
         return [
           `✓ 主线向量已更新（事件 seq ${w.seq}）`,
-          `  doing: ${vector.doing || '(unset)'}`,
-          `  next: ${vector.next || '(unset)'}`,
-          `  notDoing: ${vector.notDoing || '(unset)'}`,
-          `  exitCondition: ${vector.exitCondition || '(unset)'}`,
+          `  doing: ${vf.doing}`,
+          `  next: ${vf.next}`,
+          `  notDoing: ${vf.notDoing}`,
+          `  exitCondition: ${vf.exitCondition}`,
           changed.length ? '' : '  (无字段变化)',
           changed.length ? '下一步: 向量已变更，下一次任意工具调用即按新向量治理（无需额外的渲染动作）。' : ''
         ].filter(Boolean).join('\n')

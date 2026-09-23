@@ -734,3 +734,50 @@ test('P3 健康分不拦截：主权告警 + 绕过告警并存时，nav_commit 
   const r = await commitIntent(root, { task: 't', anchor: 'PN-F01', arch: 'a', scope: { features: ['PN-F01'] } })
   assert.notEqual(r.status, 'blocked', '健康信号绝不得变成写入闸门（ARCHITECTURE §10）')
 })
+
+// ============ 主线向量的缺席可观测（隐性字段陷阱）============
+//
+// 病根（2026-09-23 实测）：主线向量四字段曾在**四个渲染站点各自手写**，且对"未填"给出四种语义
+// —— nav_set 回执四字段全显式 `(unset)`；health/presence 只显式 doing/next，另两个**整行消失**；
+// tree 干脆不渲染 exitCondition。后果不是"少显示一行"，而是**失败不可观测**：
+// 新增字段时漏改一处、或某字段从未被渲染，都不会有任何信号。
+// 这正是本仓最忌的一类缺陷（同族：ACT-341「空扫不得判绿」）。
+//
+// 判据刻意**从模型派生**（不是硬编码四个名字）：`vector` 长出新字段而没人渲染 ⇒ 本用例自动失败。
+// 这样它不需要人维护 —— 与该文件其余判据同源。
+
+test('主线向量：每个字段在三个渲染面上都必须显式可辨（派生自模型，非硬编码）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)   // seed 四字段全有值
+  // 造"未填"态：这才是原病根分支 —— 真仓/夹具四字段全满时它测不出来（假绿）
+  await appendEvents(root, [{ kind: 'set', vector: { doing: 'ONLY-DOING', next: '', notDoing: '   ', exitCondition: null } }])
+
+  const m = buildModel(root)
+  const folded = foldOnly(root)
+
+  // 权威字段集从模型派生（排除 updatedAt —— 它是元数据，不是主线语义）
+  const fields = Object.keys(m.vector).filter((k) => k !== 'updatedAt')
+  assert.ok(fields.length >= 4, `向量字段数异常：${fields.join(', ')}`)
+
+  const surfaces = {
+    'renderTreeText': renderTreeText(m),
+    'renderHealth': renderHealth(m, { rootPath: root, opens: [], locks: [], inflight: [], logCheck: null }),
+    'renderPresence': renderPresence(folded)
+  }
+  for (const [name, text] of Object.entries(surfaces)) {
+    for (const f of fields) {
+      // 每个字段必须在场：要么带真实值，要么带显式 (unset) —— 不许整行消失
+      assert.ok(text.includes(f), `${name} 未渲染向量字段 "${f}"（缺席即不可观测）`)
+    }
+    assert.ok(text.includes('(unset)'), `${name} 必须把未填字段显式标成 (unset)，而不是让整行消失`)
+    assert.ok(text.includes('ONLY-DOING'), `${name} 必须给出已填字段的真实值`)
+  }
+
+  // 反向：`(unset)` 不得泄漏到**数据面**（JSON 快照的缺席仍是空串，不是显示串）
+  const { mountHost } = await import('./host-harness.mjs')
+  const h = await mountHost(root, { config: {} })
+  t.after(() => h.dispose())
+  const snap = JSON.parse(await h.call('nav_graph', { mode: 'health', format: 'json' }))
+  assert.equal(snap.vector.next, '', 'JSON 数据面缺席必须是空串（(unset) 只是显示态，不得污染数据）')
+  assert.equal(snap.vector.doing, 'ONLY-DOING')
+})
