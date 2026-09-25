@@ -5,6 +5,8 @@
 import { key, normSlashes } from './paths.js'
 import { coverage, moduleBelongsTo, filePressure, governanceSovereignty, governanceVitality, REPEAT_PATCH_THRESHOLD } from './model.js'
 import { renderTreeText, vectorFields } from './render.js'
+// 在途缓存 ⟷ 模型的差集：**从 commit.js 借来**的纯目录+数集派生，不是第二真相（见那边注释）。
+import { inflightDrift } from './commit.js'
 
 /** health 里「文件职责」一节最多显示多少个落点文件（排序在模型层，确定性）。 */
 const FILE_PRESSURE_TOP = 8
@@ -57,7 +59,45 @@ export function renderHealth(model, { rootPath, opens, locks = [], inflight = []
   L.push('')
   L.push('  【覆盖】')
   L.push(`  模型: 项目 ${cv.projects} · 模块 ${cv.modules} · 功能 ${cv.features} · 文档工件 ${cv.artifacts} · 已退役 ${cv.retired}`)
-  L.push(`  落点: 登记文件 ${cv.registeredFiles} · 未登记 ${cv.unregisteredFiles} · STALE ${model.stale.length}`)
+  // 落点分母：**三桶自证可加和**（磁盘文件 = 命中 + 未登记 + 显式跳过），差额非 0 时必须
+  // 有名有姓地列出来 —— 旧读数把「登记**条目**」与「磁盘**文件**」并排成一行，
+  // 两个分母不同却被当成一份账去减（治理根实测 156 + 3460 = 3607 > 3605，差 -2 且无处可查）。
+  L.push(`  落点: 登记条目 ${cv.registeredEntries ?? cv.registeredFiles}（口径见下行）· 未登记 ${cv.unregisteredFiles} · STALE ${model.stale.length}`)
+  if (cv.disk) {
+    const d = cv.disk
+    const w = cv.walk || {}
+    // 截断**显式**：命中上限时读数必须写明，否则"缺口数"看起来是个完整的数（本仓无静默截断纪律）。
+    const cut = w.truncated
+      ? ` · ⚠ 已截断（走盘上限 ${w.max}，实得 ≥${w.atLeast} ⇒ 还有文件没走到，未登记数是**下界**）`
+      : ` · 未截断（上限 ${w.max}，实得 ${w.counted}）`
+    L.push(`  磁盘: ${d.files} 文件 = 命中 ${d.hit} + 未登记 ${d.unregistered} + 显式跳过(glob) ${d.skipped}` +
+      `${d.balanced ? ' ✓ 可加和（差 0）' : ` ⛔ 差集 ${d.residual}（不平）`}${cut}`)
+    const r = cv.registered || null
+    if (r) {
+      L.push(`  登记: ${r.entries} 条目 = 唯一键 ${r.uniqueKeys} + 重复条目 ${r.duplicateEntries}（glob 字面量 ${r.globEntries}）` +
+        ` · 唯一键 = 在盘 ${r.onDisk} + 不在盘 ${r.offDisk}${r.onDisk + r.offDisk === r.uniqueKeys ? ' ✓' : ' ⛔（不平）'}`)
+      // ⚠ 两侧分母不同 ⇒ 两个数**不能直接相减**。但把它们与磁盘侧摆在一起时，差额**有确定归属**，
+      //   恒等式（可核，任一项都能在上面几行里找到）：
+      //     登记条目 + 未登记 − 磁盘文件  ≡  不在盘 + 重复条目 + glob字面量 − 显式跳过
+      //   推导：E = (K + DUP) + G 而 D = ON + U + S 且 H = ON
+      //         ⇒ E + U − D = OFF + DUP + G − S。
+      //   ⚠ 不要写成"E − (U + H)"：那是在拿登记条目减**磁盘侧两项之和**，量纲不成立，
+      //     会给出一个无意义的负数（本席首版即犯此错，实测 -3452）—— 读数**不能**教人算错账。
+      const lhs = (cv.registeredEntries ?? cv.registeredFiles) + d.unregistered - d.files
+      const rhs = r.offDisk + r.duplicateEntries + r.globEntries - d.skipped
+      L.push(`    ⚠ 两个分母（登记条目 / 磁盘文件）**不能直接相减**；摆在一起的差额有确定归属：` +
+        `登记条目 + 未登记 − 磁盘文件 = ${lhs} ≡ 不在盘 ${r.offDisk} + 重复条目 ${r.duplicateEntries} + glob ${r.globEntries} − 跳过 ${d.skipped} = ${rhs}` +
+        `${lhs === rhs ? ' ✓' : ' ⛔（恒等式不成立，请按上面几行逐项核对）'}`)
+      if (r.offDiskFiles.length) {
+        const shown = r.offDiskFiles.slice(0, 8)
+        L.push(`    · 不在盘的登记落点 ${r.offDiskFiles.length}：${shown.join('、')}${r.offDiskFiles.length > shown.length ? ` …(+${r.offDiskFiles.length - shown.length}，全量 = nav_graph mode=json)` : ''}（同时计入上方 STALE）`)
+      }
+      if (r.misbucketed.length) {
+        const shown = r.misbucketed.slice(0, 8)
+        L.push(`    ⚠ 口径不一致 ${r.misbucketed.length}：这些文件按"未登记"计，其实登记在**非 feature 层**：${shown.join('、')}${r.misbucketed.length > shown.length ? ` …(+${r.misbucketed.length - shown.length}，全量 = nav_graph mode=json)` : ''}`)
+      }
+    }
+  }
   // 四字段一律显式（唯一权威 = render.js 的 vectorFields）：缺席必须可分辨。
   const vf = vectorFields(model.vector)
   L.push(`  主线: doing=${vf.doing} | next=${vf.next}`)
@@ -69,7 +109,54 @@ export function renderHealth(model, { rootPath, opens, locks = [], inflight = []
     const age = Math.round((Date.now() - Date.parse(c.at)) / 60000)
     L.push(`    · ${c.id} ${truncate(c.task, 70)} | anchor=${c.anchor} | ${(c.files || []).length} 文件 | ${age} 分钟前 | ${c.actor ? `actor=${String(c.actor).slice(0, 8)}` : 'actor=?'} | 查证申报 ${planBrief(c.plan, 40)}`)
   }
-  if (inflight.length) L.push(`    在途状态文件: ${inflight.length}（runtime 缓存，可丢）`)
+  // ---- 在途缓存 ⟷ 模型 的差集：**常驻一行**（可确定断言：两边 seq 数集比对）----
+  //
+  // 病根（2026-09-25 实测）：`writeInflight` / `clearInflight` 双双 `catch {}` 吞掉，
+  // 而旧版这里只在"缓存非空"时打一句原始计数 —— 于是治理根"模型 22 笔在途 / inflight 目录 21 个文件"
+  // 这种不一致**在任何一个可读面上都不存在**（不相等这件事没有任何出口）。
+  // ⚠ "缓存可丢"（I3）说的是**收口判据不依赖它**（判据在事件流，I1），不是"它坏了可以不报"。
+  //   两者混为一谈，缺陷就永远无声。判据本身也只读 **seq 数集**（不读内容、不计耗时）。
+  //   ⚠ 不新增参数位：差集由**模型 + 磁盘缓存命名**当场派生（`inflightDrift`）——
+  //     多开一个可选参数就多一个"宿主漏传即静默失效"的点，而这里根本不需要调用方记得喂。
+  //   ⚠ 截断的取回路径写**真能取回**的地方：health 的 json 快照不含差集明细（host 未改），
+  //     指到 mode=json 就是一句假承诺 —— 本仓最忌"训练人相信错的东西"。
+  const dr = rootPath ? inflightDrift(rootPath, model) : null
+  if (dr) {
+    const head = `在途缓存 ⟷ 模型: 缓存 ${dr.cached} 个 / 模型 ${dr.open} 笔 / 差集 ${dr.read}`
+    if (!dr.ok) {
+      // ---- 第三态：「读不到」≠「不一致」（A2 裁决：读失败不得被当成差异）----
+      // 病根（2026-09-25 实测）：`inflightDrift` 把 readdir 失败送进 `unreadable`，
+      // 但**没有任何消费者** —— 这里只读 consistent/missing/extra/skipped，全仓 grep 无 dr.unreadable。
+      // 后果不是"少报一句"：目录读不到时 files 为空集 ⇒ missing 凭空长出"模型有 open 而缓存缺 N 笔"
+      // （点名 ACT-xxxx），health 打「**不一致**」并把人支去核对收口回执 ——
+      // **拿读失败当差异**，正是本项要治的形态；它只是从 `catch {}` 搬进了注释。
+      // 判据（读得到吗）与对账（一致吗）**不是同一个问题**，故必须先分流：
+      // 这里既不打「不一致」、也不给差集明细（判据不可得时输出差集就是造差异）。
+      // 与「一致时不报」（防狼来了）同源：报的是**亲眼看到的**那一态。
+      L.push(`    ⚠ 在途缓存 ${dr.dir} **读不到** —— 不是"不一致"：对账判据（<seq>.json 数集）本次拿不到，不判差集`)
+      for (const u of dr.unreadable) L.push(`       · ${u}`)
+      L.push('       → 缓存可丢（I3），但「读不到」与「丢了」必须可辨；目录被占位/权限修好即恢复判定。')
+    } else if (dr.consistent) {
+      L.push(`    ${head}：一致（按 <seq>.json 数集比对，确定性）`)
+    } else {
+      L.push(`    ⚠ ${head} —— **不一致**（按 <seq>.json 数集比对，确定性）`)
+      const MISS_TOP = 8
+      const miss = dr.missing.slice(0, MISS_TOP).map((m) => m.id)
+      L.push(`       · 模型有 open 而缓存缺 ${dr.missing.length} 笔${miss.length ? `: ${miss.join('、')}` : ''}`)
+      if (dr.missing.length > miss.length) L.push(`         …(+${dr.missing.length - miss.length}，共 ${dr.missing.length} 笔；全量 = phase:open 的 commit 事件 .internal/events.jsonl)`)
+      const EXTRA_TOP = 8
+      const extra = dr.extra.slice(0, EXTRA_TOP).map((e) => e.id)
+      L.push(`       · 缓存有而模型不在途 ${dr.extra.length} 个${extra.length ? `: ${extra.join('、')}` : ''}`)
+      if (dr.extra.length > extra.length) L.push(`         …(+${dr.extra.length - extra.length}，共 ${dr.extra.length} 个；全量 = 目录 .internal/runtime/inflight/)`)
+      L.push('       → 缓存是可丢的（I3），但"丢了 / 清不掉"必须可见；核对收口回执里有没有同期的失败行。')
+    }
+    // 未归类残骸**两个分支都要报**（放在 if 里就成了"一致时不提"的静默丢弃）。
+    if (dr.skipped.length) {
+      L.push(`       · ⚠ 未归类残骸 ${dr.skipped.length} 个（非 <seq>.json 命名，不计入差集）: ${dr.skipped.slice(0, 8).join('、')}${dr.skipped.length > 8 ? ` …(+${dr.skipped.length - 8}，共 ${dr.skipped.length} 个)` : ''}`)
+    }
+  } else if (inflight.length) {
+    L.push(`    在途状态文件: ${inflight.length}（runtime 缓存，可丢）`)
+  }
   L.push('')
   L.push(`  架构决策: ${model.decisions.length} 条${model.decisions.length ? `（最近 ${model.decisions[model.decisions.length - 1].id} @ ${model.decisions[model.decisions.length - 1].anchor}）` : ''}`)
   const pressure = [...model.patchPressure.values()].filter((p) => {
@@ -307,7 +394,38 @@ export function renderImpact(model, loc) {
 
 export function renderGaps(model, { limit = 30 } = {}) {
   const L = []
-  L.push(`Gaps — 未登记文件 ${model.unregistered.length} · STALE 落点 ${model.stale.length}`)
+  const den = model.denominator || null
+  const w = den?.walk || null
+  // ⚠ 截断与 STALE 名单一样，必须**在入口处**就说清：截断时"未登记 N"是下界不是总数。
+  const cut = w && w.truncated ? `（⚠ 走盘已截断 @上限 ${w.max}，实得 ≥${w.atLeast} ⇒ 下面的未登记数是**下界**）` : ''
+  L.push(`Gaps — 未登记文件 ${model.unregistered.length} · STALE 落点 ${model.stale.length}${cut}`)
+  // 三桶自证：磁盘文件 = 命中 + 未登记 + 显式跳过。skip 桶不给出口就等于静默丢弃
+  // （走盘跳过了、清单里又没有 ⇒ 它从任何读数里消失）。这里按节点聚合，全量走 mode=json。
+  if (den) {
+    const d = den.disk
+    L.push(`  分母自证: 磁盘 ${d.files} = 命中 ${d.hit} + 未登记 ${d.unregistered} + 显式跳过(glob) ${d.skipped}` +
+      `${d.balanced ? ' ✓ 可加和（差 0）' : ` ⛔ 差集 ${d.residual}（不平）`}`)
+    if (den.skippedByGlob.length) {
+      const byNode = new Map()
+      for (const s of den.skippedByGlob) {
+        if (!byNode.has(s.node)) byNode.set(s.node, [])
+        byNode.get(s.node).push(s)
+      }
+      const globGroups = [...byNode.entries()].sort((a, b) => b[1].length - a[1].length || (a[0] < b[0] ? -1 : 1))
+      L.push(`  显式跳过 ${den.skippedByGlob.length} 个文件（被登记 glob 覆盖 ⇒ 不算缺口，但**不是**被静默丢弃）:`)
+      const TOPG = 6
+      for (const [node, list] of globGroups.slice(0, TOPG)) {
+        L.push(`    · ${list[0].glob} ← ${node} — ${list.length} 个（例: ${list.slice(0, 2).map((x) => x.file).join('、')}${list.length > 2 ? ` …+${list.length - 2}` : ''}）`)
+      }
+      if (globGroups.length > TOPG) L.push(`    · …另 ${globGroups.length - TOPG} 组 / ${den.skippedByGlob.length - globGroups.slice(0, TOPG).reduce((n, [, v]) => n + v.length, 0)} 个文件（全量 = nav_graph mode=json）`)
+    }
+    const r = den.registered
+    if (r && (r.offDiskFiles.length || r.duplicateEntries || r.misbucketed.length)) {
+      L.push(`  登记侧: ${r.entries} 条目 = 唯一键 ${r.uniqueKeys} + 重复条目 ${r.duplicateEntries} · 唯一键 = 在盘 ${r.onDisk} + 不在盘 ${r.offDisk}`)
+      if (r.offDiskFiles.length) L.push(`    · 不在盘的登记落点（= 上面 STALE 的那 ${r.offDiskFiles.length} 条）: ${r.offDiskFiles.join('、')}`)
+      if (r.misbucketed.length) L.push(`    ⚠ 口径不一致 ${r.misbucketed.length}：按"未登记"计，其实登记在**非 feature 层**: ${r.misbucketed.join('、')}`)
+    }
+  }
   if (model.unregistered.length) {
     // 按顶层目录聚合：每组计数 ⇒ 全量总数守恒（4,291 个名字压成几行，但没有任何文件被无声抹掉）
     const groups = new Map()
@@ -334,7 +452,12 @@ export function renderGaps(model, { limit = 30 } = {}) {
     if (model.stale.length > limit) L.push(`    · …(+${model.stale.length - limit}，全量 = nav_graph mode=json)`)
     L.push('  -> 真删了：nav_node target=<节点> retire=true；只是搬走：nav_node set=files=…')
   }
-  if (!model.unregistered.length && !model.stale.length) L.push('  ✓ 无缺口：登记与磁盘一致。')
+  // ⚠ 截断时**不得**判"无缺口"：没走到的文件当然也不会出现在缺口清单里，
+  //   那句 ✓ 就成了"分母变小换来的假绿"（与裁断口径同族）。
+  if (!model.unregistered.length && !model.stale.length) {
+    if (w && w.truncated) L.push(`  ⚠ 未登记清单为空，但走盘@上限 ${w.max} 已截断（实得 ≥${w.atLeast}）⇒ **不能**判"无缺口"：没走到的文件不会出现在这里。`)
+    else L.push('  ✓ 无缺口：登记与磁盘一致。')
+  }
   return L.join('\n')
 }
 
@@ -463,6 +586,29 @@ export function renderCommitResult(res, model) {
     }
     L.push('')
   }
+  // ---- 在途缓存失败：登记回执**与**收口回执都要看得见 ----
+  //
+  // ⚠ 为什么收口回执也要有这一段：`clearInflight` 失败原先归 `catch {}`，
+  // 于是"已收口（事件流里的事实）"与"残骸还留在缓存里（可读面上的不一致）"同时成立却无人说。
+  // 精确性声明：这里只列**本次收口尝试里**清不掉的 —— 它不是账本，是回执。
+  const faults = []
+  if (res.inflightFault) faults.push({ op: 'write', id: res.commit?.id, error: res.inflightFault })
+  const recFaulted = res.reconcile?.faulted || []
+  for (const x of recFaulted) faults.push({ op: 'clear', id: x.id, error: x.error })
+  if (faults.length) {
+    L.push('⚠ 在途缓存失败 —— 缓存可丢（I3），但"丢了 / 清不掉"必须可见:')
+    if (res.inflightFault) {
+      L.push(`  ✗ ${res.commit?.id || '本笔'} 的在途缓存**写入失败**: ${truncate(res.inflightFault, 140)}`)
+      L.push('     → 收口判据不受影响（证据快照写在事件流里，I1），但缓存差集会出现"模型有 open 而缓存缺"。')
+    }
+    for (const x of recFaulted) {
+      L.push(`  ✗ ${x.id} 已收口（事件流），但其在途缓存**清理失败**: ${truncate(x.error, 140)}`)
+      L.push('     → 该笔会在缓存里留下残骸（health 的差集一行会报出来）。')
+    }
+    L.push('    （详见 nav_graph mode=health 的「在途缓存 ⟷ 模型」一行）')
+    L.push('')
+  }
+
   if (res.status === 'blocked') {
     L.push('⛔ 闸门拒绝 — 本次改动未登记（先解决再动手）:')
     for (const b of res.gates.blocked) L.push(`  ${b.gate}: ${b.detail}`)

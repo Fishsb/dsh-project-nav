@@ -42,19 +42,48 @@ function paramsOf(src, toolName) {
   if (start < 0) return []
   const pStart = src.indexOf('parameters: {', start)
   if (pStart < 0) return []
-  // 取 parameters 块（按缩进配平的花括号扫描）
-  let i = src.indexOf('{', pStart)
-  let depth = 0
-  let end = i
-  for (; end < src.length; end++) {
-    if (src[end] === '{') depth++
-    else if (src[end] === '}') { depth--; if (depth === 0) break }
-  }
-  const block = src.slice(i, end)
+  // 单趟词法扫描：① 花括号配平定出 parameters 块的边界；② `depth === 1` 处的
+  // 裸标识符 = **顶层参数键**（depth 在此是"当前在几个花括号之内"）。
+  //
+  // ⚠ 为什么不按缩进匹配：旧写法把缩进写死成 /^\s{6}/，参数行 6→4 空格（**纯格式化**）
+  //   即失配 ⇒ 静默返回 [] ⇒ 上界类判据退化成 `0 <= N` 恒真（本仓最忌的「空扫判绿」）。
+  //   缩进是排版，不是结构。
+  // ⚠ 为什么 `depth === 1` 要在**收下这个 token 时**判，而不是"遇到 { 之后"判：
+  //   后者的深度已经变成 2，于是每个工具只抓得到**第 1 个**参数（值对象内层也被数成顶层键）。
+  //   唯一正确的时序是：收 token 时该 token 尚未改变深度 ⇒ 顶层键恰恰只在 depth===1 时出现。
+  // 空白与注释一律丢弃（故缩进、换行、单行/多行写法都不参与判定）；
+  // 字符串字面量整体吃掉：description 里的 `{` / `}` / 逗号不得搅乱配平与切分。
   const params = []
-  const pr = /^\s{6}([A-Za-z_$][\w$]*):\s*\{/gm
-  let m
-  while ((m = pr.exec(block)) !== null) params.push(m[1])
+  let depth = 0
+  let quote = null // 处于字符串字面量时的终结符（' " `）
+  let escaped = false
+  let token = '' // 当前裸标识符 token（只在 depth===1 时可能成为参数键）
+  // 收 token：只有"顶层 + 后面紧跟冒号"的裸标识符才是参数键。
+  const flushToken = (atColon) => {
+    if (token) {
+      if (atColon && depth === 1) params.push(token)
+      token = ''
+    }
+  }
+  for (let j = src.indexOf('{', pStart); j < src.length; j++) {
+    const ch = src[j]
+    if (quote) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') { quote = ch; continue }
+    if (ch === '{') { depth++; continue }
+    if (ch === '}') {
+      depth--
+      if (depth === 0) return params // parameters 块收口
+      continue
+    }
+    if (ch === ':') { flushToken(true); continue }
+    if (/[A-Za-z0-9_$]/.test(ch)) { token += ch; continue }
+    flushToken(false) // 空白 / 逗号 / 其他：token 边界，非键
+  }
   return params
 }
 

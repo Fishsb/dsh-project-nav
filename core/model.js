@@ -17,6 +17,14 @@ export const LAYERS = ['project', 'module', 'feature', 'artifact']
 /** 补丁计数闸阈值（同一锚点连续 3 次补丁 → 强制先出决策） */
 export const REPEAT_PATCH_THRESHOLD = 3
 
+/**
+ * 走盘上限 —— 「分母」的唯一可核数字。
+ *
+ * 刻意从**这里显式传给** `walkFiles`（而不是吃它自己的默认值 5000）：默认值写在两处
+ * 就是两个真相，改一处忘另一处 ⇒ 读数悄悄换了分母而没人发现。此处是模型路径上的唯一权威。
+ */
+const WALK_MAX = 5000
+
 export const nodeId = (layer, name) => `${layer}:${key(name)}`
 
 /**
@@ -215,15 +223,36 @@ function fileOwnersOf(nodes) {
 /**
  * 一条 commit 事件算不算「一次补丁」？
  *
- *   open                → 算：一次改动意图。
- *   closed 且带 closes   → **不算**：它只是那笔意图的收口回执（同一笔改动的第二个事件）。
- *                          两者都算 ⇒ 每笔改动被计两次 ⇒ 阈值 3 实际在 ~1.5 笔时就触发，
- *                          计数闸（第一性原理触发器）会退化成狼来了。
- *   closed 且不带 closes → 算：历史迁移来的"已完成的改动"记录，没有配对的 open 事件。
+ * 判据（**明写、可核**）——「补丁」= **一笔真的落地了改动的记录**。三类不算：
+ *
+ *   ① open                → **算**：一次改动意图（意图本身就是"要动这里"的信号）。
+ *   ② closed 且带 closes   → **不算**：它只是那笔意图的收口回执（同一笔改动的第二个事件）。
+ *                            两者都算 ⇒ 每笔改动被计两次 ⇒ 阈值 3 实际在 ~1.5 笔时就触发，
+ *                            计数闸（第一性原理触发器）会退化成狼来了。
+ *   ③ closed 且不带 closes → 载有 outcome，按 outcome 判：
+ *        · outcome.evidence === 'archived' → **不算**：显式归档，**本次不施工**
+ *          （core/commit.js:184 archiveIntent 自述"唯一绕过证据的出口"）。
+ *          计它 = 把"没干"记成"干了一次"，正是 0.10.1 修掉的"狼来了"同型退化。
+ *        · outcome.status === 'aborted'    → **不算**：迁移期登记的**已中止**记录，
+ *          从未落地（治理根实测 #45/#76/#77）。
+ *        · 其余（含 evidence='changed'、'migrated'+'done'） → **算**：历史迁移来的
+ *          "已完成的改动"记录没有配对的 open 事件，本类必须照算。
+ *
+ * ⚠ 刻意**不**引入「outcome 有 changed 但只动了非代码面 ⇒ 不算」这一档：实测它**不可判**。
+ *   判它要拿 outcome 的触面表当"这次改了什么"的完整清单，而那张表是**残缺的**：
+ *   scope 声明用子项目相对路径时（治理根实测 ACT-289/295：`src/panel-eval.ts` 实际在
+ *   `shoucang/src/panel-eval.ts`），解析不出的文件以 `{exists:false}` 恒不变 ⇒ 触面表里
+ *   只剩那个 doc，**看起来"只动了文档"，实际代码文件也可能改了**。实测 outcome 触面条目
+ *   288 条里 48 条（17%）按治理根治不到 —— 用一张 17% 条目不可达的表做判据，会把真代码改动
+ *   静默判成"非补丁"（一刀切清零）。故只做 ① ② 两档：**宁可漏报，不可误报**（F3）。
  */
 function isPatchRecord(c) {
   if (c.phase === 'open') return true
-  return c.phase === 'closed' && !c.closes
+  if (c.phase !== 'closed' || c.closes) return false
+  const o = c.outcome
+  if (o && o.evidence === 'archived') return false
+  if (o && o.status === 'aborted') return false
+  return true
 }
 
 /** 锚点补丁计数（计数闸数据源）。缓存与非缓存路径共用同一实现。 */
@@ -402,24 +431,137 @@ function staleOf(rootPath, nodes) {
   return stale
 }
 
-/** 磁盘实况 · 缺口：磁盘上有、登记里没有（被登记 glob 覆盖的不算 —— glob 本来就代表一批文件）。 */
-function unregisteredOf(nodes, fileOwners, diskFiles) {
-  const anchoredGlobs = new Set()
+/**
+ * 磁盘文件的分桶 —— **唯一实现**（buildModel 与 buildModelFromPlain 共用，见 I1）。
+ *
+ * 谓词两个、顺序固定（同磁盘必同结果，确定性）：
+ *   ① 该文件的 key 在 `fileOwners` 里   → hit（已登记精确命中）
+ *   ② 被某个**活节点**登记的 glob 覆盖     → skipped（显式跳过：glob 本来就代表一批文件）
+ *   ③ 其余                               → unregistered（缺口）
+ *
+ * ⚠ 为什么必须**一次分桶、三桶同源**：旧实现只算 ③，而读数把「登记**条目**数」与「磁盘**文件**数」
+ *   并列成一行（`登记文件 156 · 未登记 3460`）⇒ 两个**分母不同**的数被当成一份账去减。
+ *   治理根实测（2026-09-25）：156 + 3460 = 3607 > 磁盘 3605，差 **-2**，
+ *   而"这 2 是哪来的"**在任何一个出口上都不存在** —— 正是本仓最忌的「失败不可观测」。
+ *   真因：`feature:rt-budget-mute` 登记了 2 个磁盘上不存在的落点（src/budget.ts / src/tools.ts），
+ *   它们进了 fileOwners（登记侧分子）却永远进不了磁盘侧分母 ⇒ 登记侧比磁盘侧多算 2。
+ *   治本不是调数字（那是发明口径凑绿），而是**把两侧口径在同一处显式对齐**：
+ *   磁盘侧三桶自证可加和，登记侧条目另立一条恒等式，并点名两侧的碎片。
+ */
+function partitionDisk(nodes, fileOwners, diskFiles) {
+  const globs = []
   for (const n of nodes.values()) {
     if (n.status !== 'active') continue
-    for (const f of n.files || []) if (/[*?]/.test(f)) anchoredGlobs.add(normSlashes(f))
+    for (const f of n.files || []) {
+      if (!/[*?]/.test(f)) continue
+      const g = normSlashes(f)
+      if (globs.some((x) => x.glob === g)) continue   // 同一条 glob 被多节点登记 ⇒ 只留首见（与旧 Set 语义一致）
+      globs.push({ node: n.id, glob: g, re: globToRegExp(g) })
+    }
   }
+  const hit = []
+  const skipped = []
   const unregistered = []
   for (const f of diskFiles) {
-    if (fileOwners.has(key(f))) continue
-    if (anchoredGlobs.size) {
-      let covered = false
-      for (const g of anchoredGlobs) { if (globToRegExp(g).test(f)) { covered = true; break } }
-      if (covered) continue
-    }
+    if (fileOwners.has(key(f))) { hit.push(f); continue }
+    const cover = globs.find((g) => g.re.test(f))
+    if (cover) { skipped.push({ file: f, node: cover.node, glob: cover.glob }); continue }
     unregistered.push(f)
   }
-  return unregistered
+  return { hit, skipped, unregistered }
+}
+
+/**
+ * 走盘 = **分母的采集口**。截断必须显式（本仓「无静默截断」纪律 + ARCHITECTURE §2②）。
+ *
+ * 为什么要多走一个「上限+1」才能判截断：`walkFiles` 的返回是 `string[]`，**不携带**截断标志
+ * ⇒ "是否被截断"在调用侧不可判 —— 走满 5000 与恰好 3605 两种情形返回值长得一模一样。
+ * 这里用一次 `max = 上限 + 1` 的走盘把它变成**可确定断言**：返回数 > 上限 ⟺ 真的被截断
+ * （`walkFiles` 一凑够 max 就停，故多出来的那一个只能是"还有更多"）。
+ *
+ * 代价 = **零额外走盘**：那一次走盘同时充当正式清单，只是顺带带回"还有更多"的证据；
+ * 作为证据多出来的那一项在交给模型前**丢弃并记账**（`counted` = 上限），故读数不会比生产上限多算一个文件。
+ *
+ * ⚠ 截断时 `unregistered` 是**下界不是总数**：没走到的文件当然也不会出现在缺口清单里。
+ *   这正是它必须显式标记的原因 —— 静默截断会让"缺口数"看起来是个完整的数。
+ */
+function walkDisk(rootPath) {
+  const probe = walkFiles(rootPath, { max: WALK_MAX + 1 })
+  const truncated = probe.length > WALK_MAX
+  const files = truncated ? probe.slice(0, WALK_MAX) : probe
+  return { files, max: WALK_MAX, counted: files.length, truncated, atLeast: probe.length }
+}
+
+/**
+ * 分母对账（纯派生 · 可确定断言）：把"这张账到底有几个分母"一次说清。
+ *
+ * 两条恒等式**各自**成立，且分属不同分母（**并列 ≠ 可相减**，这是本项修复的核心纪律）：
+ *   磁盘侧（分母 = walkFiles 实得文件数）：命中 + 未登记 + 显式跳过 ≡ 磁盘文件
+ *   登记侧（分母 = 登记**条目**数）      ：精确条目 ≡ 唯一键 + 重复条目；唯一键 ≡ 在盘 + 不在盘
+ * 任一侧不平 ⇒ **逐个列出**碎片归属（不吞、不四舍五入成"约"）。
+ *
+ * `misbucketed` 是第三个**跨口径**检查，刻意只报不改：按 fileOwners 口径（仅活 feature 的落点）
+ * 判"未登记"，若某文件其实登记在**非 feature 层**，它就会被算进"未登记"——那是口径不一致，
+ * 不是缺口。当前治理根为 0；非 0 必须**列名**而不是静默改判（改判 = 悄悄换分母，本次要修的病）。
+ */
+function denominatorOf(nodes, fileOwners, diskFiles, walk, part) {
+  // ---- 登记侧：只对齐 coverage() 用的那条口径（活 feature 的落点条目） ----
+  const exact = new Map()          // key → { file, owners: [nodeId] }
+  let entries = 0
+  let globEntries = 0
+  for (const n of nodes.values()) {
+    if (n.status !== 'active' || n.layer !== 'feature') continue
+    for (const f of n.files || []) {
+      entries++
+      if (/[*?]/.test(f)) { globEntries++; continue }
+      const k = key(f)
+      if (!exact.has(k)) exact.set(k, { file: normSlashes(f), owners: [] })
+      const e = exact.get(k)
+      if (!e.owners.includes(n.id)) e.owners.push(n.id)
+    }
+  }
+  const diskKeys = new Set(diskFiles.map(key))
+  const offDiskFiles = []
+  let onDisk = 0
+  const duplicateFiles = []
+  for (const [k, e] of exact) {
+    if (diskKeys.has(k)) onDisk++
+    else offDiskFiles.push(e.file)
+    if (e.owners.length > 1) duplicateFiles.push({ file: e.file, owners: [...e.owners].sort() })
+  }
+  // ---- 跨口径检查：已登记在**非 feature 层**、却按 fileOwners 口径落进"未登记"的文件 ----
+  const registeredAnywhere = new Set()
+  for (const n of nodes.values()) {
+    if (n.status !== 'active') continue
+    for (const f of n.files || []) if (!/[*?]/.test(f)) registeredAnywhere.add(key(f))
+  }
+  const misbucketed = part.unregistered.filter((f) => registeredAnywhere.has(key(f))).map(normSlashes).sort()
+
+  const residual = diskFiles.length - part.hit.length - part.unregistered.length - part.skipped.length
+  return {
+    walk: { max: walk.max, counted: walk.counted, truncated: walk.truncated, atLeast: walk.atLeast },
+    disk: {
+      files: diskFiles.length,
+      hit: part.hit.length,
+      unregistered: part.unregistered.length,
+      skipped: part.skipped.length,
+      balanced: residual === 0,
+      residual
+    },
+    registered: {
+      entries,
+      globEntries,
+      exactEntries: entries - globEntries,
+      uniqueKeys: exact.size,
+      duplicateEntries: (entries - globEntries) - exact.size,
+      onDisk,
+      offDisk: offDiskFiles.length,
+      offDiskFiles: offDiskFiles.sort(),
+      duplicateFiles: duplicateFiles.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0)),
+      misbucketed
+    },
+    skippedByGlob: part.skipped.map((s) => ({ file: normSlashes(s.file), node: s.node, glob: s.glob }))
+  }
 }
 
 /**
@@ -451,8 +593,13 @@ export function buildModel(rootPath, { now = Date.now(), useScanCache = false } 
   const stale = staleOf(rootPath, base.nodes)
   // （projectDirs 同时充当依赖图扫描边界 —— 原来算了却没人用，是死代码）
   const projectDirs = projectDirsOf(base.nodes)
-  const diskFiles = walkFiles(rootPath)
-  const unregistered = unregisteredOf(base.nodes, fileOwners, diskFiles)
+  const walk = walkDisk(rootPath)
+  const diskFiles = walk.files
+  // 磁盘文件**一次分桶、三桶同源**（命中 / 未登记 / 显式跳过）—— 见 partitionDisk 的注释：
+  // 两侧口径不同是既成事实，治本是**对齐并点名**，不是调数字凑一个等式。
+  const part = partitionDisk(base.nodes, fileOwners, diskFiles)
+  const unregistered = part.unregistered
+  const denominator = denominatorOf(base.nodes, fileOwners, diskFiles, walk, part)
 
   // 磁盘实况：依赖图（谁引用谁）—— ARCHITECTURE §1 / §3。复用上面走出的 diskFiles，不重复走盘。
   const edges = buildEdges(rootPath, diskFiles, fileOwners, projectDirs, { useScanCache })
@@ -471,6 +618,8 @@ export function buildModel(rootPath, { now = Date.now(), useScanCache = false } 
     fileOwners,
     stale,
     unregistered,
+    denominator,
+    skippedByGlob: denominator.skippedByGlob,
     edges,
     patchPressure,
     log: [...base.log, ...corrupt.map((c) => ({ seq: null, problem: `corrupt event line ${c.line}: ${c.reason}` }))],
@@ -592,18 +741,32 @@ export function filePressure(model, { threshold = REPEAT_PATCH_THRESHOLD } = {})
   return { files, threshold, over: files.filter((f) => f.over) }
 }
 
-/** 覆盖率：登记功能 / 全部磁盘文件。 */
+/**
+ * 覆盖率：登记功能 / 全部磁盘文件。
+ *
+ * ⚠ **两个数不是同一张账**（本仓实测过的读错方式，见下面 registeredEntries 的注释）：
+ *   · `registeredEntries` = 登记**条目**数（分母 = 登记面）
+ *   · `unregisteredFiles` = 磁盘**文件**数（分母 = 磁盘面）
+ * 旧读数把两者并排成一行，看起来像"登记 156 / 未登记 3460"可以相加 —— 实测相加 3607 > 磁盘 3605。
+ * 故这里**同时**给出可加和的那一组（`disk.breakdown`，三桶同源）与差集归属，让"对不平"当场可见。
+ *
+ * 保留 `registeredFiles` 这个名字：它是**已发布的读数口径**（render/renderTree/host 三个出口在用），
+ * 改名属于语义变更，不在本次范围内。此处只补 `registeredEntries` 作为它的别名并在注释里挑明口径。
+ */
 export function coverage(model) {
   const features = [...model.nodes.values()].filter((n) => n.layer === 'feature' && n.status === 'active')
   const registeredFiles = features.reduce((a, n) => a + (n.files?.length || 0), 0)
+  const den = model.denominator || null
   return {
     projects: [...model.nodes.values()].filter((n) => n.layer === 'project' && n.status === 'active').length,
     modules: [...model.nodes.values()].filter((n) => n.layer === 'module' && n.status === 'active').length,
     features: features.length,
     artifacts: [...model.nodes.values()].filter((n) => n.layer === 'artifact' && n.status === 'active').length,
     registeredFiles,
+    registeredEntries: registeredFiles,
     unregisteredFiles: model.unregistered.length,
-    retired: [...model.nodes.values()].filter((n) => n.status === 'retired').length
+    retired: [...model.nodes.values()].filter((n) => n.status === 'retired').length,
+    ...(den ? { walk: den.walk, disk: den.disk, registered: den.registered } : {})
   }
 }
 
@@ -945,15 +1108,19 @@ function buildModelFromPlain(plain, rootPath) {
   // 磁盘实况（STALE / 缺口）**跟依赖图同一理由重算**：事件流的戳证明不了磁盘，
   // 而这两项恰恰是纯磁盘判断 —— 直接信缓存就会出现"落点早没了、缺口早有了，模型还说一致"
   // （F4/F3 的反面：假的一致比已知的漂移更坏）。本条与上面依赖图的实现**必须是同一份**（staleOf/unregisteredOf）。
-  const diskFiles = walkFiles(rootPath)
+  const walk = walkDisk(rootPath)
+  const diskFiles = walk.files
   const stale = staleOf(rootPath, nodes)
-  const unregistered = unregisteredOf(nodes, fileOwners, diskFiles)
+  // 与 buildModel **同一实现**（I1：同一份真相不允许两个答案）—— 否则冷热两条路径会给出不同的分桶。
+  const part = partitionDisk(nodes, fileOwners, diskFiles)
+  const unregistered = part.unregistered
+  const denominator = denominatorOf(nodes, fileOwners, diskFiles, walk, part)
   return {
     rootPath,
     builtAt: plain.builtAt,
     nodes, vector: plain.vector || {}, decisions: folded.decisions, commits: folded.commits,
     openCommits, fileOwners,
-    stale, unregistered,
+    stale, unregistered, denominator, skippedByGlob: denominator.skippedByGlob,
     // 依赖图**不缓存、每次重算**：它是磁盘派生，事件流的戳证明不了磁盘 import 还新鲜。
     // 两条路径走同一实现 ⇒ 结果必然一致（I1：同一份真相不允许两个答案）。
     // （P0-1）重算走 `scanImportsCached`：它的指纹是**磁盘**（清单+size+mtime），不是事件流戳，

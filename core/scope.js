@@ -74,6 +74,49 @@ export function expandGlob(rootPath, pattern) {
 }
 
 /**
+ * 仓内文件索引：`key(路径) → 磁盘上的真实拼写`。**从模型取，不额外扫盘。**
+ *
+ * 为什么从模型取：磁盘实况（走过的文件清单 + 登记的落点）**已经在模型里**——
+ * `unregistered` = 磁盘上有、登记里没有；节点 `files` = 登记落点（保留事件流里的真实拼写）。
+ * 再走一次盘等于同一份事实算两遍（治理根实测 walkFiles 51ms/次，而 resolveScope 每笔在途都要调）。
+ *
+ * 三条取舍：
+ *   ① 登记落点走**节点**而不是 `fileOwners` 的键：后者被 `key()` 折叠过，会丢大小写；
+ *   ② glob 落点不进索引 —— 它本身不是文件路径（与 `staleOf` 同一判据）；
+ *   ③ `stale`（登记了但磁盘上没有）**减掉** —— 索引要回答的是"磁盘上真有什么"，
+ *      留着不存在的登记路径只会制造假歧义（歧义会压住本可解析的落点）。
+ *
+ * 模型不含磁盘实况时（`foldOnly` 路径）退回 `walkFiles`：宁可慢，也不许静默给出空索引
+ * —— 空索引会把所有本仓相对登记判成 does not exist，那正是本函数要修的形态。
+ */
+function diskIndexFor(rootPath, model) {
+  const idx = new Map()
+  const add = (p, real) => { const k = key(p); if (k && !idx.has(k)) idx.set(k, normSlashes(real)) }
+  const hasDiskView = model && (model.fileOwners || model.unregistered)
+  if (hasDiskView) {
+    for (const n of model.nodes?.values() || []) {
+      if (n.status !== 'active') continue
+      for (const f of n.files || []) { if (!isGlob(f)) add(f, f) }
+    }
+    for (const f of model.unregistered || []) add(f, f)
+    // ③ 减掉登记了但磁盘上没有的：索引 = 磁盘上真有什么
+    for (const s of model.stale || []) idx.delete(key(s.file))
+    return idx
+  }
+  for (const f of walkFiles(rootPath)) add(f, f)
+  return idx
+}
+
+/** 仓内**同后缀**命中集（确定性排序）：`src/x.ts` 命中 `shoucang/src/x.ts`。 */
+function suffixHits(index, rel) {
+  const t = key(rel)
+  if (!t) return []
+  const hits = []
+  for (const [k, real] of index) { if (k === t || k.endsWith('/' + t)) hits.push(real) }
+  return hits.sort()
+}
+
+/**
  * scope → 落点文件集合。
  *
  * @param {object} model 折叠后的架构模型
@@ -103,8 +146,20 @@ export function resolveScope(rootPath, model, scope = {}) {
     }
   }
 
-  // ② 字面量路径（一律按被治理 root 解析；越界拒绝）
+  // ② 字面量路径（越界拒绝）—— **解析优先级是确定的**，绝不瞎选：
+  //    ① 治理根相对命中 ⇒ 取根（既有语义，最高优先，不许被项目命中改写）；
+  //    ② 根下没有、仓内恰有**唯一一份**同后缀文件 ⇒ 取它（本仓相对登记由此可达）；
+  //    ③ 多份命中（歧义）⇒ 明说 ambiguous，**一个候选都不选**，原始登记仍留在 scope；
+  //    ④ 零命中 ⇒ 仍登记（供将来 appeared 收口），显式报 does not exist。
+  //
+  // ⚠ 为什么要 ②：按**本仓相对**登记的落点（如 `src/x.ts`，真实在 `shoucang/src/x.ts`）
+  //   曾恒解析成 `<root>/src/x.ts` ⇒ 恒不存在 ⇒ 证据恒 {exists:false} ⇒ diffEvidence 判 unchanged
+  //   ⇒ 收口永不发生（僵尸在途）。只报"不存在"时它看起来像文件被删了，实为**解析错位**。
   const missing = []
+  // 索引**惰性构建**：只有真的走到 ②/③ 才需要它。全部字面量都根相对命中时零额外开销
+  // ——治理根实测构建一次 6.2ms，而 reconcile 每笔在途都要调 resolveScope。
+  let index = null
+  const indexOf = () => { if (!index) index = diskIndexFor(rootPath, model); return index }
   for (const raw of scope.files || []) {
     const s = String(raw).trim()
     if (!s) continue
@@ -118,7 +173,15 @@ export function resolveScope(rootPath, model, scope = {}) {
     const rel = normSlashes(relToRoot(rootPath, s))
     files.add(rel)
     fromLiteral.push(rel)
-    if (!exists(join(rootPath, rel))) missing.push(`${rel} (does not exist)`)
+    // ① 治理根相对优先
+    if (exists(join(rootPath, rel))) continue
+    const hits = suffixHits(indexOf(), rel)
+    // ③ 歧义：绝不瞎选（不把任何候选写进 files —— 写了就是替调用方猜）
+    if (hits.length > 1) { missing.push(`${rel} (ambiguous: ${hits.length} candidates — ${hits.slice(0, 5).join(', ')}${hits.length > 5 ? `, +${hits.length - 5} more` : ''})`); continue }
+    // ② 唯一命中 ⇒ 记成真实路径（files 里已登记的是原始写法，故这里补一条真实路径）
+    if (hits.length === 1) { files.add(hits[0]); fromLiteral.push(hits[0]); continue }
+    // ④ 零命中：仍登记（它会以 appeared 被收口），但显式报出
+    missing.push(`${rel} (does not exist)`)
   }
 
   return {
@@ -198,6 +261,7 @@ export function diffEvidence(before = {}, after = {}) {
   const appeared = []
   const unchanged = []
   const unreadable = []
+  const rerouted = []
   const noteUnreadable = (rel, reason) => { unreadable.push({ file: rel, reason: reason || 'unreadable' }) }
   for (const [rel, b] of Object.entries(before)) {
     const a = after[rel]
@@ -218,8 +282,59 @@ export function diffEvidence(before = {}, after = {}) {
     else if (after[rel] && unreadableReason(after[rel])) noteUnreadable(rel, unreadableReason(after[rel]))
     else appeared.push(rel)
   }
+  // ---- 解析漂移（rerouted）：**同一字面量的解析归属变了**，不是文件变了 ----
+  //
+  // 为什么必须单列（2026-09-25 独立复核实证，两种形态都会「造假事实」）：
+  //   ① 登记一个**尚不存在**的字面量（合法：新文件本该以 appeared 被收口），随后别处出现
+  //      一个**同名但毫不相干**的文件 ⇒ 解析命中它 ⇒ 旧逻辑记 appeared:'<别处的文件>'
+  //      ⇒ 收口该笔并在 append-only 事件流里写下**因果错误的事实**；
+  //   ② 先唯一命中、随后出现同名 ⇒ 决议退化为歧义 ⇒ 真实路径从 files 里消失
+  //      ⇒ 旧逻辑记 vanished:'<真实路径>' ⇒ **没有任何文件变化却判 changed**。
+  //
+  // 判据：一条在途意图的证据面，只能因「它**自己解析出的那些实体**」的存在性/内容变化而变化；
+  //       「文本 → 实体的归属关系」变了 ⇒ 判据**不可判**，与「读不到」同族，不得当成 changed。
+  //
+  // 归属规则（与 resolveScope 的优先级链同源）：一个证据键 K 归属于**首个**形如
+  //   K 自身、或 `<前缀>/K` 且该前缀不含 '/' 的字面量。前缀带 '/' 的路径**不吸收**内容键，
+  //   因为两侧都出现的那个内容键（如 core/scope.js）本身也是字面量，归它自己。
+  const keysBefore = Object.keys(before)
+  const keysAfter = Object.keys(after)
+  const ownerOf = (k, keys) => {
+    const cands = keys.filter((l) => l === k || k.endsWith('/' + l))
+    if (!cands.length) return null
+    cands.sort((x, y) => x.split('/').length - y.split('/').length || (x < y ? -1 : x > y ? 1 : 0))
+    return (keys.includes(cands[0]) && cands[0] === k) ? cands[0] : (cands.find((c) => c !== k && !c.includes('/')) || cands[0])
+  }
+  const groupOf = (keys) => {
+    const g = new Map()
+    for (const k of keys) {
+      const o = ownerOf(k, keys)
+      if (o === null) continue
+      if (!g.has(o)) g.set(o, new Set())
+      g.get(o).add(k)
+    }
+    return g
+  }
+  const gBefore = groupOf(keysBefore)
+  const gAfter = groupOf(keysAfter)
+  for (const [literal, setB] of gBefore) {
+    const setA = gAfter.get(literal)
+    if (!setA) continue
+    const sb = [...setB].sort().join('|')
+    const sa = [...setA].sort().join('|')
+    if (sb === sa) continue                    // 归属未变 ⇒ 与漂移无关
+    rerouted.push({ literal, before: [...setB].sort(), after: [...setA].sort() })
+  }
+  // 漂移项从"变化"里摘掉：归属变了不是文件变了
+  for (const { before: bs, after: as } of rerouted) {
+    for (const arr of [modified, vanished, appeared]) {
+      for (const k of [...bs, ...as]) {
+        const i = arr.indexOf(k); if (i >= 0) arr.splice(i, 1)
+      }
+    }
+  }
   const changed = modified.length > 0 || vanished.length > 0 || appeared.length > 0
-  return { changed, modified, vanished, appeared, unchanged, unreadable }
+  return { changed, modified, vanished, appeared, unchanged, unreadable, rerouted }
 }
 
 /**

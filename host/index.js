@@ -488,7 +488,14 @@ function snapshotOf(model, rootPath, rec, mode, target) {
   const base = { mode, target: target || null, events: model.eventCount }
   switch (mode) {
     case 'coverage': return { ...base, coverage: coverage(model), staleCount: model.stale.length };
-    case 'gaps': return { ...base, unregistered: model.unregistered, stale: model.stale };
+    // ⚠ 三桶自证必须能**整份取回**：renderGaps 的「显式跳过(glob)」桶原先只挂在模型上，
+    //   host 的 json 投影里一个键都没有 ⇒ 那条 "…另 N 组 / M 个文件（全量 = nav_graph …）" 的取回路径
+    //   取回 **0 条**。这是本仓明令的失效形态：**训练人相信一个取不到的路径**。
+    //   归位刻意放在 **gaps 自己的 json**（"json 与所读 mode 一一对应"）：读数在 mode=gaps 里产生，
+    //   就由 mode=gaps 的 json 取回。**不放 healthSnapshot** —— 那是 switch 的默认分支，
+    //   塞进 skip 桶等于让每个未列出的 mode 的 format=json（health/impact/map…）都背上它，
+    //   那正是"把 json 变最肥路径"。skip 桶可能上千条（一条 src/** 就能覆盖全仓）。
+    case 'gaps': return { ...base, unregistered: model.unregistered, stale: model.stale, skippedByGlob: model.skippedByGlob || [] };
     case 'adrs': return { ...base, total: model.decisions.length, decisions: model.decisions.map((d) => ({ id: d.id, anchor: d.anchor, at: d.at, reason: d.reason, decision: d.decision, impact: d.impact || '' })) };
     case 'docs': return { ...base, artifacts: [...model.nodes.values()].filter((n) => n.layer === 'artifact' && n.status === 'active').map((a) => ({ id: a.id, name: a.name, path: a.path, when: a.when || '', tags: a.tags || [] })) };
     case 'impact': {

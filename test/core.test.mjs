@@ -223,6 +223,48 @@ test('不在磁盘上的落点记 exists:false，不算 vanished（也不清空 
   assert.equal(diffEvidence(e1, e2).changed, false, '本来就不存在的文件不该每次都被报成漂移')
 })
 
+// ============ 解析漂移（rerouted）——「归属变了 ≠ 文件变了」 ============
+//
+// 判例（2026-09-25 独立复核实证）：resolveScope 有了「本仓相对」后缀兜底后，**归属关系**会漂：
+//   ① 登记一个尚不存在的字面量（新文件本该以 appeared 被收口），随后别处出现同名无关文件
+//      ⇒ 旧逻辑记 appeared:'<别处的文件>' ⇒ 收口该笔并在 append-only 事件流写下因果错误的事实；
+//   ② 先唯一命中、随后出现同名 ⇒ 真路径从 files 里消失 ⇒ 旧逻辑记 vanished ⇒ 无文件变化却判 changed。
+// 判据：证据面只能因「它自己解析出的那些实体」变化而变化；归属变了 ⇒ 不可判（与「读不到」同族）。
+test('解析漂移：同一字面量的归属变了 ⇒ 不算 changed（且必须显式报出 rerouted）', async (t) => {
+  const root = tmpRoot(t)
+  mkdirSync(join(root, 'pA'), { recursive: true })
+
+  // 形态①：字面量本来未命中，随后别处出现同名 ⇒ 归属漂移
+  const before1 = { 'src/panel.js': { exists: false } }
+  mkdirSync(join(root, 'pA', 'src'), { recursive: true })
+  put(root, 'pA/src/panel.js', 'unrelated')
+  const rootModel = buildModel(root)
+  const files1 = resolveScope(root, rootModel, { files: ['src/panel.js'] }).files
+  const after1 = evidenceOf(root, files1)
+  assert.ok(files1.includes('pA/src/panel.js'), '夹具前提：后缀兜底确实命中了别处的同名文件')
+  const d1 = diffEvidence(before1, after1)
+  assert.equal(d1.changed, false, '归属漂移不得判 changed（否则收口会写入因果错误的事实）')
+  assert.equal(d1.appeared.length, 0, '不得把无关同名文件记成 appeared')
+  assert.ok(d1.rerouted.length > 0, '漂移必须显式报出，不许静默吞掉')
+
+  // 形态②：先唯一命中、随后出现同名 ⇒ 决议退化为歧义 ⇒ 真实路径**从 files 里整个消失**
+  // （这是实测形态：files 少了那条，而不是它变成 exists:false）
+  const before2 = { 'x.js': { exists: false }, 'pA/x.js': { exists: true, size: 3, sha1: 'aaa' } }
+  const after2 = { 'x.js': { exists: false } }
+  const d2 = diffEvidence(before2, after2)
+  assert.equal(d2.changed, false, '归属退化不得判 vanished（文件根本没动）')
+  assert.equal(d2.vanished.length, 0)
+  assert.ok(d2.rerouted.length > 0, '归属退化同样要显式报出')
+
+  // 反向：真消失**仍要**能被发现（防一刀切把真改动也卡住）
+  const d3 = diffEvidence({ 'a.js': { exists: true, size: 1, sha1: 'x' } }, { 'a.js': { exists: false } })
+  assert.equal(d3.changed, true, '真消失必须仍判 changed')
+
+  // 反向：真新增（无同名归属干扰）仍要能被发现
+  const d4 = diffEvidence({ 'new.js': { exists: false } }, { 'new.js': { exists: true, size: 2, sha1: 'y' } })
+  assert.equal(d4.changed, true, '真新增必须仍判 changed')
+})
+
 // ============ 七闸 ============
 
 test('闸门1 锚点闸：缺锚点 / 假锚点 → 拒；真节点 → 过', async (t) => {
@@ -282,6 +324,64 @@ test('计数闸按**归一键**统计：功能码与节点 id 是同一个锚点
   const m = buildModel(root)
   assert.equal(pressureFor(m, 'PN-F01').sinceDecisionCount, 2)
   assert.equal(pressureFor(m, 'feature:pn-f01').sinceDecisionCount, 2)
+})
+
+// 计数闸的**数据源判据**：什么算「一次补丁」？
+// 反面教材写在本仓契约里（AGENTS.md §2 · 0.10.1）：closed 收口回执曾被当成补丁数 ⇒ 每笔改动计两次，
+// 阈值 3 实际在 ~1.5 笔时就触发（第一性原理触发器退化成狼来了）。故三档逐档钉住，
+// 且每档都带**反向**：判据若被改成"一刀切不算"，真改动会被静默吃掉 —— 那与误报同害。
+test('计数闸只数真的落地了的改动（三档）：收口回执 / 归档 / 已中止不算，真改动照算', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+
+  // 档① open ⇒ 算（改动意图本身就是"要动这里"的信号）
+  await appendEvents(root, [{ kind: 'commit', phase: 'open', anchor: 'PN-F01', task: '意图-1', arch: 'ok', scope: { files: [] } }])
+  let m = buildModel(root)
+  assert.equal(pressureFor(m, 'PN-F01').count, 1, '档① open 算作一次')
+
+  // 档② closed **带** closes ⇒ 不算：折叠把收口回执就地标 closed 且 closes === 它自己的 seq，
+  // 它是同一笔改动的第二个事件（再算一次 = 每笔改动计两次）
+  await appendEvents(root, [{
+    kind: 'commit', phase: 'closed', closes: 5, anchor: 'PN-F01', task: '收口回执',
+    scope: { files: [] }, outcome: { evidence: 'changed', modified: ['src/a.js'], vanished: [], appeared: [] }
+  }])
+  m = buildModel(root)
+  assert.equal(m.commits[0].closes, 5, '夹具语义：收口回执把**它自己那条**就地标 closed+closes')
+  assert.equal(pressureFor(m, 'PN-F01').count, 1, '档② 收口回执不算：同一笔改动不得被计两次')
+
+  // 档③ closed **不带** closes（= 回执那条）时按 outcome 判：归档 / 已中止 ⇒ 不算
+  await appendEvents(root, [
+    { kind: 'commit', phase: 'closed', anchor: 'PN-F01', task: '显式归档', scope: { files: [] }, outcome: { evidence: 'archived', reason: '方向已废' } },
+    { kind: 'commit', phase: 'closed', anchor: 'PN-F01', task: '迁移期已中止', scope: { files: [] }, outcome: { evidence: 'migrated', status: 'aborted', drift: null } }
+  ])
+  m = buildModel(root)
+  assert.equal(pressureFor(m, 'PN-F01').count, 1, '档③ 显式归档（零施工）与 aborted（从未落地）都不算')
+
+  // 档③ 的**反向**：迁移来的"已完成改动"没有配对的 open 事件，必须照算 ——
+  // 一刀切清零会把真改动静默吃掉（与狼来了同害，且更难发现）
+  await appendEvents(root, [
+    { kind: 'commit', phase: 'closed', anchor: 'PN-F01', task: '迁移-已完成', scope: { files: [] }, outcome: { evidence: 'migrated', status: 'done', drift: null } },
+    { kind: 'commit', phase: 'closed', anchor: 'PN-F01', task: '真改动', scope: { files: [] }, outcome: { evidence: 'changed', modified: ['src/a.js'], vanished: [], appeared: [] } },
+    { kind: 'commit', phase: 'closed', anchor: 'PN-F01', task: '历史记录无 outcome', scope: { files: [] } }
+  ])
+  m = buildModel(root)
+  assert.equal(pressureFor(m, 'PN-F01').count, 4, '档③ migrated+done / changed / 无 outcome 三种真改动必须照算')
+  assert.equal(countGate(m, 'PN-F01').severity, 'reject', '4 ≥ 阈值 3：这些真改动确实把计数闸喂到了 reject')
+
+  // 档② 的反向收尾：回执里带 archived 也不得翻转它自己的判定（带 closes 的回执恒不算，不看 outcome）
+  await appendEvents(root, [{
+    kind: 'commit', phase: 'closed', closes: 5, anchor: 'PN-F01', task: '收口回执(归档)',
+    scope: { files: [] }, outcome: { evidence: 'archived', reason: '空 scope 误建' }
+  }])
+  // ⚠ 形状校验：若折叠把第二条回执当"重复收口"忽略，上面的 count 断言会因**夹具空转**而恒真
+  m = buildModel(root)
+  assert.deepEqual(m.commits.map((c) => c.seq), [5, 6, 7, 8, 9, 10, 11, 12],
+    '夹具形状必须成立：8 条 commit 事件逐条成为 8 条折叠记录（含第二条回执，不得被折叠吞掉）')
+  assert.equal(m.commits.at(-1).closes, undefined, '回执那条自身的 closes 是 undefined（self-closes 标在被收口的那条上）')
+  assert.equal(m.commits.at(-1).outcome.evidence, 'archived', '第二条回执带的是 archived outcome')
+  assert.equal(pressureFor(m, 'PN-F01').count, 4, '档② 带 closes 的回执恒不算（其 outcome 是 archived 也不改变这一点）')
+  // 对照：计数是**按记录**算出来的，不是某个非零常数
+  assert.equal(pressureFor(m, 'core').count, 0, '对照：无任何补丁记录的锚点必须是 0')
 })
 
 test('闸门2 范围闸：撞 notDoing → 拒；与在途 scope 重叠 → 告警', async (t) => {

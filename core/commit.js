@@ -33,6 +33,11 @@ function inflightFile(rootPath, seq) {
   return join(paths.inflightDir(rootPath), `${seq}.json`)
 }
 
+// ⚠ 这两处**不是**"第二个真相"：失败原因由**返回值**就地交给调用方（回执），
+//   既不落盘、也不进模型 —— 只把原本"被吞掉"的那条消息挪到一个可读出口。
+//   为什么不能只打日志：日志不进 agent 的上下文，等于没报（本仓「静默失效」同族）。
+
+/** 写一笔在途缓存。@returns {string|null} 失败原因（null = 成功）—— 失败必须能传出去，不许无声。 */
 function writeInflight(rootPath, commit) {
   try {
     mkdirSync(paths.inflightDir(rootPath), { recursive: true })
@@ -40,11 +45,24 @@ function writeInflight(rootPath, commit) {
       id: commit.id, seq: commit.seq, at: commit.at, anchor: commit.anchor,
       task: commit.task, scope: commit.scope, files: commit.files, evidence: commit.evidence
     }, null, 2))
-  } catch { /* 在途状态是缓存：丢了也能从事件流复算（I3） */ }
+    return null
+  } catch (e) {
+    // 在途状态是缓存：丢了也能从事件流复算（I3）⇒ **不抛**，收口判据不受影响。
+    // 但"写失败了"这件事本身必须可读 —— 交给回执。
+    return String(e?.message || e)
+  }
 }
 
+/** 清一笔在途缓存。@returns {string|null} 失败原因（null = 成功或本就无该文件）。 */
 function clearInflight(rootPath, seq) {
-  try { const f = inflightFile(rootPath, seq); if (existsSync(f)) unlinkSync(f) } catch { /* 同上 */ }
+  try {
+    const f = inflightFile(rootPath, seq)
+    if (existsSync(f)) unlinkSync(f)
+    return null
+  } catch (e) {
+    // 同上：清不掉不改变"已收口"这个事实（那写在事件流里），但残骸必须可见。
+    return String(e?.message || e)
+  }
 }
 
 /** 在途意图的 scope 声明（写入事件，收口时按它重解析）。 */
@@ -80,7 +98,7 @@ export function filesForCommit(rootPath, model, c) {
  */
 export async function reconcile(rootPath, { now = Date.now(), actor = null } = {}) {
   const model = loadModel(rootPath, { now })
-  if (!model.openCommits.length) return { closed: [], stillOpen: [] }
+  if (!model.openCommits.length) return { closed: [], stillOpen: [], faulted: [] }
 
   const closed = []
   const stillOpen = []
@@ -93,6 +111,14 @@ export async function reconcile(rootPath, { now = Date.now(), actor = null } = {
     // 收口的两种"不收"必须可区分：「读不到」不是「没变」——
     // 它意味着**这条证据不可判**，把它并按证据收口就是拿读失败当"改过了"（静默收口）。
     // 记仍 open 且把原因带出去，让调用方看得见"为什么没收"。
+    // 解析漂移 ⇒ 判据**不可判**：这不是"文件变了"，是"文本→实体的对应关系变了"。
+    // 拿它收口会在事件流写下因果错误的事实（如把无关同名文件记成 appeared）。
+    // 与「读不到」同族：宁可不收，也不许拿不稳的证据收口。取整笔不收（不选中端口径），
+    // 这样既不收口也不入库——避免恒在途却被当成"已解决"。
+    if (diff.rerouted && diff.rerouted.length) {
+      stillOpen.push({ ...c, reason: 'rerouted', rerouted: diff.rerouted, diff })
+      continue
+    }
     if (!diff.changed) {
       stillOpen.push(diff.unreadable.length
         ? { ...c, reason: 'unreadable', unreadable: diff.unreadable, diff }
@@ -101,12 +127,15 @@ export async function reconcile(rootPath, { now = Date.now(), actor = null } = {
     }
     closed.push({ commit: c, diff })
   }
-  if (!closed.length) return { closed: [], stillOpen }
+  if (!closed.length) return { closed: [], stillOpen, faulted: [] }
 
   // 收口一律在锁内追加（避免两个会话同时收同一笔）。
   // 锁被占用不是错误：说明另一个会话正在收口，下一次调用（或它自己）会处理。
   // 把"等待别人"当成失败会让并发场景整体报错 —— 那是 v0.9.0 要根治的那类形态。
   const deferred = []
+  // 收口本身是**事件流里的事实**，与缓存清没清掉无关；但"残骸清不掉"必须能传出去
+  // （静默的后果：在途缓存永远比模型多，且没人知道为什么 —— 与 writeInflight 吞错同型）。
+  const faulted = []
   try {
     await withLock(rootPath, 'events', async () => {
       for (const { commit: c, diff } of closed) {
@@ -122,16 +151,17 @@ export async function reconcile(rootPath, { now = Date.now(), actor = null } = {
             modified: diff.modified, vanished: diff.vanished, appeared: diff.appeared
           }
         }], { now })
-        clearInflight(rootPath, c.seq)
+        const err = clearInflight(rootPath, c.seq)
+        if (err) faulted.push({ op: 'clear', id: c.id, seq: c.seq, anchor: c.anchor, error: err })
       }
     }, { timeoutMs: 15000 })
   } catch (e) {
     if (!/is held by another writer/.test(String(e.message))) throw e
     for (const { commit: c, diff } of closed) deferred.push({ ...c, diff, reason: 'lock-deferred' })
-    return { closed: [], stillOpen: [...stillOpen, ...deferred] }
+    return { closed: [], stillOpen: [...stillOpen, ...deferred], faulted }
   }
 
-  return { closed, stillOpen }
+  return { closed, stillOpen, faulted }
 }
 
 /**
@@ -173,10 +203,13 @@ export async function commitIntent(rootPath, intent, { now = Date.now(), actor =
     plan: intent.plan || '', scope, arch: intent.arch ?? null, actor,
     files: mat.files, evidence
   }], { now })
-  writeInflight(rootPath, written)
+  // 写缓存失败**不改变登记结果**（这仍是 'ok'：事实已在事件流里，I1/I3 要求如此），
+  // 但失败原因随回执带出去 —— 否则"登记好了、缓存却没有"就永远只有用户自己看得出来。
+  const fault = writeInflight(rootPath, written)
 
   return {
     status: 'ok', reconcile: rec, gates: gateReport, materialized: mat,
+    inflightFault: fault,
     commit: { id: `ACT-${written.seq}`, seq: written.seq, at: written.at }
   }
 }
@@ -194,8 +227,9 @@ export async function archiveIntent(rootPath, id, reason, { now = Date.now(), ac
     task: target.task, plan: '', scope: target.scope, arch: target.arch, actor,
     outcome: { evidence: 'archived', reason: reason || '(no reason given)' }
   }], { now })
-  clearInflight(rootPath, target.seq)
-  return { status: 'ok', archived: { id: `ACT-${target.seq}`, task: target.task } }
+  // 归档出口与收口同办：清不掉残骸必须能传出去（否则回执说"已归档"，缓存里那笔还在）。
+  const fault = clearInflight(rootPath, target.seq)
+  return { status: 'ok', inflightFault: fault, archived: { id: `ACT-${target.seq}`, task: target.task } }
 }
 
 /** 读在途意图的诊断视图（nav_graph）。 */
@@ -209,4 +243,57 @@ export function inflightView(rootPath) {
     }
   } catch { /* 诊断 best-effort */ }
   return out
+}
+
+/**
+ * **在途缓存 ⟷ 模型在途**的差集 —— 从缓存文件名（`<seq>.json`，与模型笔的 `seq` 同键空间）确定性比对。
+ *
+ * 判据只用**数集**（seq 集合），不用耗时、不读文件内容 ⇒ 可确定断言：
+ *   · `missing` = 模型说 open、缓存里没有 ⇒ 该笔的缓存丢了（写失败 / 被删）
+ *   · `extra`   = 缓存里有、模型说不在途 ⇒ 残骸（清理失败 / 幽灵条目）
+ *   · `over`/`under` = 两种方向各自的计数，供 health 一行直出
+ *
+ * ⚠ **方向**：模型 → 缓存。缓存**永远不是**第二真相（I1）——它在事件流之后，
+ * 且这里只拿它当"被检查物"，任何一侧都不能反过来定义另一侧（I3：删掉 runtime/ 零损失）。
+ * 没有 inflight 目录 = 缓存一条都没有（不是"没读到"）——模型有 open 就报 missing。
+ *
+ * ⚠ **不报** readdir 失败与解析失败：那是"读不到"，与"不一致"不同类，
+ * 混进同一行就是拿读失败当差异（本仓 A2 裁决的静默收口同型）。它们走 digest 的 `unreadable`。
+ */
+export function inflightDrift(rootPath, model) {
+  const opens = model?.openCommits || []
+  const seqs = new Set(opens.map((c) => c.seq))
+  const dir = paths.inflightDir(rootPath)
+  const digest = { dir, ok: true, unreadable: [], skipped: [] }
+  const files = new Set()
+  if (existsSync(dir)) {
+    let entries = []
+    try { entries = readdirSync(dir) } catch (e) {
+      digest.ok = false
+      digest.unreadable.push(`目录读不到: ${String(e?.message || e)}`)
+    }
+    for (const f of entries) {
+      const m = /^(\d+)\.json$/.exec(f)
+      if (!m) { if (f !== '.keep') digest.skipped.push(f); continue }   // 非缓存命名 = 未归类残骸，不是"缓存条目"
+      files.add(Number(m[1]))
+    }
+  }
+  const missing = [], extra = []
+  for (const c of opens) if (!files.has(c.seq)) missing.push({ id: c.id, seq: c.seq, anchor: c.anchor, task: c.task })
+  for (const s of [...files].sort((a, b) => a - b)) {
+    if (!seqs.has(s)) extra.push({ id: `ACT-${s}`, seq: s, file: `${s}.json` })
+  }
+  return {
+    ...digest,
+    dirExists: existsSync(dir),
+    /** 缓存里**合法命名**的条目数（模型侧对应量 = model.openCommits.length）。 */
+    cached: files.size,
+    open: opens.length,
+    missing, extra,
+    over: missing.length,
+    under: extra.length,
+    read: missing.length + extra.length,
+    /** 一致 ⇔ 一个方向都不缺、一个方向都不多。 */
+    consistent: missing.length === 0 && extra.length === 0
+  }
 }
