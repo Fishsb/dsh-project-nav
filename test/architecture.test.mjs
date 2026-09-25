@@ -2,17 +2,19 @@
 //
 // 这一组测试不做"功能验证"，只验证**架构本身**：
 //   I1 单源 · I2 渲染 · I3 可丢弃 · A1 收口不依赖会话 · A2 真相可自检
-//   A4 六闸完整 · A5 模型面字段数 · A6 工具面 = 6
+//   A4 七闸完整 · A5 模型面字段数 · A6 工具面 = 5（数字以同文件断言为准，跑一次即得）
 // 架构错了，局部补得再好也没用 —— 所以这些用例比功能用例更重要。
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, readdirSync, utimesSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, readdirSync, utimesSync, chmodSync, mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { tmpRoot, put, touch, seed } from './helper.mjs'
-import { appendEvents, readEvents, verifyLog, rewriteVerified } from '../core/log.js'
+import { tmpRoot, put, touch, seed, snapshotTree, armSnapshotProbe } from './helper.mjs'
+import { appendEvents, readEvents, verifyLog, rewriteVerified, EVENT_KINDS } from '../core/log.js'
 import { loadModel, buildModel, foldOnly, coverage, pressureFor, filePressure, normalizeAnchor, governanceSovereignty, governanceVitality } from '../core/model.js'
+import { evidenceOf, diffEvidence } from '../core/scope.js'
 import { commitIntent, reconcile, archiveIntent } from '../core/commit.js'
 import { paths, PLANE } from '../core/paths.js'
 import { renderTreeText } from '../core/render.js'
@@ -97,8 +99,16 @@ test('I2 按需渲染可得：树文本由模型纯函数产出，且零落盘',
 
 test('I2 在场层：治理摘要由纯事件流派生，且**不落盘、不扫盘**', async (t) => {
   const root = tmpRoot(t)
+  // ① 武装自证必须**先于**被测判据：先证明快照真能发现新写入，再拿它去判在场层。
+  armSnapshotProbe()
+  // ② 顺序硬约束：seed 的 appendEvents 走 withLock，**必然**建出 .internal/runtime/locks
+  //    —— 那是合法写入，不属在场层。故快照只能取在 seed **之后**、在场调用**之前**；
+  //    若取在 seed 之前，快照把锁建目录一起算作"在场层新增"，判据会红在错误的地方。
   await seed(root)
-  const before = existsSync(join(root, '.internal', 'runtime'))
+  const snap = () => snapshotTree(join(root, '.internal'))
+  // 取证（不是断言）：seed 之后是**非空**树 —— 下面比对的绝不是"空集比空集"。
+  console.log('  [在场层零落盘] 在场调用前 .internal 快照 = ' + JSON.stringify(snap()))
+  const before = snap()
   const t0 = Date.now()
   const folded = foldOnly(root)
   const text = renderPresence(folded)
@@ -106,9 +116,11 @@ test('I2 在场层：治理摘要由纯事件流派生，且**不落盘、不扫
 
   assert.ok(text.includes('治理在场'), '在场摘要必须有可识别的抬头')
   assert.ok(text.includes('doing='), '在场摘要必须带主线（agent 需要知道现在在做什么）')
-  // 廉价路径：纯事件流折叠不应建 runtime（buildModel/loadModel 才会落）
-  assert.equal(existsSync(join(root, '.internal', 'runtime')), before,
-    'foldOnly/renderPresence 不得创建 runtime（I3：删 runtime 零损失）')
+  // 廉价路径 + 零落盘：纯事件流折叠不得新增**目录或文件**（buildModel/loadModel 才会落）
+  // ⚠ 判据是「在场层这一步没有新增」，不是「runtime/ 不存在」—— 后者恒假，见上。
+  assert.deepEqual(snap(), before,
+    'foldOnly/renderPresence 不得新建任何目录或文件（I2 治理面零落盘；含 runtime 缓存）')
+  assert.ok(existsSync(join(root, '.internal', 'runtime')), '前置事实：seed 已建 runtime（本判据的比对基线非空）')
   assert.ok(ms < 200, `在场摘要必须廉价（实测 ${ms}ms；不得走磁盘扫描的 buildModel）`)
 })
 
@@ -365,8 +377,159 @@ test('A5 模型面字段数 ≤ 4（锚点 / scope / arch= / 理由）', () => {
   const tools = scanTools()
   const commit = tools.schemas.find((s) => s.name === 'nav_commit')
   assert.ok(commit, 'nav_commit 必须存在')
+
+  // ⚠ 前置非空断言（2026-09-25 复核席实测的空判据）：下面的 upper-bound 是 `nonMode.length <= 4`，
+  // 而 paramsOf 抽不到参数时返回 **[]** ⇒ nonMode 恒空 ⇒ `0 <= 4` 恒真。
+  // 也就是说：抽取面一旦失配（曾把 `^\s{6}` 写成 `^\s{8}`），这条判据**看起来还是绿的**，
+  // 却已经一个字段都没在看 —— 这正是本仓最忌的「空扫判绿」（同族 ACT-341 / A2）。
+  // 所以先证明抽取面真的抽到了东西，再谈上界。
+  assert.ok(commit.params.length > 0,
+    '⚠ 空扫：nav_commit 一个参数都没抽到（上界判据会退化成 0<=4 恒真）—— 先修参数抽取面，别让判据空转')
+  for (const req of ['task', 'anchor']) {
+    assert.ok(commit.params.includes(req),
+      `⚠ 空扫：nav_commit 的必填参数 ${req} 未被抽到（实际抽到: [${commit.params.join(', ')}]）—— 抽取面失配时上界判据恒真`)
+  }
+
   const nonMode = commit.params.filter((p) => !['task', 'plan', 'features', 'modules', 'files', 'mode', 'id', 'reason'].includes(p))
   assert.ok(nonMode.length <= 4, `nav_commit 的模型面字段过多: ${nonMode.join(', ')}`)
+})
+
+// ============ A2 三态证据（读不到 ≠ 改了）============
+//
+// 病根（2026-09-25 复核席变异实测）：core/scope.js 的 `if (bU || aU)` 短路曾被改掉，
+// **四套件全绿** —— 也就是说「读不到 ≠ 改了」这条命门（静默收口）当时没有任何守卫。
+//
+// 为什么它是命门：读失败一旦混进内容比较（读失败曾记 sha1:null，与任何 sha1 都不相等），
+// 收口就会把「没读到」判成「改过了」⇒ 笔记被静默收掉，而收口证据本身在说谎。
+//
+// ⚠ 夹具平台边界（本仓实测，跨平台）：本机是 Windows，两条常见造法**都不成立** ——
+//   · `chmodSync(file, 0o000)` 在 win32 上被忽略：实测 stat OK / read OK（返回真实内容）；
+//   · 「打开句柄 + unlink」在 Node 上会直接删掉名字：实测 unlink 后 statSync 是 ENOENT
+//     ⇒ 那是**第三态（确实不存在）**，不是「存在但读不到」，喂给它就把判据喂错了靶。
+// 而 FS 层制造 EPERM 会红在**非管理员/非 Windows** 的机器上（CI 上绝大多数不是管理员）
+// ⇒ 不许变成假红。故本用例走任务书给出的退路②：**直接构造三态输入喂纯函数**（确定性、平台无关），
+// 并把「真实 FS 三态」作为**有则验、无则显式 SKIP 且打印原因**的加强项（不是静默跳过）。
+//
+// 三条断言各自能独立抓住一种改法（不是一条判据的多份抄写）：
+//   ① evidenceOf  —— 抓住「读不到压成 sha1:null」；
+//   ② diffEvidence —— 抓住「bU || aU 短路被改掉」（读失败被丢进 modified）；
+//   ③ reconcile   —— 抓住「收口不看 unreadable、照写 closed」（静默收口）。
+
+/**
+ * 「存在但读不到」的真实 FS 夹具：造得出就返回绝对路径，造不出返回 null（原因由调用方打印）。
+ *
+ * ⚠ 平台约束（本仓实测）：`chmod` 在 win32 上被忽略（0o000 照样读得到），
+ * 而"打开句柄 + unlink"会真的把名字删掉（那落到**第三态**，不是第二态）⇒ 本机两条路都不通。
+ * 故本函数只负责**尝试**：造不出来就返回 null，由调用方显式 SKIP（不静默、也不假红）。
+ *
+ * ⚠ 权限必须有人负责收尾：只读目录会让 rmSync EACCES ⇒ 清理失败会红在**夹具**上而不是判据上。
+ * 调用方为此在 `t.after` 里先 chmod 恢复再删树（见用例）。
+ */
+function makeUnreadableFixture(abs) {
+  if (process.platform !== 'win32') {
+    try { chmodSync(abs, 0o000) } catch { /* 落到只读目录探针 */ }
+    if (!readSucceeds(abs)) return abs
+  }
+  // 兜底：可读文件放进**不可读目录**（stat 命中、read 被拒）。
+  try { chmodSync(dirname(abs), 0o000) } catch { /* noop */ }
+  if (!readSucceeds(abs)) return abs
+  try { chmodSync(dirname(abs), 0o755) } catch { /* noop */ }
+  return null
+}
+
+function readSucceeds(abs) {
+  try { readFileSync(abs); return true } catch { return false }
+}
+
+test('A2 三态：存在但读不到 ≠ 改了 —— evidence/diff/reconcile 三级都必须可区分', async (t) => {
+  // ---------- 主判据（纯函数级，确定性、平台无关）----------
+  const REL = 'src/locked.js'
+  const REAL_SHA = 'a'.repeat(40)
+  const before = { [REL]: { exists: true, size: 10, mtimeMs: 1000, sha1: REAL_SHA } }
+  const unreadable = { [REL]: { exists: true, size: 10, mtimeMs: 1001, unreadable: 'EPERM' } }
+
+  // ① evidenceOf：读不到的第三态必须可区分（不是 exists:false，也不是裸 sha1:null）
+  const probe = mkdtempSync(join(tmpdir(), 'pnx-unreadable-'))
+  // 先恢复权限、再删树：夹具可能把 probe 目录 chmod 成 0o000（POSIX 上的兜底试探），
+  // 若直接 rmSync 会 EACCES ⇒ 那是**夹具清理失败**，会红在错误的地方（等于假红）。
+  t.after(() => { try { chmodSync(probe, 0o755) } catch { /* win32 无此语义 */ } ; rmSync(probe, { recursive: true, force: true }) })
+  writeFileSync(join(probe, 'readable.js'), 'readable', 'utf-8')
+
+  // 平台无关的两条**结构性**断言（任何机器都跑）：
+  //   · 可读文件 → 真 sha1；· 不存在 → exists:false 且**不出现 sha1 键**。
+  // 合起来封的是"把读失败压成 sha1:null"那种折法 —— null 与任何 sha1 都不相等，
+  // 于是比对时必被读成"内容变了"（静默收口的来源）。
+  const eRead = evidenceOf(probe, ['readable.js'])['readable.js']
+  assert.equal(eRead.exists, true)
+  assert.match(String(eRead.sha1), /^[0-9a-f]{40}$/, '可读文件必须给出真 sha1（不是 null、不是占位）')
+  assert.equal(eRead.unreadable, undefined, '可读文件不得带 unreadable（第三态不得被误报）')
+  const eGone = evidenceOf(probe, ['nope.js'])['nope.js']
+  assert.equal(eGone.exists, false, '确实不存在 → exists:false（第三态与第二态必须可区分）')
+  assert.ok(!Object.hasOwn(eGone, 'sha1'), '不存在时不得挂一个 sha1 占位（sha1 键的缺席本身就是语义）')
+
+  // 真实 FS 夹具：造得出就验满第三态，造不出**显式 SKIP 并打印原因**（不静默、也不假红）
+  const fx = join(probe, 'locked-by-fs.js')
+  writeFileSync(fx, 'locked', 'utf-8')
+  const real = makeUnreadableFixture(fx)
+  if (real) {
+    const es = evidenceOf(probe, ['locked-by-fs.js'])['locked-by-fs.js']
+    assert.equal(es.exists, true, '真实 FS 夹具：必须落在第三态（stat 成功 ⇒ 不是 existed:false）')
+    assert.equal(typeof es.unreadable, 'string', '真实 FS 夹具：必须带 unreadable 原因')
+    assert.equal(es.sha1, undefined, '读不到时不得凭空造 sha1（内容根本没读到）')
+    assert.deepEqual(diffEvidence({ 'locked-by-fs.js': es }, { 'locked-by-fs.js': es }).modified, [],
+      '真实 FS 夹具：自己与自己比绝不能算 modified')
+  } else {
+    console.log(`  [A2 真实 FS 夹具 SKIP] platform=${process.platform} —— chmod(0o000) 与只读目录在本平台都不生效（实测 win32 两者皆被忽略）；` +
+      '第三态在本机改由纯函数构造覆盖（②③），未降级为假绿')
+  }
+
+  // ② diffEvidence：读不到 vs 有值 —— 不得判 changed，且原因必须在 unreadable 通道里
+  const d = diffEvidence(before, unreadable)
+  assert.equal(d.changed, false, '读不到 ≠ 改了：读失败不得被判成内容变化（静默收口的来源）')
+  assert.deepEqual(d.modified, [], '读不到的文件不得进 modified（那是把"没读到"说成"改过了"）')
+  assert.deepEqual(d.vanished, [], '读不到不得被说成消失')
+  assert.deepEqual(d.appeared, [])
+  assert.deepEqual(d.unreadable.map((u) => u.file), [REL], '原因必须列在 unreadable 通道里（不得吞）')
+  assert.ok(d.unreadable[0].reason.includes('EPERM'), `unreadable 必须带可读原因，实际 ${JSON.stringify(d.unreadable)}：读失败的因由不得只丢一个词`)
+  // 反向配对（同一夹具下）：真改了仍必须报 changed —— 否则上一条可以被"永远返回 changed:false"骗过
+  const d2 = diffEvidence(before, { [REL]: { exists: true, size: 11, mtimeMs: 2002, sha1: 'b'.repeat(40) } })
+  assert.equal(d2.changed, true, '成对断言：真改了必须报 changed（缺这一半，上面那条可被恒 false 骗过）')
+  // 历史事件流兼容：只有 "exists:true 而 sha1 缺席" 的旧证据，同样不得算"变了"
+  const dOld = diffEvidence({ [REL]: { exists: true, sha1: null } }, unreadable)
+  assert.equal(dOld.changed, false, '旧证据（sha1:null 无 unreadable 字段）同样不得判 changed')
+
+  // ③ reconcile：读不到 ⇒ 不得写 closed 事件，仍 open 且带可读原因
+  const root = tmpRoot(t)
+  await seed(root, { files: ['src/a.js'] })
+  const c = await commitIntent(root, { task: 'A2 三态', anchor: 'PN-F01', arch: 'a', scope: { files: ['src/a.js'] } })
+  assert.equal(c.status, 'ok')
+  const eventsFile = paths.events(root)
+  const linesOf = () => readFileSync(eventsFile, 'utf-8').split(/\r?\n/).filter((l) => l.trim())
+  // 逐行改写：只动那一份事件的 evidence 与它的 sha1 —— 不得引入坏行（seq 连续性必须保住）
+  const events = readEvents(root).events
+  writeFileSync(eventsFile, events.map((ev) => {
+    if (ev.kind !== 'commit' || ev.phase !== 'open') return JSON.stringify(ev)
+    const f = Object.keys(ev.evidence || {})[0]
+    return JSON.stringify({ ...ev, evidence: { ...ev.evidence, [f]: { ...ev.evidence[f], unreadable: 'EPERM' } } })
+  }).join('\n') + '\n', 'utf-8')
+  assert.equal(verifyLog(root).ok, true, '前置：改写后事件流自身必须仍完整（否则下面的收口判据红在错误的地方）')
+
+  const rec = await reconcile(root)
+  const closedEvents = readEvents(root).events.filter((ev) => ev.kind === 'commit' && ev.phase === 'closed')
+  assert.equal(closedEvents.length, 0, '读不到 ⇒ 不得写 closed 事件（这就是"静默收口"：拿读失败当改过了）')
+  assert.equal(rec.closed.length, 0)
+  assert.equal(rec.stillOpen.length, 1, '应仍 open（读不到不是"没变"，也不是"已收"）')
+  assert.equal(rec.stillOpen[0].reason, 'unreadable', '仍 open 必须把原因带出去，不得只丢一个 reason:unchanged')
+  assert.ok(String(Array.isArray(rec.stillOpen[0].unreadable) ? JSON.stringify(rec.stillOpen[0].unreadable) : rec.stillOpen[0].unreadable).includes('EPERM'),
+    '原因必须可读（调用方要看得见"为什么没收"）')
+
+  // 反向配对：把 unreadable 去掉（恢复正常可读）⇒ 必须回到可收口状态
+  // —— 否则上一条可以被"reconcile 永远不收口"骗过。
+  writeFileSync(eventsFile, events.map((ev) => JSON.stringify(ev)).join('\n') + '\n', 'utf-8')
+  put(root, 'src/a.js', 'changed-by-A2-probe')
+  const rec2 = await reconcile(root)
+  assert.equal(rec2.closed.length, 1, '成对断言：证据恢复正常后必须能收口（缺这一半，上一条可被"永不收口"骗过）')
+  assert.equal(readEvents(root).events.filter((ev) => ev.kind === 'commit' && ev.phase === 'closed').length, 1)
 })
 
 test('A4 七闸在 host 的写入路径上是强制的（闸门不在流程里，在查询里）', async (t) => {
@@ -385,6 +548,40 @@ test('A4 七闸在 host 的写入路径上是强制的（闸门不在流程里�
   const blocked = await commitIntent(root, { task: 't', anchor: 'PN-F01', arch: 'a', scope: { features: ['PN-F01'] } })
   assert.equal(blocked.status, 'blocked')
   assert.ok(blocked.gates.blocked.some((b) => b.gate === 'count'))
+})
+
+test('A4 事件模型 = 4 种 kind（ARCHITECTURE §5 的架构事实，加第 5 种即红）', async (t) => {
+  // 病根（2026-09-25 复核席变异实测）：给 `core/log.js` 的 EVENT_KINDS 加第 5 种 ⇒ **四套件全绿**。
+  // 而 ARCHITECTURE §5 的章节标题与表格都写死「事件模型（4 种 kind，唯一写入面）」——
+  // 架构事实没有任何机检，改它就等于悄悄改了架构（且没人会发现）。
+  //
+  // 判据刻意**双侧**都取：
+  //   · 运行时面：EVENT_KINDS 常量本身（这是"唯一写入面"实际拒绝未知 kind 的依据）；
+  //   · 契约面：ARCHITECTURE §5 的表格（文档说 4 种就必须真的是那 4 种，反之亦然）。
+  // 只取一侧都会被"改一边忘另一边"绕过。
+  const CONTRACT_KINDS = ['commit', 'decide', 'node', 'set']
+  assert.equal(EVENT_KINDS.length, 4, `事件模型必须恰为 4 种 kind（ARCHITECTURE §5），实际 ${EVENT_KINDS.length}: ${EVENT_KINDS.join(', ')}`)
+  assert.deepEqual([...EVENT_KINDS].sort(), [...CONTRACT_KINDS].sort(),
+    `kind 集合必须与契约 §5 的四个逐字一致，实际 ${EVENT_KINDS.join(', ')}`)
+
+  // 契约面：从 ARCHITECTURE §5 解析出表格里列出的 kind，与常量集合比对
+  const arch = readFileSync(new URL('../ARCHITECTURE.md', import.meta.url), 'utf-8')
+  const sec = arch.split(/\n(?=## )/).find((s) => /^## 5\./.test(s))
+  assert.ok(sec, 'ARCHITECTURE 必须有 §5（事件模型）—— 找不到就是契约被搬走了')
+  const head = sec.split('\n')[0]
+  assert.match(head, /4 种 kind/, `§5 标题必须写明 kind 种数（判据要与文档对得上），实际: ${head}`)
+  const tableKinds = [...sec.matchAll(/^\| \`([a-z]+)\` \|/gm)].map((m) => m[1]).sort()
+  assert.deepEqual(tableKinds, [...CONTRACT_KINDS].sort(),
+    `§5 表格列出的 kind 必须恰为四个，实际 ${tableKinds.join(', ')} —— 文档与 EVENT_KINDS 必须同源`)
+
+  // 行为面（端到端）：未知 kind 必须在**写入时**被拒 —— 常量改了而闸门没跟上，这里会红
+  const root = tmpRoot(t)
+  await seed(root)
+  await assert.rejects(
+    () => appendEvents(root, [{ kind: 'drift', anchor: 'PN-F01' }]),
+    /unknown event kind/,
+    '未知 kind 必须被 appendEvents 拒绝（EVENT_KINDS 是唯一写入面的实际闸门，不是陈列品）'
+  )
 })
 
 // ============ 平面契约 ============
@@ -412,6 +609,92 @@ test('I1 依赖图在缓存与非缓存两条路径上必须一致（同一个�
   const warm = loadModel(root, { useCache: true })
   assert.deepEqual([...cold.edges.fileEdges], [...warm.edges.fileEdges])
   assert.deepEqual([...cold.edges.deps], [...warm.edges.deps])
+})
+
+// ============ A5 缓存语义（0.12.0 · useCache 默认翻为 true 之后的覆盖缺口）============
+//
+// 病根（2026-09-25 施工席自述 + 复核席确认）：`loadModel` 的默认已翻成 `useCache: true`
+// —— 生产路径**从此读缓存**，而缓存路径此前只被「edges 冷热一致」覆盖过：
+// 而 edges 在**两条路径上都当场重算**（见 buildModelFromPlain 注释）⇒ 零分辨力，
+// 缓存载荷有没有被真的消费、被消费得对不对，一个字都没测。
+//
+// 下面两条补的是「**缓存载荷真的被消费**」：
+//   ① 逐项比对缓存**供应**的那些字段（vector / decisions / nodes / stale / unregistered / commits）；
+//   ② 篡改缓存载荷 ⇒ 第二关（contentDigest）必须作废整份缓存 —— 这一条是投毒方向的守卫。
+
+test('A5 冷热一致不止 edges：缓存供应的每个字段都必须逐项等价（缓存载荷真被消费）', async (t) => {
+  const root = tmpRoot(t)
+  await seed(root)
+  put(root, 'src/b.js', "import './a.js'\n")
+  await appendEvents(root, [{ kind: 'decide', anchor: 'PN-F01', reason: 'r', decision: 'd' }])
+
+  const cold = loadModel(root, { useCache: false })   // 重算 + 落缓存
+  const supplyOf = (m) => ({                          // ← 缓存**供应**的那一半（事件流派生）
+    vector: m.vector,
+    decisions: m.decisions,
+    nodes: [...m.nodes.values()].map((n) => [n.id, n.status, n.name, n.files, n.module]),
+    commits: m.commits.map((c) => [c.id, c.phase, c.anchor])
+  })
+  assert.ok(cold.vector.doing && cold.nodes.size > 0, '前置事实：缓存供应的载荷非空（否则下面的比对是空集比空集）')
+
+  // ⚠ 判别力来源：**落缓存之后**再改磁盘（事件流一个字没动 ⇒ 戳仍然一致 ⇒ warm 必然走缓存路径）。
+  // 登记的落点被删 → STALE；新增未登记文件 → unregistered。这两个是**纯磁盘派生**，
+  // 而 buildModelFromPlain 的既定契约是"命中缓存也当场重算"（事件流的戳证明不了磁盘）。
+  rmSync(join(root, 'src', 'a.js'), { force: true })
+  put(root, 'src/z-extra.js', '// unregistered')
+
+
+  const warm = loadModel(root, { useCache: true })
+  const fresh = buildModel(root)                      // 无缓存重算 = 参考真相
+  assert.deepEqual(supplyOf(warm), supplyOf(cold),
+    '命中缓存的那条路径必须与"写缓存时的真相"逐字段等价 —— 缓存载荷是"被消费"的，不是被忽略的')
+  // 磁盘派生态：不得采信缓存里那份（旧判据只比 edges ⇒ 换个字段就完全看不见）
+  assert.ok(warm.stale.length > 0, '前置事实：STALE 必须非空 —— 否则"重算 vs 采信缓存"在这一项上不可分辨')
+  assert.ok(warm.unregistered.includes('src/z-extra.js'), '前置事实：未登记清单必须非空（同上）')
+  assert.deepEqual(warm.stale, fresh.stale, '命中缓存时 STALE 必须当场重算，不得从缓存载荷里取（I1：戳证明不了磁盘）')
+  assert.deepEqual(warm.unregistered, fresh.unregistered, '未登记清单同理（stale/unregistered 与 edges 同一理由）')
+
+  // 冷热两条路径的 dependents（节点级投影）也不许分叉
+  const deps = (m) => [...m.edges.dependents].map(([k, v]) => [k, [...v].sort()]).sort()
+  assert.deepEqual(deps(warm), deps(cold))
+})
+
+test('A5 篡改缓存载荷 ⇒ warm 不得采信（contentDigest 第二关；投毒方向的守卫）', async (t) => {
+  // 为什么必须单独测投毒：第一关（事件流戳）只管"源没变"，
+  // 手工改一处缓存字段**根本不改变事件流的戳** ⇒ 光有第一关时"源没变"为真、缓存却已不是源的投影。
+  // 这正是 useCache 翻成默认 true 之后必须堵的口子（读缓存成为默认路径）。
+  const root = tmpRoot(t)
+  await seed(root)
+  await appendEvents(root, [{ kind: 'decide', anchor: 'PN-F01', reason: 'r', decision: 'd' }])
+  loadModel(root, { useCache: false })        // 先写出一份**合法**缓存
+  const modelFile = paths.model(root)
+
+  // 篡改前后必须是两份不同字节（下面"不得采信"的判据才有标的）
+  const beforeBytes = readFileSync(modelFile, 'utf-8')
+  const tampered = JSON.parse(beforeBytes)
+  tampered.vector = { ...tampered.vector, doing: 'POISONED-VECTOR' }
+  // 两处一起投毒：
+  //   · vector —— 与既有 I1 用例的靶同一面（那一条已覆盖它，这里作回归）；
+  //   · node.name —— **此前无任何判据覆盖的面**（旧冷热用例只比 edges ⇒ 对它零分辨力）。
+  tampered.nodes = tampered.nodes.map((n) => n.id === 'feature:pn-f01' ? { ...n, name: 'POISONED-NAME' } : n)
+  writeFileSync(modelFile, JSON.stringify(tampered, null, 2), 'utf-8')
+  assert.notEqual(readFileSync(modelFile, 'utf-8'), beforeBytes, '前置事实：篡改必须真的改变了缓存字节')
+
+  const warm = loadModel(root, { useCache: true })
+  assert.notEqual(warm.vector.doing, 'POISONED-VECTOR', '篡改缓存载荷后 warm 不得采信（contentDigest 第二关必须作废整份缓存）')
+  assert.equal(warm.vector.doing, 'core', 'warm 必须回落事件流里的真相')
+  assert.equal(warm.nodes.get('feature:pn-f01').name, 'PN-F01',
+    '缓存里的节点名被篡改也不得采信 —— 这是旧冷热用例（只比 edges）零分辨力的那一面')
+
+  // 反向配对：**只**动 vector 时，戳（事件流未变）确实一致 —— 证明这道关卡的靶是第一关盖不住的那一面
+  assert.equal(loadModel(root, { useCache: false }).vector.doing, 'core')
+
+  // 且缓存必须被重建（不得把毒留在盘上等着下一次读）
+  const afterBytes = readFileSync(modelFile, 'utf-8')
+  assert.equal(JSON.parse(afterBytes).vector.doing, 'core', '缓存必须被重建回真相，而不是带着被篡改的载荷继续结账')
+  // 重建后的缓存必须重新可被采信（否则"防投毒"可以退化成"永远重算"）
+  const warm2 = loadModel(root, { useCache: true })
+  assert.equal(warm2.vector.doing, 'core')
 })
 
 test('I3 删掉 runtime/ 后依赖图无损重建（它是磁盘派生，不是长期资产）', async (t) => {

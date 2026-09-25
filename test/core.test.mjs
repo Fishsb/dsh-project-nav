@@ -223,7 +223,7 @@ test('不在磁盘上的落点记 exists:false，不算 vanished（也不清空 
   assert.equal(diffEvidence(e1, e2).changed, false, '本来就不存在的文件不该每次都被报成漂移')
 })
 
-// ============ 六闸 ============
+// ============ 七闸 ============
 
 test('闸门1 锚点闸：缺锚点 / 假锚点 → 拒；真节点 → 过', async (t) => {
   const root = tmpRoot(t)

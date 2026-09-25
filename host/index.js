@@ -59,7 +59,9 @@ export function apply(ctx, config) {
   async function refresh(now = Date.now()) {
     // 先按证据收口（会写事件），再用收口后的真相建模型。
     lastReconcile = { ...(await reconcile(root, { now })), at: now }
-    return loadModel(root, { now })
+    // 显式 useCache: true —— 读缓存才是"载入模型"的默认语义，别依赖默认值（默认值同样已翻成 true）。
+    // 这是 I3 自述的"只有这条路径允许落 runtime"那条路径：读缓存 + 失效则重算 + 落盘自证。
+    return loadModel(root, { now, useCache: true })
   }
 
   // ================= 工作区边界：已拆除（0.9.2） =================

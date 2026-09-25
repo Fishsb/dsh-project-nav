@@ -19,6 +19,7 @@
 | **I3** | 可丢弃：删掉 `.internal/runtime/` → 治理零损失（**依赖图同办**） | 把任何"不能丢"的东西放进 `runtime/` |
 
 改完任何东西，跑 `npm test`——三条不变式都有可机检的用例（**具体项数不写在这里**，那是会漂移的数字，跑一次即得）。
+⚠ **本机 node / npm 不在 PATH**（`npm test` 直接跑不起来）：等价的退路是用绝对路径 node 直跑四个套件，命令形态见 §4。
 治理开销的收敛方式走 **ARCHITECTURE §2「信息可达性」**：压缩去冗余可以，静默丢信息不行，字节上限不设。
 响应性同属治理开销：**纯磁盘派生的重活必须可缓存，且以磁盘指纹自证新鲜度**（ARCHITECTURE §2「响应性判据」）。
 缓存有效性**不得用耗时判定**——耗时是代理指标会漂；机检判据取命中/失效这种可确定断言的量。
@@ -95,7 +96,8 @@ npm pack --cache .npm-cache          # 产出 dsh-external-project-nav-<ver>.tgz
 | 边界 | 事实 | 应对 |
 |---|---|---|
 | 文件沙箱 | **策略随会话变，别照抄历史结论**：`workspace-write` 下可写根是 `D:\FF\project-nav`（不含 `D:\FF` 与 `~/.dsh`）；`danger-full-access` 下**全都可写**（含 profile） | **先判当前策略，再决定要不要推给别人**：`danger-full-access` ⇒ 自己动手（2026-09-12 实测：profile 安装 + 自证可直接做）；`workspace-write` ⇒ 才交给用户。**唯一永远只有用户能做的是重启** —— agent 不能重启承载自己的进程 |
-| `node --test` | 用管道 spawn 子进程 → 受限沙箱下 `spawn EPERM` | 用 `npm test`（直接执行测试文件，`node:test` 照跑） |
+| **node / npm 不在本机 PATH** | 实测（2026-09-25）：`PATH` 里**没有一个目录含 `node.exe`**（含 `~/.dsh-win/bin`），故 `npm test` 只得到 `npm : The term 'npm' is not recognized as the name of a cmdlet…`（`CommandNotFoundException`）。`package.json` 的 `scripts.test` 本身没问题 —— 是解释器不在搜索路径上 | 用**绝对路径**直跑，四个套件（core / architecture / concurrency / host）各起一次：`& 'C:\Users\lk\.dsh-win\node\node.exe' test/core.test.mjs`。本机唯一的 node 就在 `C:\Users\lk\.dsh-win\node\`（同目录另有 `npm.cmd` / `npx.cmd`，要用时同样走绝对路径） |
+| `node --test` | 用管道 spawn 子进程 → 受限沙箱下 `spawn EPERM` | 用 `npm test`（直接执行测试文件，`node:test` 照跑）；**npm 不在 PATH 时**改走上一条：绝对路径 node 直跑四个套件 |
 | Node 直接 spawn | `child_process` 抓管道输出 → `EPERM` | 别在 Node 里 spawn 子进程；需要的字节转换在本 shell 内用 .NET API 做 |
 | PowerShell 写文件 | **PS 5.1 的 `Set-Content -Encoding utf8` 会按 GBK 误读 UTF-8 源文件并写坏中文** | **一律用编辑工具改文本**；确需 PS 批量处理时只用 `[System.IO.File]::ReadAllBytes/WriteAllBytes` 做字节级操作 |
 | PowerShell 读脚本 | **PS 5.1 读无 BOM 的 UTF-8 `.ps1` 会按 GBK 解码**，中文（尤其全角标点）会把字符串终结符吃掉 → 语法错 | 含非 ASCII 的 `.ps1` 必须存成 **UTF-8 with BOM**；而 `package.json` / `.js` / `.md` 必须**无 BOM**（node 不认 BOM） |
@@ -141,7 +143,7 @@ npm pack --cache .npm-cache          # 产出 dsh-external-project-nav-<ver>.tgz
 ⚠ **本仓实际是「整目录忽略」**，因为**本仓不是治理根**（治理根是 `D:\FF`，事件流在那边）——
 本仓的 `.internal/` 里没有任何该进版本控制的真相。**这是本仓与"被治理项目"的关键差别**：
 **被治理项目**若也整目录忽略 `.internal/`，事件流就不进版本控制，新 clone 读不到任何决策，
-"决策可传播"（A3）就成了空话 ⇒ **被治理项目必须放行 `!.internal/events.jsonl`**。
+"决策可传播"就成了空话 ⇒ **被治理项目必须放行 `!.internal/events.jsonl`**。
 
 > 历史教训（2026-09-12 实证，留作判例）：本文件曾长期教一份 `!.internal/` + `!.internal/ARCH-MODEL.md`
 > 的示范，而 `ARCH-MODEL.md` 已于 0.10.3 删除、`.gitignore` 也已收敛 ⇒ **契约在教一份错的东西**。

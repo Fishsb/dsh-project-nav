@@ -6,6 +6,7 @@
 // 一切"当前状态"都只能从这里查询 —— 没有第二处读盘拼装。
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { key, normSlashes, paths, nowIso } from './paths.js'
@@ -380,6 +381,48 @@ function projectDirsOf(nodes) {
 }
 
 /**
+ * 磁盘实况 · STALE 落点：登记了但磁盘上没有。
+ *
+ * glob 落点不做存在性判定：它本身不是文件路径，拿它去 existsSync 必然恒报 STALE（假警报腐蚀信号）。
+ *
+ * ⚠ 这一段（以及下面的缺口）**两条路径必须共用本实现**：事件流的戳证明不了磁盘的事
+ * —— 删掉一个落点、新增一个文件，事件流一个字都不变，戳照样一致。
+ * 所以磁盘实况**不能**随缓存被当成"已证明新鲜的真相"带走：命中缓存的读必须自己再走一次盘，
+ * 否则"文件删了仍报无缺口"就是把缓存变成了第二个答案（I1）。
+ */
+function staleOf(rootPath, nodes) {
+  const stale = []
+  for (const n of nodes.values()) {
+    if (n.status !== 'active') continue
+    for (const f of n.files || []) {
+      if (/[*?]/.test(f)) continue
+      if (!existsSync(`${rootPath}/${f}`)) stale.push({ node: n.id, file: f })
+    }
+  }
+  return stale
+}
+
+/** 磁盘实况 · 缺口：磁盘上有、登记里没有（被登记 glob 覆盖的不算 —— glob 本来就代表一批文件）。 */
+function unregisteredOf(nodes, fileOwners, diskFiles) {
+  const anchoredGlobs = new Set()
+  for (const n of nodes.values()) {
+    if (n.status !== 'active') continue
+    for (const f of n.files || []) if (/[*?]/.test(f)) anchoredGlobs.add(normSlashes(f))
+  }
+  const unregistered = []
+  for (const f of diskFiles) {
+    if (fileOwners.has(key(f))) continue
+    if (anchoredGlobs.size) {
+      let covered = false
+      for (const g of anchoredGlobs) { if (globToRegExp(g).test(f)) { covered = true; break } }
+      if (covered) continue
+    }
+    unregistered.push(f)
+  }
+  return unregistered
+}
+
+/**
  * 完整模型 = 折叠 + 磁盘实况（I1：模型的每个属性都能由这两者复算）。
  *
  * `useScanCache` 默认 **false**：`buildModel` 是**纯重算**（内存里，不落盘），
@@ -404,36 +447,12 @@ export function buildModel(rootPath, { now = Date.now(), useScanCache = false } 
       .map((m) => m.name)
   }
 
-  // 磁盘实况：落点是否存在（STALE 探测）
-  // glob 落点不做存在性判定：它本身不是文件路径，拿它去 existsSync 必然恒报 STALE（假警报腐蚀信号）。
-  const stale = []
-  for (const n of base.nodes.values()) {
-    if (n.status !== 'active') continue
-    for (const f of n.files || []) {
-      if (/[*?]/.test(f)) continue
-      if (!existsSync(`${rootPath}/${f}`)) stale.push({ node: n.id, file: f })
-    }
-  }
-
-  // 缺口：磁盘上有、登记里没有
+  // 磁盘实况：落点是否存在（STALE 探测）+ 缺口（磁盘上有、登记里没有）—— 共享实现，见 staleOf/unregisteredOf
+  const stale = staleOf(rootPath, base.nodes)
   // （projectDirs 同时充当依赖图扫描边界 —— 原来算了却没人用，是死代码）
   const projectDirs = projectDirsOf(base.nodes)
   const diskFiles = walkFiles(rootPath)
-  const anchoredGlobs = new Set()
-  for (const n of base.nodes.values()) {
-    if (n.status !== 'active') continue
-    for (const f of n.files || []) if (/[*?]/.test(f)) anchoredGlobs.add(normSlashes(f))
-  }
-  const unregistered = []
-  for (const f of diskFiles) {
-    if (fileOwners.has(key(f))) continue
-    if (anchoredGlobs.size) {
-      let covered = false
-      for (const g of anchoredGlobs) { if (globToRegExp(g).test(f)) { covered = true; break } }
-      if (covered) continue
-    }
-    unregistered.push(f)
-  }
+  const unregistered = unregisteredOf(base.nodes, fileOwners, diskFiles)
 
   // 磁盘实况：依赖图（谁引用谁）—— ARCHITECTURE §1 / §3。复用上面走出的 diskFiles，不重复走盘。
   const edges = buildEdges(rootPath, diskFiles, fileOwners, projectDirs, { useScanCache })
@@ -854,8 +873,17 @@ export function governanceVitality(model) {
  *
  * 缓存只有在"带日志戳且戳与当前事件流一致"时才被采信：
  * 一份无法自证与源一致性的缓存**不是缓存，是第二个真相**（I1）。
+ *
+ * `useCache` 默认 **true**：读缓存就是"载入模型"的语义，写而不读的缓存是纯粹的白写。
+ * 曾默认 false 的后果是实测出来的：唯一生产调用点（host/index.js）拿到的永远是重算结果，
+ * 缓存**每笔工具调用被白写一次**（治理根那份 ≈1MB）而从未被读过一次 —— 缓存成了假可观测性
+ * （"看它一直在更新"≠"它在生效"）。`useCache: false` 保留为重算显式口（自举/测试用），
+ * 注意它**是**会重写缓存的：缓存落盘是"允许落 runtime 的那条路径"的既有行为，与读不读它无关。
+ *
+ * ⚠ **不信缓存里的磁盘派生量**：戳只证明事件流没变，而落点存的在、缺口的多少是磁盘的事。
+ * 故命中缓存时 `stale`/`unregistered` 与依赖图一样**当场重算**（见 buildModelFromPlain）。
  */
-export function loadModel(rootPath, { useCache = false, now = Date.now() } = {}) {
+export function loadModel(rootPath, { useCache = true, now = Date.now() } = {}) {
   const stamp = logStamp(rootPath)
   if (useCache) {
     try {
@@ -864,7 +892,12 @@ export function loadModel(rootPath, { useCache = false, now = Date.now() } = {})
         && cached.stamp.digest === stamp.digest
         && cached.stamp.size === stamp.size
         && cached.stamp.lines === stamp.lines
-      if (sameSource && stamp.lines > 0) return buildModelFromPlain(cached, rootPath)
+      // 第二关：缓存自证**这一份内容就是写者写下的那一份**。
+      // 只有第一关不够 —— 戳是写者自报的，手工改一处字段根本不改变事件流的戳，
+      // 于是"源没变"为真、缓存却已不是源的投影。读缓存成为默认路径后这是必须堵上的口子
+      // （判据 = 摘要全等，可确定断言；旧的缓存没有该字段 ⇒ 判 false ⇒ 重算一次后自动补上）。
+      const intact = typeof cached?.contentDigest === 'string' && cached.contentDigest === contentDigestOf(cached)
+      if (sameSource && intact && stamp.lines > 0) return buildModelFromPlain(cached, rootPath)
     } catch { /* 缓存不可用 → 重算（这就是 cache 的语义：随时可丢） */ }
   }
   // 只有这条路径允许落 runtime ⇒ 只有它开扫描缓存（buildModel 保持纯重算，见其注释）
@@ -881,7 +914,17 @@ function persistModel(rootPath, model) {
     vector: model.vector, decisions: model.decisions, commits: model.commits,
     stale: model.stale, unregistered: model.unregistered, log: model.log
   }
+  plain.contentDigest = contentDigestOf(plain)
   rewriteVerified(paths.model(rootPath), JSON.stringify(plain, null, 2))
+}
+
+/**
+ * 缓存内容摘要：**这份文件是否还是写者写下的那一份**（≠ stamp：stamp 说的是"源没变"）。
+ * 摘要字段本身不参与计算（删掉它再序列化），故写入与校验两侧得到同一串。
+ */
+function contentDigestOf(plain) {
+  const { contentDigest, ...rest } = plain
+  return createHash('sha1').update(JSON.stringify(rest, null, 2)).digest('hex')
 }
 
 function buildModelFromPlain(plain, rootPath) {
@@ -899,17 +942,23 @@ function buildModelFromPlain(plain, rootPath) {
   // 所以这条路径与 buildModel 得到**完全相同**的计数闸结果（I1）。
   const folded = { nodes, commits: plain.commits || [], decisions: plain.decisions || [], log: plain.log || [], vector: plain.vector || {} }
   const { patchPressure, openCommits } = pressureFrom(folded)
+  // 磁盘实况（STALE / 缺口）**跟依赖图同一理由重算**：事件流的戳证明不了磁盘，
+  // 而这两项恰恰是纯磁盘判断 —— 直接信缓存就会出现"落点早没了、缺口早有了，模型还说一致"
+  // （F4/F3 的反面：假的一致比已知的漂移更坏）。本条与上面依赖图的实现**必须是同一份**（staleOf/unregisteredOf）。
+  const diskFiles = walkFiles(rootPath)
+  const stale = staleOf(rootPath, nodes)
+  const unregistered = unregisteredOf(nodes, fileOwners, diskFiles)
   return {
     rootPath,
     builtAt: plain.builtAt,
     nodes, vector: plain.vector || {}, decisions: folded.decisions, commits: folded.commits,
     openCommits, fileOwners,
-    stale: plain.stale || [], unregistered: plain.unregistered || [],
+    stale, unregistered,
     // 依赖图**不缓存、每次重算**：它是磁盘派生，事件流的戳证明不了磁盘 import 还新鲜。
     // 两条路径走同一实现 ⇒ 结果必然一致（I1：同一份真相不允许两个答案）。
     // （P0-1）重算走 `scanImportsCached`：它的指纹是**磁盘**（清单+size+mtime），不是事件流戳，
     // 所以"不缓存依赖图"与"缓存扫描结果"不矛盾 —— 前者说的是不拿事件流戳当新鲜度证明。
-    edges: buildEdges(rootPath, walkFiles(rootPath), fileOwners, projectDirsOf(nodes), { useScanCache: true }),
+    edges: buildEdges(rootPath, diskFiles, fileOwners, projectDirsOf(nodes), { useScanCache: true }),
     patchPressure, log: folded.log, eventCount: plain.eventCount || 0, extras: {},
     stamp: plain.stamp
   }

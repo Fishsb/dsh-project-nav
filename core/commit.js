@@ -90,7 +90,15 @@ export async function reconcile(rootPath, { now = Date.now(), actor = null } = {
     const files = filesForCommit(rootPath, model, c)
     const after = evidenceOf(rootPath, files)
     const diff = diffEvidence(before, after)
-    if (!diff.changed) { stillOpen.push({ ...c, reason: 'unchanged', diff }); continue }
+    // 收口的两种"不收"必须可区分：「读不到」不是「没变」——
+    // 它意味着**这条证据不可判**，把它并按证据收口就是拿读失败当"改过了"（静默收口）。
+    // 记仍 open 且把原因带出去，让调用方看得见"为什么没收"。
+    if (!diff.changed) {
+      stillOpen.push(diff.unreadable.length
+        ? { ...c, reason: 'unreadable', unreadable: diff.unreadable, diff }
+        : { ...c, reason: 'unchanged', diff })
+      continue
+    }
     closed.push({ commit: c, diff })
   }
   if (!closed.length) return { closed: [], stillOpen }

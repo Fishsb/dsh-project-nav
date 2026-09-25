@@ -165,9 +165,34 @@ Write-Host '⑤ 运行时面（对安装实体做加载 + 真跑）'
 $runtime = Join-Path $RepoDir 'verify-runtime.mjs'
 if (-not (Test-Path $runtime)) { Bad "找不到运行时校验: $runtime" }
 else {
-  & node $runtime $Dest
-  if ($LASTEXITCODE -eq 0) { Ok '运行时冒烟通过（安装实体可加载、可运行、契约完整）' }
-  else { Bad "运行时冒烟未通过（退出码 $LASTEXITCODE）—— 见上方明细" }
+  # ⚠ ⑤ 必须**自足**：本机 node 不在 PATH 上（实测裸 "& node" => CommandNotFoundException），
+  # 那样这一级会**死在起点** —— 唯一能判"能不能加载"的一级永远给不出结论。
+  # 三级解析；全都落空就报 FAIL（静默跳过 = 假绿，本仓记过的形态）。
+  $NodeExe = $null
+  # (1) 显式指定：$env:NODE_EXE
+  if ($env:NODE_EXE -and (Test-Path $env:NODE_EXE)) { $NodeExe = $env:NODE_EXE }
+  # (2) 本机已知路径
+  if (-not $NodeExe) {
+    foreach ($cand in @('C:\Users\lk\.dsh-win\node\node.exe')) {
+      if (-not $NodeExe -and $cand -and (Test-Path $cand)) { $NodeExe = $cand }
+    }
+  }
+  # (3) 退回 PATH 上的 node
+  if (-not $NodeExe) {
+    $cmdNode = Get-Command node -ErrorAction SilentlyContinue
+    if ($cmdNode) { $NodeExe = $cmdNode.Source }
+  }
+
+  if (-not $NodeExe) {
+    Bad '找不到 node —— ⑤ 运行时面**未验**（不是通过）：本机 node 不在 PATH，已知路径也没有'
+    Note '办法：设 $env:NODE_EXE=<node.exe 绝对路径>（本机 = C:\Users\lk\.dsh-win\node\node.exe）后重跑'
+  }
+  else {
+    Note "node = $NodeExe"
+    & $NodeExe $runtime $Dest
+    if ($LASTEXITCODE -eq 0) { Ok '运行时冒烟通过（安装实体可加载、可运行、契约完整）' }
+    else { Bad "运行时冒烟未通过（退出码 $LASTEXITCODE）—— 见上方明细" }
+  }
 }
 
 # ---------- 汇总 ----------

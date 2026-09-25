@@ -4,7 +4,7 @@
 
 **面向 DeepSeek Harness（DSH）的项目反漂移治理插件**
 
-[![version](https://img.shields.io/badge/version-0.12.3-blue)](../../releases)
+[![version](https://img.shields.io/badge/version-0.12.4-blue)](../../releases)
 [![license](https://img.shields.io/badge/license-BSD--3--Clause-green)](./LICENSE)
 [![dsh-tools](https://img.shields.io/badge/dsh--tools-%3E%3D0.1.2--rc.1-orange)](https://www.npmjs.com/package/@deepseek-ai/dsh-tools)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen)](./package.json)
@@ -239,9 +239,9 @@ npm run test:node-runner  # 同一批用例走 node --test
 | 套件 | 覆盖 |
 |---|---|
 | `test/core.test.mjs` | 事件流 / 折叠 / scope 解析 / 七闸 / **依赖图扫描与影响面** / 收口 |
-| `test/architecture.test.mjs` | **不变量** I1·I2·I3（含依赖图双路径一致与可重建）· A1·A4·A5·A6 · **信息可达性**（投影索引完整性 / 确定性渲染零 diff / 源码静默截断扫描 / json 按 mode 对应） |
+| `test/architecture.test.mjs` | **不变量** I1·I2·I3（含依赖图双路径一致与可重建）· **验收判据 A1 收口不依赖会话 · A4 七闸在写入路径上强制 · A5 模型面字段数 ≤4 · A6 工具面 =5**（A2 真相可自检 · A3 决策可传播 —— A3 的独立机检件随 0.12.0 落盘投影退场，真相自检现由 I1 的事件流 seq 完整性代守）· **信息可达性**（节点索引完整性 / 确定性渲染零 diff / 源码静默截断扫描 / json 按 mode 对应） |
 | `test/concurrency.test.mjs` | F1 并发追加不丢 / F2 破锁竞态 / token 校验 / 重入 / 无锁残留 |
-| `test/host.test.mjs` | 真 host 代码 + 桩 ctx：装配面 6 工具、闸门接线、**nav_graph mode=impact 端到端**、归属归一回归 |
+| `test/host.test.mjs` | 真 host 代码 + 桩 ctx：装配面 5 工具、闸门接线、**nav_graph mode=impact 端到端**、归属归一回归 |
 
 > 沙箱提示：`node --test` 会用管道 spawn 子进程，在某些受限沙箱下报 `spawn EPERM`。
 > `npm test` 直接执行测试文件（文件被直接运行时 `node:test` 同样执行），因此不受影响。
@@ -251,6 +251,31 @@ npm run test:node-runner  # 同一批用例走 node --test
 > **每次更新一律 +0.0.1**，不因"加功能"跳中间位（lk 2026-09-10 定调）。
 > **例外：架构换代**才允许跳位，且必须在变更日志里写明"换代"二字。
 
+- `0.12.3 → 0.12.4`：**修 bug + 补机检（非换代）** —— 工具仍 5 · 闸仍 7 · kind 仍 4 · 数据面仍 2 层 · **零新增文件**。
+  本轮做了一次全量检查（并发只读勘察 → 并行修复 → **独立席变异复核**），结论收敛成一条方法论判据：
+  **「写着」不等于「能红」** —— 判据的字节在场，不等于破坏实现时它会失败。
+  ① **三处判据恒真**（掩盖类，最优先）：在场层「零落盘」两处 —— `before` 取在 `seed` **之后**（锁已建 `runtime/`，恒 true）、
+     快照只收文件不收目录（目录落盘看不见）；「确定性渲染」只比同毫秒内两次求值（对 `Date.now()` 只在跨毫秒时偶然变红）。
+     ⇒ 修法不是加断言，而是**换取样窗口 + 快照覆盖目录与文件 + 武装自证**（`armSnapshotProbe`：先证明快照真能发现新写入）。
+  ② **证据读失败被判成「改了」**（`core/scope.js` → `core/commit.js`）：`sha1` 读失败返回 `null`，「读不到」与「内容变了」同形
+     ⇒ `reconcile` 写 `closed` 事件**静默收口** —— 而该文件自己写着「收口证据会说谎，这是最不能接受的形态」。
+     现改为**三态**（可读 / 读不到 / 不存在）：读不到**不算 changed**、单列 `unreadable` 原因、绝不写 closed。
+  ③ **模型缓存写而不读**：`loadModel` 默认 `useCache:false` 却无条件 `persistModel` ⇒ 每笔工具调用白写约 1MB 且无人读。
+     读路径启用后补第二关 `contentDigest`（自证「这份缓存仍是写者写下的那份」）；并修正一处被掩盖的旧缺口：
+     warm 路径原样带出缓存里的磁盘实况（`stale`/`unregistered`），删落点/加文件时事件流一字不动 ⇒ 曾报假绿，现两路共用同一重算实现。
+  ④ **四处契约失效内容**：套件表写「6 工具」（实况 5）；引用的「投影索引完整性」随 0.12.0 落盘投影退场（实为**改名**为「节点索引完整性」，判据未变）；
+     A1–A6 被三处引用而全仓无定义；§4 边界表缺「**node / npm 不在本机 PATH**」这条最常踩的事实。
+  ⑤ **`verify-install.ps1` 第⑤级**（唯一能判「能不能加载」的一级）用裸 `node` ⇒ 本机 node 不在 PATH 时**中断**而非报错，
+     汇总与 `exit 1` 都不执行 ⇒ 调用方看到「无 FAIL」，**假绿**。现三级回退解析 node，全落空则显式 FAIL 并给办法。
+  ⑥ **独立复核（变异实测，非同席自审）抓到、并被随后修复的**：修复方向对，但**三处新判据仍是空的** ——
+     host 侧零落盘因取样窗口污染恒真（同一变异下旧序绿、新序红）；三态短路被改回无守卫；`A5` 是非空上界遇空集恒真；`kind 4 种` 无机检。
+     现全部补成**能红**的判据，各自附先红证据（破坏实现 ⇒ 判据变红）。测试项数不写在这里（会漂移，跑一次即得）。
+  ⚠ **外部事件**：仓内曾出现一个**名字被破坏的目录**（`'D' + U+F03A`，非 `D:`），内含 `FF\.internal\runtime\` 一棵**影子治理树**（空模型 `eventCount:0`）。
+     根因是 `host/index.js` 的 `root = config?.root ? resolve(config.root) : process.cwd()`：`isAbsolute('D<U+F03A>/FF')` 为 false
+     ⇒ `resolve()` 当**相对路径**拼到 cwd，写出 `<cwd>/D<U+F03A>/FF/…` 而**无任何异常**。残留已移出仓库（备份 `~/.dsh/tmp/pn-shadow-root-20260925`）；
+     触发源**未复现**（现配置 root 为纯 ASCII，全盘 15167 个文本文件零命中）。**root 合法性校验未加** —— 它改 `host/` 启动语义，留作具名决策。
+  ⚠ **未做**：`kind 4 种` 已补机检但**未补契约排除条款**；`test/tools-list.mjs` 的 `^\s{6}` 缩进耦合仍会把失配报成红（不再静默）而非根治；
+     `core/paths.js` 的 `PLANE.LEGACY/legacyDir`（零消费者）与 `host/index.js` 两个未用 import 未清（各 1 处，属零消费者残骸）。
 - `0.8.6 → 0.9.0`：换骨架（决策丢弃、事实 F1–F9 保留）。
 - `0.9.2 → 0.10.0`：**换代** —— 模型从「包含树」升级为「包含树 + 依赖图」，闸门六 → 七。
 - `0.10.0 → 0.10.1`：**修 bug**（非换代）—— 计数闸曾把 `closed` 收口回执也当补丁数，每笔改动被计两次、
@@ -280,7 +305,7 @@ npm run test:node-runner  # 同一批用例走 node --test
   ③ gaps 的未登记文件按顶层目录聚合（计数守恒，一条不丢）；④ ARCH-MODEL.md 的 ADR 节改全量一行索引
   （老决策不再整条消失，实测投影体积大头是此节的逐条展开）；⑤ 全仓定长 slice 补"共N/+N + 取回路径"；
   ⑥ 投影去时间戳 ⇒ 确定性渲染（模型不变 ⇒ 字节不变 ⇒ 重渲染零写盘），`nav_render` 自报体积（信号非裁决）；
-  ⑦ 新增四条机检（投影索引完整性 / 确定性渲染 / 源码静默截断扫描 / json 按 mode 对应）。
+  ⑦ 新增四条机检（节点索引完整性 / 确定性渲染 / 源码静默截断扫描 / json 按 mode 对应）。
 - `0.10.5 → 0.10.6`：**加功能（非换代）** —— 「先查后造」的可见化三册（A 极简路线，圆桌会议定案）：
   ① **PN-S1 查证申报可见**：`plan` 此前**写而不渲**（治理根 45 条非空 plan 对模型完全不可见）⇒
   补三个出口 —— `renderCommitResult`（写入回执；启用那个**零引用**的 `model` 形参，取值必须走

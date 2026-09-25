@@ -133,13 +133,23 @@ export function resolveScope(rootPath, model, scope = {}) {
 
 function exists(p) { try { return existsSync(p) } catch { return false } }
 
-function sha1(file) {
-  try { return createHash('sha1').update(readFileSync(file)).digest('hex') } catch { return null }
+/**
+ * 内容指纹。**失败不返回 null，返回原因** —— 「读不到」与「读出来的内容」必须可区分：
+ * 被压成 null 的失败，比对时与任何 sha1 都不相等 ⇒ 会被读成"内容变了"（静默收口的来源）。
+ */
+function sha1Of(file) {
+  try { return { sha1: createHash('sha1').update(readFileSync(file)).digest('hex') } }
+  catch (e) { return { reason: e?.code || e?.message || 'UNREADABLE' } }
 }
 
 /**
- * 证据指纹：scope 内每个文件 {size, mtimeMs, sha1}。
- * 不存在的文件记 `exists:false`（F4：不存在的文件不能被误报为 vanished，也不能被静默丢弃）。
+ * 证据指纹：scope 内每个文件落在**三态**之一。
+ *   ① 存在且可读   → {exists:true, size, mtimeMs, sha1}
+ *   ② 存在但读不到 → {exists:true, size, mtimeMs, unreadable:'EPERM…'}（statSync 成功、readFileSync 失败）
+ *   ③ 确实不存在   → {exists:false}（F4：不存在的文件不能被误报为 vanished，也不能被静默丢弃）
+ *
+ * ⚠ ② 必须与①的"内容变了"可区分：过去读失败被压成 sha1:null，比对时与任何值都不等
+ * ⇒ 收口把"读不到"判成"改过了"，笔记被静默收掉（收口证据说谎）。
  */
 export function evidenceOf(rootPath, files) {
   const entries = {}
@@ -148,7 +158,10 @@ export function evidenceOf(rootPath, files) {
     try {
       const st = statSync(abs)
       if (!st.isFile()) { entries[rel] = { exists: false, kind: 'not-a-file' }; continue }
-      entries[rel] = { exists: true, size: st.size, mtimeMs: Math.round(st.mtimeMs), sha1: sha1(abs) }
+      const h = sha1Of(abs)
+      entries[rel] = h.sha1 !== undefined
+        ? { exists: true, size: st.size, mtimeMs: Math.round(st.mtimeMs), sha1: h.sha1 }
+        : { exists: true, size: st.size, mtimeMs: Math.round(st.mtimeMs), unreadable: h.reason }
     } catch {
       entries[rel] = { exists: false }
     }
@@ -157,17 +170,35 @@ export function evidenceOf(rootPath, files) {
 }
 
 /**
+ * 一条证据是否"存在但读不到"，并给出原因。
+ * 两代都认：新 evidenceOf 带 `unreadable`；旧事件流里的历史证据只有
+ * "exists:true 而 sha1 缺席/null" —— 那同样是**没有内容可比**，不得当成"变了"。
+ */
+function unreadableReason(e) {
+  if (!e || !e.exists) return null
+  if (typeof e.unreadable === 'string') return e.unreadable
+  if (e.sha1 === null || e.sha1 === undefined) return 'unreadable'
+  return null
+}
+
+/**
  * 证据比对（收口的唯一判据 —— 与会话无关）。
  *
- * 顺序很重要：**先判存在性，再比内容**。
- * 若先比 sha1，一个被删除的文件（after.sha1 === undefined）与 before.sha1（字符串/null）
- * 不相等，就会把"消失"误报成"被修改" —— 收口证据会说谎，这是最不能接受的形态。
+ * 顺序很重要：**先判存在性，再判可读性，最后比内容**。
+ * ① 若先比 sha1，一个被删除的文件（after.sha1 === undefined）与 before.sha1 不相等，
+ *    就会把"消失"误报成"被修改"；
+ * ② 若把"读不到"混进内容比较（读失败曾记 sha1:null），它与任何 sha1 都不相等，
+ *    就会把"没读到"误报成"改过了" —— 两者都是**收口证据说谎**，最不能接受的形态。
+ * 因此读不到**不算 changed**，而是进 `unreadable` 作为显式原因回传给调用方（不得吞）。
+ * 向后兼容：既有五键 unchanged / modified / vanished / appeared / changed 语义不变，只新增 unreadable。
  */
 export function diffEvidence(before = {}, after = {}) {
   const modified = []
   const vanished = []
   const appeared = []
   const unchanged = []
+  const unreadable = []
+  const noteUnreadable = (rel, reason) => { unreadable.push({ file: rel, reason: reason || 'unreadable' }) }
   for (const [rel, b] of Object.entries(before)) {
     const a = after[rel]
     if (!a) { vanished.push(rel); continue }
@@ -176,15 +207,19 @@ export function diffEvidence(before = {}, after = {}) {
     if (bEx && !aEx) { vanished.push(rel); continue }
     if (!bEx && aEx) { appeared.push(rel); continue }
     if (!bEx && !aEx) { unchanged.push(rel); continue }
+    const bU = unreadableReason(b)
+    const aU = unreadableReason(a)
+    if (bU || aU) { noteUnreadable(rel, bU && aU ? `before: ${bU}; after: ${aU}` : (aU || bU)); continue }
     if (b.sha1 !== a.sha1 || b.size !== a.size) { modified.push(rel); continue }
     unchanged.push(rel)
   }
   for (const rel of Object.keys(after)) if (!(rel in before)) {
     if (after[rel] && after[rel].exists === false) unchanged.push(rel)
+    else if (after[rel] && unreadableReason(after[rel])) noteUnreadable(rel, unreadableReason(after[rel]))
     else appeared.push(rel)
   }
   const changed = modified.length > 0 || vanished.length > 0 || appeared.length > 0
-  return { changed, modified, vanished, appeared, unchanged }
+  return { changed, modified, vanished, appeared, unchanged, unreadable }
 }
 
 /**

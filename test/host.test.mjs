@@ -1,6 +1,6 @@
 // test/host.test.mjs — 装配面与端到端（真 host 代码 + 桩 ctx）
 //
-// 这一组回答的是"A4/A6 是否真的成立"：六个工具真的注册了吗？闸门真的接在写入路径上吗？
+// 这一组回答的是"A4/A6 是否真的成立"：五个工具真的注册了吗？闸门真的接在写入路径上吗？
 // 收口真的不需要第二次调用吗？—— 全部走真代码，只有 ctx 与 root 是替身。
 //
 // 旧套件用了同样的手法（data-URL shim 编译真 host），这里沿用并把它提到台面上。
@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { tmpRoot, put, touch, seed } from './helper.mjs'
+import { tmpRoot, put, touch, seed, snapshotTree, armSnapshotProbe } from './helper.mjs'
 import { mountHost } from './host-harness.mjs'
 import { appendEvents, readEvents } from '../core/log.js'
 import { paths, PLANE } from '../core/paths.js'
@@ -201,29 +201,29 @@ test('在场层：治理摘要已注册，text 是函数（每轮求值），且
   assert.ok(sec, '在场层必须注册 systemPrompt.section（否则治理又退回"只在被调用时存在"）')
   assert.equal(typeof sec.text, 'function', 'text 必须是函数 —— 静态串会变成 spawn 期快照，治理状态一改就过期')
 
+  // 零落盘：注入过程**不得新增任何目录或文件**（I2/I3）。
+  // ⚠ 不能断言 runtime/ 不存在 —— seed 阶段的 appendEvents 走 withLock，必然建 runtime/locks。
+  // 正确判据是**前后快照比对**（"没有新增"才是零落盘），且快照必须**目录与文件都收**。
+  //
+  // 判例（2026-09-25 实证）：旧版 walk 只 push 文件、不收目录 ⇒ 往 .internal/runtime/ 里新写一个
+  // 目录时快照**毫无变化**，deepEqual 恒相等（实测：新建 .internal/runtime/x 后 deepEqual 仍通过）。
+  // 「在场层这一步没有新增」才是判据；而目录本身就是一次落盘。
+  //
+  // ① 武装自证先行：证明共享快照函数真能发现新写入（空集比对从此过不了这一关）。
+  armSnapshotProbe()
+  // ② 取在 seed **之后**（锁的写入合法，不属在场层这一步）、在场调用**之前**；
+  //    两处（architecture.test.mjs / host.test.mjs）共用 helper.snapshotTree，口径只有一份。
+  const snap = () => snapshotTree(join(root, '.internal'))
+  const before = snap()
+  console.log('  [在场层零落盘] 在场调用前 .internal 快照 = ' + JSON.stringify(before))
+  // ③ **被测的那一次在场调用**必须落在 before 之后 —— 只此一次，且它就是被断言文本的那一次。
+  //    ⚠ 旧序（2026-09-25 复核席实测）在 :204 先探一次文本、:221 才取 before ⇒ 若在场层真落盘，
+  //      那两个文件已进 before，deepEqual 恒真（变异实证：foldOnly→loadModel 后 host 仍 32/32 全绿）。
+  //      同一变异下把本次调用移到快照之后，立刻红 ⇒ 判据的真假只取决于顺序。
   const text = h.presenceText({ agent: { session: { meta: { cwd: root } } } })
   assert.match(text, /治理在场/)
   assert.match(text, /doing=/, '摘要必须带主线向量')
-
-  // 零落盘：注入过程**不得新增任何文件**（I3）。
-  // ⚠ 不能断言 runtime/ 不存在 —— seed 阶段的 appendEvents 走 withLock，必然建 runtime/locks。
-  // 正确判据是**前后快照比对**（"没有新增"才是零落盘）。
-  const snap = () => {
-    const out = []
-    const walk = (d) => {
-      if (!existsSync(d)) return
-      for (const e of readdirSync(d, { withFileTypes: true })) {
-        const f = join(d, e.name)
-        if (e.isDirectory()) walk(f)
-        else out.push(f)
-      }
-    }
-    walk(join(root, '.internal'))
-    return out.sort()
-  }
-  const before = snap()
-  h.presenceText({ agent: { session: { meta: { cwd: root } } } })
-  assert.deepEqual(snap(), before, '在场层必须零落盘（含 runtime 缓存）—— 落盘就是把删掉的投影换个名字加回来')
+  assert.deepEqual(snap(), before, '在场层必须零落盘（含 runtime 缓存里的新目录）—— 落盘就是把删掉的投影换个名字加回来')
 })
 
 test('在场层：事件流变化 ⇒ 下一次组装给出不同文本（证明确实每轮求值，不是快照）', async (t) => {

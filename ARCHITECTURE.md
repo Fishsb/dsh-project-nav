@@ -1,4 +1,4 @@
-# project-nav 架构（v0.12.3 · 在场的治理层）
+# project-nav 架构（v0.12.4 · 在场的治理层）
 
 > **上位约束**：所有开发动作必须从架构出发。动手前能说出这次改动落在哪个架构节点；说不出 = 还没做架构思考，十有八九是局部补丁。
 >
@@ -240,6 +240,7 @@ health+presence 两项消失 / tree 不渲染 `exitCondition`）⇒ 「新增字
 | `core/commit.js` · `render.js` | 编排层：写入编排 + 按证据收口 · **按需渲染（纯计算，零写盘）** |
 | `core/format.js` | 表现层：**一切"说给模型看"的文本都在这里成形**（含**在场层** `renderPresence`） |
 | `test/` | 领域行为 · 不变量 I1–I3 与 A1–A6 · 并发与锁 · host 装配面 |
+> 验收判据 A1–A6 的**名字**在 `test/architecture.test.mjs` 的用例标题里可直接读到（A1 收口只认证据 / A2 真相可自检 / A4 七闸在写入路径上 / A5 模型面字段数 / A6 工具面）；**A3（决策可传播）没有独立机检件** —— 它随 0.12.0 落盘投影退场，现由 I1 的事件流 `seq` 完整性代守。
 
 **依赖方向**：`paths ← {log, lock} ← scope ← model ← gates ← commit ← host`。
 > `scope → log`（0.11.0 引入）：扫描缓存要落 `runtime/`，而**一切 runtime 文件的写入方式只有一种**
