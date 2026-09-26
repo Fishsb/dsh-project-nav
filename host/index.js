@@ -19,10 +19,10 @@ import {
   paths, normSlashes, key
 } from '../core/paths.js'
 import { loadModel, normalizeAnchor, pressureFor, coverage, REPEAT_PATCH_THRESHOLD, foldOnly } from '../core/model.js'
-import { appendEvents, verifyLog, readEvents } from '../core/log.js'
-import { reconcile, commitIntent, archiveIntent, inflightView, materialize } from '../core/commit.js'
-import { locate, resolveScope, evidenceOf } from '../core/scope.js'
-import { renderTreeText, vectorFields } from '../core/render.js'
+import { appendEvents, verifyLog } from '../core/log.js'
+import { reconcile, commitIntent, archiveIntent, inflightView } from '../core/commit.js'
+import { locate } from '../core/scope.js'
+import { vectorFields } from '../core/render.js'
 import { listLocks } from '../core/lock.js'
 import {
   splitList, parseKv, truncate, renderHealth, renderScopeTarget, renderGaps,

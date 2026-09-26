@@ -16,9 +16,7 @@ export const PLANE = {
   /** 唯一事实源：append-only 事件流（永久 · 进版本控制） */
   EVENTS: '.internal/events.jsonl',
   /** 可丢弃缓存 / 在途 / 锁 / 诊断（短命 · 不进版本控制） */
-  RUNTIME: '.internal/runtime',
-  /** 旧账本归档（只读 · 迁移后不再被读写） */
-  LEGACY: '.internal/legacy'
+  RUNTIME: '.internal/runtime'
 }
 
 export const RUNTIME_FILES = {
@@ -39,8 +37,7 @@ export const paths = {
   model: (root) => p(root, PLANE.RUNTIME, RUNTIME_FILES.MODEL),
   inflightDir: (root) => p(root, PLANE.RUNTIME, RUNTIME_FILES.INFLIGHT),
   locksDir: (root) => p(root, PLANE.RUNTIME, RUNTIME_FILES.LOCKS),
-  archDir: (root) => p(root, '.internal', 'arch'),
-  legacyDir: (root) => p(root, PLANE.LEGACY)
+  archDir: (root) => p(root, '.internal', 'arch')
 }
 
 /** 统一成 `/` 分隔、无尾斜杠。不做大小写折叠（保真），比较时再折叠。 */

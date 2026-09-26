@@ -94,25 +94,42 @@ if (-not (Test-Path (Join-Path $Dest 'package.json'))) { Fail "实体未生成: 
 $ip = [System.IO.File]::ReadAllText((Join-Path $Dest 'package.json'), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
 if ($ip.version -ne $WantVer) { Fail "实体版本 = $($ip.version)，不是 $WantVer" }
 
-# 树 = 装：实体与仓库源码逐文件一致（进包文件）
-$pkgFiles = @((Get-Content (Join-Path $RepoDir 'package.json') -Raw | ConvertFrom-Json).files)
-$checked = 0
-foreach ($top in $pkgFiles) {
+# 树 = 装：实体与仓库源码逐文件一致（**进包面**）
+#
+# ⚠ 进包面 = package.json 的 files[] 展开 + npm 的「始终包含」成员。后者按 npm 规则
+# **结构性发现**（package.json 自身 · 声明里的 main 文件 · 包根的 README* / LICENSE* / LICENCE*），
+# 不写死名字 —— 这类文件无视 files[] 一律进包，实测本仓产物 16 个成员 = files[] 的 14 + README.md + LICENSE。
+# 旧版只展开 files[] ⇒ 自证面比实际进包面**小 2 份**：README.md / LICENSE 装了却没人验
+# （同一状态下 verify-install.ps1 立刻报红 ⇒「装了却没人验」的静默面，2026-09-25 修）。
+# 派生式与 verify-install.ps1 **逐字同源**（该脚本会机检这段是否与它一致）。
+# <<<PACK-FACE-DERIVATION>>>
+$pkgDecl   = [System.IO.File]::ReadAllText((Join-Path $RepoDir 'package.json'), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+$wantFiles = @()
+foreach ($top in @($pkgDecl.files)) {
   $src = Join-Path $RepoDir $top
+  if (-not (Test-Path $src)) { continue }
   if (Test-Path $src -PathType Container) {
-    foreach ($f in (Get-ChildItem $src -Recurse -File)) {
-      $rel = $f.FullName.Substring($RepoDir.Length + 1)
-      $dst = Join-Path $Dest $rel
-      if (-not (Test-Path $dst)) { Fail "实体缺 $rel" }
-      if ((Get-FileHash $f.FullName -Algorithm SHA256).Hash -ne (Get-FileHash $dst -Algorithm SHA256).Hash) { Fail "$rel 与仓库源码不一致（装错了产物？）" }
-      $checked++
-    }
-  } else {
-    $dst = Join-Path $Dest $top
-    if (-not (Test-Path $dst)) { Fail "实体缺 $top" }
-    if ((Get-FileHash $src -Algorithm SHA256).Hash -ne (Get-FileHash $dst -Algorithm SHA256).Hash) { Fail "$top 与仓库源码不一致" }
-    $checked++
-  }
+    foreach ($f in (Get-ChildItem $src -Recurse -File)) { $wantFiles += ($f.FullName.Substring($RepoDir.Length + 1) -replace '\\','/') }
+  } elseif ($wantFiles -notcontains ($top -replace '\\','/')) { $wantFiles += ($top -replace '\\','/') }
+}
+$impNames = @('package.json')
+if ($pkgDecl.main) { $impNames += ($pkgDecl.main -replace '^\./','') }
+foreach ($imp in $impNames) {
+  $impN = $imp -replace '\\','/'
+  if ((Test-Path (Join-Path $RepoDir $imp)) -and ($wantFiles -notcontains $impN)) { $wantFiles += $impN }
+}
+foreach ($pat in @('README*','LICENSE*','LICENCE*')) {
+  foreach ($f in (Get-ChildItem $RepoDir -File -Filter $pat)) { if ($wantFiles -notcontains $f.Name) { $wantFiles += $f.Name } }
+}
+$wantFiles = @($wantFiles | Sort-Object -Unique)
+# <<<END-PACK-FACE-DERIVATION>>>
+$checked = 0
+foreach ($rel in $wantFiles) {
+  $src = Join-Path $RepoDir $rel
+  $dst = Join-Path $Dest $rel
+  if (-not (Test-Path $dst)) { Fail "实体缺 $rel" }
+  if ((Get-FileHash $src -Algorithm SHA256).Hash -ne (Get-FileHash $dst -Algorithm SHA256).Hash) { Fail "$rel 与仓库源码不一致（装错了产物？）" }
+  $checked++
 }
 
 Write-Host ''

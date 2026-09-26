@@ -135,16 +135,30 @@
 这是本插件存在的理由。动手前问一句「我改的东西，谁在引用」：
 
 ```
-File: core/model.js  —  1 个落点文件
+File: project-nav/core/model.js  —  1 个落点文件
 
-↓ 我引用谁:
-  core/model.js → core/log.js, core/paths.js, core/scope.js
+↓ 我引用谁（1 个落点有外部依赖）:
+  project-nav/core/model.js → project-nav/core/log.js, project-nav/core/paths.js, project-nav/core/scope.js
 
-↑ 谁引用我 = 影响面（9 个文件 · 7 个节点）:
-  bootstrap.mjs ← 被 core/model.js 引用
-  core/commit.js ← 被 core/model.js 引用
+↑ 谁引用我 = 影响面（8 个文件 · 5 个节点）:
+  project-nav/core/commit.js ← 被 project-nav/core/model.js 引用
+  project-nav/core/format.js ← 被 project-nav/core/model.js 引用
+  project-nav/host/index.js ← 被 project-nav/core/model.js 引用
   ...
 ```
+
+> ⚠ 上例取自**治理根实测输出**（`D:\FF`，2026-09-25；本仓不是治理根，故路径带 `project-nav/` 前缀）。
+> 判据同 §4「文件职责」那条**示例必须取自真实输出**：图省事写一个"应该长这样"的样例 = 训练人相信错的东西。
+>
+> **方向读法**（本节讲的就是方向，实测最易被读反，故写全）：**↑ 段每行的行首文件 = 引用方**。
+> 上例三行读作「`core/commit.js` / `core/format.js` / `host/index.js` **引用了** `core/model.js`」——不是反过来。
+> ⚠ 行尾那句「← 被 `X` 引用」里的 `X` 是**被查询的文件本身**（不是引用方）：按字面读会读反 ——
+> 那样上例就变成"`model.js` 引用了 `commit.js`"，与上一段 ↓（`model.js` 只引用 `log`/`paths`/`scope`）直接冲突。
+>
+> **判例（本节旧示例）**：它列着 `bootstrap.mjs` —— 0.9 自举期的一次性脚本。方向为
+> **`bootstrap.mjs` 引用了 `core/model.js`**（依据：该文件里有
+> `import { buildModel, loadModel } from './core/model.js'`；**反向不成立** —— `core/model.js` 对 `bootstrap` 零命中），
+> 故它当时确实列在 `core/model.js` 的影响面里。脚本已删，此行随之失效。
 
 ### 最重要的行为变化：**收口不需要第二个动作**
 
@@ -202,8 +216,10 @@ File: core/model.js  —  1 个落点文件
 **不存在第三层**：任何新的长期状态先回答"它是事件，还是渲染？"，两者都不是就不该存在。
 依赖图**不是第三层**——它是磁盘实况，与 STALE 探测、缺口扫描在同一位置计算。
 
-> `.gitignore` 必须**只排除 runtime**，不能整目录排除 `.internal/`——
+> **适用范围**：被治理项目的 `.gitignore` 必须**只排除 runtime**，不能整目录排除 `.internal/`——
 > 否则事件流不进版本控制，新 clone 读不到任何决策，"决策可传播"就是一句空话。
+> **本仓不是治理根**（治理根是 `D:\FF`，事件流在那边）⇒ 本仓的 `.gitignore` 是**整目录忽略** `.internal/`，
+> 与本条不冲突；判据见 `AGENTS.md` §7。
 
 ## 6. 安装
 
@@ -308,7 +324,13 @@ npm run test:node-runner  # 同一批用例走 node --test
      ⇒ `resolve()` 当**相对路径**拼到 cwd，写出 `<cwd>/D<U+F03A>/FF/…` 而**无任何异常**。残留已移出仓库（备份 `~/.dsh/tmp/pn-shadow-root-20260925`）；
      触发源**未复现**（现配置 root 为纯 ASCII，全盘 15167 个文本文件零命中）。**root 合法性校验未加** —— 它改 `host/` 启动语义，留作具名决策。
   ⚠ **未做**：`kind 4 种` 已补机检但**未补契约排除条款**；`test/tools-list.mjs` 的 `^\s{6}` 缩进耦合仍会把失配报成红（不再静默）而非根治；
-     `core/paths.js` 的 `PLANE.LEGACY/legacyDir`（零消费者）与 `host/index.js` 两个未用 import 未清（各 1 处，属零消费者残骸）。
+     更正（0.12.5 发布**之后**的施工，本仓工作区实测）：`core/paths.js` 的 `PLANE.LEGACY/legacyDir`（零消费者）
+     与 `host/index.js` 的未用 import **源码已清**。实为 **5 个具名** ——
+     `readEvents`/`materialize`/`resolveScope`/`evidenceOf`/`renderTreeText`，不是先前写的"两个"。
+     （实测本仓：`git grep -n -E 'PLANE\.LEGACY|legacyDir'` 命中 **5 处** ——
+     `README.md` 本段 2 处为叙述，另 3 处均为**注释**：`test/architecture.test.mjs` 的「平面契约」
+     用例（同日在场判据那处）与其「BOM 门禁」用例里的**引述**，以及 `verify-install.ps1` 第 ④ 级的
+     数据面判据（同样在引述同一根因）；`core/` 与 `host/` 去注释后**零命中**，即无代码消费者。）
 - `0.8.6 → 0.9.0`：换骨架（决策丢弃、事实 F1–F9 保留）。
 - `0.9.2 → 0.10.0`：**换代** —— 模型从「包含树」升级为「包含树 + 依赖图」，闸门六 → 七。
 - `0.10.0 → 0.10.1`：**修 bug**（非换代）—— 计数闸曾把 `closed` 收口回执也当补丁数，每笔改动被计两次、
@@ -400,8 +422,9 @@ npm run test:node-runner  # 同一批用例走 node --test
   **不变式的收紧**：I2 从「手改渲染物会被覆盖」变为**「治理面零落盘」**（更强的机检判据：
   调用渲染后治理根无任何新文件）。I1/I3 完好（在场层零状态）。
   ⚠ **一处对旧实现的自我纠正**：`renderModelDoc` 里那个"回查 `closes` 指向的原始笔以取 `plan`"
-  实为 **no-op**（`closes` 只写在原笔自己身上；治理根 21 条带 `closes` 的记录中 `closes !== seq` 者
-  **0 条**）—— 值对、注释错，契约里已改述为实测语义。
+  实为 **no-op** —— 折叠后 `closes` **恒指向原笔自身**（实测 68/68），回查等于原地打转。
+  （原句写的是"21 条中 `closes !== seq` 者 0 条"：该计数取的是**折叠层**；**事件流层**恰好相反 ——
+  带 `closes` 的记录 68 条中 `closes !== seq` 者 **68 条**。分层说明见 ARCHITECTURE §5。）
 - `0.12.0 → 0.12.1`：**修 bug（非换代）** —— 在场层收敛为**唯一一路**（ADR-277）。
   0.12.0 初版有两条注入路径，其中 `tools/post-execute` + `additionalContexts` **是纯重复**：
   `systemPrompt.section` 的 `text` **每轮组装即求值**，故每次请求的系统提示里已是最新治理，

@@ -108,10 +108,15 @@ health+presence 两项消失 / tree 不渲染 `exitCondition`）⇒ 「新增字
 `seq` 由追加顺序分配、ID 由 seq 派生 ⇒ 并发追加不可能撞 ID。
 **收口不依赖会话**：`open` 的 scope 证据 = 文件 `{size, mtimeMs, sha1}`；证据已变 ⇒ 下次任意工具调用自动收口；未变 ⇒ 意图继续在途（**在途 = 有人正在改，不是孤儿**）。比对**先判存在性、再比内容**——先比 sha1 会把"消失"误报成"被修改"。
 
-⚠ **折叠语义（实测，0.12.0 澄清）**：收口时**原笔被就地标 `closed` 并挂 `closes` = 自己的 seq**；
-收口回执是**另一条 commit**（`phase=closed`，无 `closes`，`plan` 结构性为空串）。
+⚠ **折叠语义（实测）**：同一个 `closes` 字段在**两层的取值关系相反**（事件流层 `closes !== seq`；
+折叠层 `closes === seq`），混读一句就会读反 —— 故分层写：
+· **事件流层（磁盘实况）**：收口回执是**另一条 commit**（`phase=closed`，`plan` 结构性为空串），
+  它带 `closes` = **被收口那笔的 seq** ⇒ 实测治理根带 `closes` 的记录 **68 条**中 `closes !== seq` 者 **68 条**
+  （`closes === seq` 者 **0 条**）。
+· **折叠层（模型，`core/model.js`）**：折叠把 `closes` 挂到**被收口的原笔**上（`target.closes = ev.closes`），
+  而**回执那条自身不带 `closes`** ⇒ 折叠后 68/68 **全部 `closes === seq`**。
 故取"原始申报"应直取原笔的 `plan` —— **不存在**"回查 `closes` 指向的笔"这种操作
-（`closes` 只写在原笔自己身上；实测治理根 21 条带 `closes` 的记录中 `closes !== seq` 者 **0 条**）。
+（折叠后 `closes` 恒指向自身，回查等于原地打转）。
 （旧版 `renderModelDoc` 写过同名回查，实为 no-op：值对、注释错。）
 
 ## 6. 七个闸门（全部是 `nav_commit` 内的模型查询）

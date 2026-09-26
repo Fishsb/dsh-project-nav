@@ -7,10 +7,12 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, readdirSync, utimesSync, chmodSync, mkdtempSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, readdirSync, utimesSync, chmodSync, mkdtempSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, dirname } from 'node:path'
+import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { gunzipSync } from 'node:zlib'
+import { createHash } from 'node:crypto'
 import { tmpRoot, put, touch, seed, snapshotTree, armSnapshotProbe } from './helper.mjs'
 import { appendEvents, readEvents, verifyLog, rewriteVerified, EVENT_KINDS } from '../core/log.js'
 import { loadModel, buildModel, foldOnly, coverage, pressureFor, filePressure, normalizeAnchor, governanceSovereignty, governanceVitality } from '../core/model.js'
@@ -193,13 +195,87 @@ test('发布链脚本：含非 ASCII 的 .ps1 必须 UTF-8 with BOM（否则 PS 
 })
 
 test('发布链脚本：包外的 .mjs/.js 不得带 BOM（node 不认 BOM）', async (t) => {
+  // ⚠ 判据形态在 2026-09-25 由「按名字」换成「按结构」—— 旧版硬编码 5 个文件名，
+  // 于是**名单之外的任何新文件带 BOM 都恒绿**：实测给 core/model.js 注入 BOM，套件仍 54/54 全绿。
+  // 这是「判据挂在名字上」的通病（同日另一处：verify-install.ps1 判「数据面 = 2 层」时只匹配
+  // 'PROJECT_DOC|MODEL_DOC' 两个名字，删掉 PLANE.LEGACY 它不报）—— 名单守住的只是**当时想到的名字**。
+  // 现在按结构扫：仓内所有 .mjs/.js/.cjs/.json 一律不得带 BOM。
+  // 排除规则只按**机制**、不按名字：dot 目录（.git/.roundtable/.internal/.verify-tmp…，本就不进包）
+  // 与 node_modules（依赖，非本仓源）。
   const here = dirname(fileURLToPath(import.meta.url))
   const pkgRoot = join(here, '..')
-  for (const rel of ['verify-runtime.mjs', 'bootstrap.mjs', 'core/render.js', 'host/index.js', 'package.json']) {
-    const bytes = readFileSync(join(pkgRoot, rel))
-    const hasBom = bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF
-    assert.ok(!hasBom, `${rel} 不得带 BOM（node 不认）`)
+  const offenders = []
+  let scanned = 0
+  const walk = (dir, rel) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.name.startsWith('.') || e.name === 'node_modules') continue
+      const r = rel ? `${rel}/${e.name}` : e.name
+      if (e.isDirectory()) { walk(join(dir, e.name), r); continue }
+      if (!/\.(mjs|js|cjs|json)$/.test(e.name)) continue
+      scanned++
+      const bytes = readFileSync(join(dir, e.name))
+      if (bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) offenders.push(r)
+    }
   }
+  walk(pkgRoot, '')
+  // 空集扫描 = 判据无从生效（与「缺产物不许静默 pass」同一条纪律）
+  assert.ok(scanned > 0, '扫描面为空 —— 判据没生效，不许静默通过')
+  assert.deepEqual(offenders, [], `下列文件带 BOM（node 不认）: ${offenders.join(', ')}`)
+})
+
+test('发布链跨面：产物 tarball 必须与源码逐字节一致（"改了源码没 repack" 必须红）', async (t) => {
+  // 为什么这条要进套件：四套件里 `grep -E 'tgz|tar|pack'` 命中 0 ⇒ **「源码改了但没重打包」
+  // 在套件内结构上看不见**，它当时只被包外的 verify-install.ps1 ③ 抓（而 ③ 要跑 PS + 读 profile），
+  // 于是"改完 core/ 忘了 npm pack"能一路绿到用户重启那一刻。
+  // 判据 = **两集合求差**，不含任何文件名清单：tarball 成员集合 vs package.json 派生出的进包集合。
+  // 三条：① 成员集合相等（多一个=打包规则与声明分叉，少一个=声明里写了却没进包）
+  //       ② 每个成员与仓库源码的 SHA256 逐字节一致（=「树 = 包」）
+  //       ③ 产物自身的压缩内容里没有"更旧"的历史 —— 由 ② 覆盖，不重复判。
+  // ⚠ 产物不存在时**不许静默 pass**（那正是本仓记过的"假绿"形态）：显式失败并指向 npm pack。
+  const here = dirname(fileURLToPath(import.meta.url))
+  const pkgRoot = join(here, '..')
+  const pkg = JSON.parse(readFileSync(join(pkgRoot, 'package.json'), 'utf-8'))
+  const tgz = join(pkgRoot, `dsh-external-project-nav-${pkg.version}.tgz`)
+  if (!existsSync(tgz)) {
+    assert.fail(`${pkg.version} 的产物不存在（${tgz}）—— 先 npm pack --cache .npm-cache；缺产物==发布链断，不许静默跳过`)
+  }
+
+  // tar 解析：只认 ustar 头（npm pack 产物实测全部为 type='0' 普通文件，见 2026-09-25 探针）
+  const raw = gunzipSync(readFileSync(tgz))
+  const packed = new Map()
+  for (let off = 0; off + 512 <= raw.length;) {
+    const name = raw.toString('utf8', off, off + 100).replace(/\0.*$/, '')
+    if (!name) break
+    const size = parseInt(raw.toString('utf8', off + 124, off + 136).replace(/\0.*$/, '').trim(), 8) || 0
+    packed.set(name.replace(/^package\//, ''), createHash('sha256').update(raw.subarray(off + 512, off + 512 + size)).digest('hex'))
+    off += 512 + Math.ceil(size / 512) * 512
+  }
+  assert.ok(packed.size > 0, 'tar 解析出 0 个成员 —— 解析失败即判据无从生效，不许静默通过')
+
+  // 期望集合从 package.json 派生（与 install.ps1 / verify-install.ps1 ② 同一来源）
+  const want = []
+  for (const top of [...pkg.files, 'package.json', 'README.md', 'LICENSE']) {
+    const abs = join(pkgRoot, top)
+    if (!existsSync(abs)) continue
+    if (statSync(abs).isDirectory()) {
+      const walk = (d) => readdirSync(d, { withFileTypes: true }).forEach((e) => {
+        const p = join(d, e.name)
+        if (e.isDirectory()) walk(p); else want.push(relative(pkgRoot, p).replace(/\\/g, '/'))
+      })
+      walk(abs)
+    } else if (!want.includes(top)) want.push(top)
+  }
+  assert.deepEqual([...packed.keys()].sort(), [...want].sort(),
+    '产物成员集合必须与 package.json files[] 派生出的进包集合相等（多=打包规则与声明分叉，少=声明了却没进包）')
+
+  const drift = []
+  for (const [rel, sha] of packed) {
+    const src = join(pkgRoot, rel)
+    if (!existsSync(src)) { drift.push(`${rel}（源码不在）`); continue }
+    const actual = createHash('sha256').update(readFileSync(src)).digest('hex')
+    if (actual !== sha) drift.push(rel)
+  }
+  assert.deepEqual(drift, [], `源码与产物不一致（忘 repack？）: ${drift.join(', ')} —— 改完源码必须 npm pack --cache .npm-cache`)
 })
 
 test('I2 零写盘是结构性的：core/render.js 不得 import 任何写盘面（源码级守卫）', async (t) => {
@@ -588,11 +664,47 @@ test('A4 事件模型 = 4 种 kind（ARCHITECTURE §5 的架构事实，加第 5
 
 test('平面契约：两层数据面（0.12.0 换代）；长期资产只有事件流一个文件', async (t) => {
   const root = tmpRoot(t)
-  assert.equal(PLANE.EVENTS, '.internal/events.jsonl')
-  assert.equal(PLANE.RUNTIME, '.internal/runtime')
-  // 换代判据：落盘投影面整体退场 ⇒ 它的两个路径常量必须不存在（留着就是留一份永不再写的承诺）
-  assert.equal('PROJECT_DOC' in PLANE, false, 'PROJECT.md 随落盘投影退场（ADR-268）')
-  assert.equal('MODEL_DOC' in PLANE, false, 'ARCH-MODEL.md 随落盘投影退场（ADR-268）')
+  // ⚠ 判据必须是**结构派生**的，不能是名字名单（2026-09-25 修 · 本项根因）。
+  // 旧版断言 `'PROJECT_DOC' in PLANE === false` / `'MODEL_DOC' in PLANE === false`：
+  // 它只能守住写它那一刻想到的那两个名字 —— 任何**别的**平面常量（新增的、残留的、改名的）
+  // 它一律看不见。实测：往 core/paths.js 注入 `PLANE.LEGACY` 后旧断言仍全绿
+  // （一道"数据面 = 2 层"的判据，在数据面真的变成 3 层时零信号）。
+  // 现判据 = **三个派生集合求差**，不含任何平面常量名、也不写死层数：
+  //   ① 定义面：core/paths.js 里 PLANE 字面量的顶层键（怎么增删都跟着动）
+  //   ② 消费面：core/ 与 host/ 全部源码里出现的 `PLANE.<键>`（文件清单也是扫出来的，不写死）
+  //   ③ 契约面：ARCHITECTURE §3 表格里列出的层路径（去尾斜杠后比）
+  // 三个必须同时逐键相等：多一个 = 留了份永不再写的承诺；少一个 = 悬空引用；
+  // 与契约对不上 = 层数被悄悄改了而契约没跟着改（换代时改契约，判据自己跟着动）。
+  const pkgRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const strip = (s) => s.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
+  const pathsSrc = strip(readFileSync(join(pkgRoot, 'core', 'paths.js'), 'utf-8'))
+  const planeBlock = pathsSrc.match(/export const PLANE\s*=\s*\{([\s\S]*?)\n\}/)
+  assert.ok(planeBlock, 'core/paths.js 必须有 PLANE 字面量定义 —— 解析不到即判据无从派生，不许静默通过')
+  const defPairs = [...planeBlock[1].matchAll(/^\s*([A-Za-z_]\w*)\s*:\s*'([^']*)'/gm)]
+  const defKeys = defPairs.map((m) => m[1]).sort()
+  const defVals = [...new Set(defPairs.map((m) => m[2].replace(/\/+$/, '')))].sort()
+  assert.ok(defKeys.length > 0, 'PLANE 至少得有一个平面常量（解析出空集 = 判据恒绿，正是本项要修的病）')
+  assert.deepEqual(defKeys, Object.keys(PLANE).sort(),
+    'PLANE 的字面量定义面必须与运行时导出对象逐键一致（解析器自证 —— 用计算键/展开写法会被这里抓住）')
+
+  const srcFiles = readdirSync(join(pkgRoot, 'core')).filter((f) => f.endsWith('.js')).map((f) => join(pkgRoot, 'core', f))
+  srcFiles.push(join(pkgRoot, 'host', 'index.js'))
+  const consumed = new Set()
+  for (const f of srcFiles) {
+    for (const m of strip(readFileSync(f, 'utf-8')).matchAll(/PLANE\.([A-Za-z_]\w*)/g)) consumed.add(m[1])
+  }
+  assert.deepEqual(defKeys, [...consumed].sort(),
+    `平面常量的定义面与消费面必须逐键相等（数据面应恰为 ${defKeys.length} 层）；定义了却零消费 = 留了永不再写的承诺，被引用却未定义 = 悬空`)
+
+  // 契约面：层数不写在这里，从 ARCHITECTURE §3 的表格行**派生**（换代时改契约，判据自己跟着动）
+  const arch = readFileSync(join(pkgRoot, 'ARCHITECTURE.md'), 'utf-8')
+  const sec3 = arch.split(/\n(?=## )/).find((s) => /^## 3\./.test(s))
+  assert.ok(sec3, 'ARCHITECTURE 必须有 §3（两层数据面）—— 找不到就是契约被搬走了')
+  const contractVals = [...sec3.matchAll(/^\|\s*\*\*[^|]+\*\*\s*\|\s*`([^`]+)`/gm)]
+    .map((m) => m[1].replace(/\/+$/, '')).sort()
+  assert.ok(contractVals.length > 0, '§3 表格里必须解析出层路径（解析出空集 = 判据恒绿）')
+  assert.deepEqual(defVals, contractVals,
+    `PLANE 的取值面必须与 ARCHITECTURE §3 列出的层逐条一致（契约与源码必须给出同一个层数 ${contractVals.length}）`)
   await seed(root)
   const internal = readdirSync(join(root, '.internal'))
   const longLived = internal.filter((f) => f.endsWith('.json') || f.endsWith('.jsonl'))
